@@ -342,3 +342,28 @@ fn user_messages_have_a_full_width_background() {
     let a = screen.lines().position(|l| l.starts_with("● I changed")).unwrap() as u16;
     assert_ne!(buf[(5, a)].bg, USER_BG);
 }
+
+#[test]
+fn file_view_highlights_added_and_deleted_lines() {
+    use ratatui::style::Color;
+    let mut h = Harness::new();
+    let path = h.app.transcript.cwd().join("src/lib.rs");
+    h.app.open_file(path, None);
+    h.draw();
+    let View::File(fv) = &h.app.view else { panic!() };
+    let row_of = |text: &str| fv.lines.iter().position(|l| l.text == text).unwrap();
+    let (added, deleted) = (row_of("fn b2() {}"), row_of("fn b() {}"));
+    // `fn` is a keyword on both sides: the added line uses the current file, the deleted line HEAD.
+    for row in [added, deleted] {
+        let first = fv.syntax(row).first().copied().expect("highlighted");
+        assert_eq!((first.start, first.end, first.style.fg), (0, 2, Some(Color::Magenta)));
+    }
+    // Rendered: the keyword keeps its syntax color on the tinted background.
+    let screen = h.screen();
+    let y = screen.lines().position(|l| l.contains("+ fn b2() {}")).unwrap() as u16;
+    let x = screen.lines().nth(y as usize).unwrap().chars().position(|c| c == 'f').unwrap() as u16;
+    let cell = &h.term.backend().buffer()[(x, y)];
+    assert_eq!(cell.fg, Color::Magenta);
+    assert_eq!(cell.bg, super::render::ADD_BG);
+    assert_eq!(h.term.backend().buffer()[(79, y)].bg, super::render::ADD_BG, "tint fills the row");
+}

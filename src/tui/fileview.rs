@@ -2,7 +2,10 @@
 
 use std::path::Path;
 
-use super::motion::{Cursor, Lines, Pos};
+use super::{
+    highlight::{self, Run},
+    motion::{Cursor, Lines, Pos},
+};
 use crate::{
     comments::Anchor,
     diff::{self, DiffLine, FileDiff, Kind, Status},
@@ -33,6 +36,10 @@ pub struct FileView {
     pub scroll: usize,
     /// First visible text column (long lines scroll horizontally with the cursor).
     pub hscroll: usize,
+    /// Syntax runs per line of the current file (index = new line number - 1).
+    hl_new: Vec<Vec<Run>>,
+    /// Syntax runs per line of the HEAD version (index = old line number - 1).
+    hl_old: Vec<Vec<Run>>,
 }
 
 fn is_noise(l: &DiffLine) -> bool {
@@ -57,7 +64,10 @@ impl FileView {
             cursor: Cursor::default(),
             scroll: 0,
             hscroll: 0,
+            hl_new: Vec::new(),
+            hl_old: Vec::new(),
         };
+        v.highlight();
         v.rebuild();
         match line {
             Some(l) => v.jump_to_line(l),
@@ -85,6 +95,29 @@ impl FileView {
             self.lines.iter().enumerate().filter(|(_, l)| l.kind == Kind::Hunk).map(|(i, _)| i).collect()
         };
         self.cursor.clamp(&self.texts);
+    }
+
+    fn highlight(&mut self) {
+        let current = self.file.full.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        self.hl_new = highlight::highlight(&self.file.path, &current).unwrap_or_default();
+        self.hl_old = self
+            .file
+            .head_source
+            .as_deref()
+            .and_then(|s| highlight::highlight(&self.file.path, s))
+            .unwrap_or_default();
+    }
+
+    /// Syntax runs for display row `row`: added and context lines use the current file,
+    /// deleted lines the HEAD version.
+    pub fn syntax(&self, row: usize) -> &[Run] {
+        let Some(l) = self.lines.get(row) else { return &[] };
+        let (runs, n) = match l.kind {
+            Kind::Add | Kind::Ctx => (&self.hl_new, l.new),
+            Kind::Del => (&self.hl_old, l.old),
+            Kind::Hunk | Kind::Meta => return &[],
+        };
+        n.and_then(|n| runs.get(n - 1)).map_or(&[], Vec::as_slice)
     }
 
     /// Current line number under the cursor (new side, else old side).
@@ -118,6 +151,7 @@ impl FileView {
         let line = self.current_line_number();
         let full = self.full;
         self.file = diff::load(cwd, &self.file.path.clone());
+        self.highlight();
         self.full = full || self.file.diff.is_empty();
         self.rebuild();
         if let Some(l) = line {

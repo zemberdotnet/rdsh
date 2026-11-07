@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthChar;
 use super::{
     app::{App, Mode, View},
     motion::Pos,
+    highlight::Run,
     transcript::GUTTER,
 };
 use crate::{comments::Anchor, diff::Kind as DiffKind};
@@ -20,18 +21,24 @@ use crate::{comments::Anchor, diff::Kind as DiffKind};
 pub const FILE_GUTTER: usize = 14;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SEL_BG: Color = Color::Rgb(58, 68, 112);
+pub(crate) const ADD_BG: Color = Color::Rgb(24, 52, 32);
+const DEL_BG: Color = Color::Rgb(62, 28, 30);
 const MAX_PROMPT_ROWS: usize = 8;
 
-/// Styles one row's text: links, selection `[s, e)` and the block cursor, clipped to `maxw` columns.
-pub(crate) fn styled(
-    text: &str,
-    base: Style,
-    links: &[(usize, usize)],
-    sel: Option<(usize, usize)>,
-    cursor: Option<usize>,
-    hscroll: usize,
-    maxw: usize,
-) -> Vec<Span<'static>> {
+/// What is drawn over a row's base style, all in char offsets of the row text.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Marks<'a> {
+    /// Syntax-highlight runs, patched over the base style.
+    pub syntax: &'a [Run],
+    pub links: &'a [(usize, usize)],
+    /// Visual selection `[s, e)`; `e` past the text end marks the line end too.
+    pub sel: Option<(usize, usize)>,
+    pub cursor: Option<usize>,
+}
+
+/// Styles one row's text with `marks`, starting at char `hscroll` and clipped to `maxw` columns.
+pub(crate) fn styled(text: &str, base: Style, marks: &Marks<'_>, hscroll: usize, maxw: usize) -> Vec<Span<'static>> {
+    let Marks { syntax, links, sel, cursor } = *marks;
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut current: Option<Style> = None;
     let mut buf = String::new();
@@ -48,7 +55,7 @@ pub(crate) fn styled(
             break;
         }
         w += cw;
-        let mut st = base;
+        let mut st = syntax.iter().filter(|r| r.start <= i && i < r.end).fold(base, |st, r| st.patch(r.style));
         if links.iter().any(|&(s, e)| s <= i && i < e) {
             st = st.fg(Color::LightBlue).add_modifier(Modifier::UNDERLINED);
         }
@@ -181,7 +188,7 @@ impl App {
             let sel = sel_range(self.mode, self.chat_cursor.pos, r, len);
             let cur = (show_cursor && r == self.chat_cursor.pos.row).then_some(self.chat_cursor.pos.col);
             let mut spans = vec![Span::styled(row.gutter, row.gutter_style)];
-            spans.extend(styled(&row.text, row.style, &links, sel, cur, 0, text_w));
+            spans.extend(styled(&row.text, row.style, &Marks { links: &links, sel, cursor: cur, ..Marks::default() }, 0, text_w));
             if let Some(bg) = row.style.bg {
                 let used: usize = spans.iter().map(|s| s.width()).sum();
                 let fill = (area.width as usize).saturating_sub(used);
@@ -232,12 +239,19 @@ impl App {
             let l = &fv.lines[r];
             let text = &fv.texts.0[r];
             let num = l.new.or(l.old);
-            let (style, sign) = match l.kind {
-                DiffKind::Add => (Style::default().fg(Color::Green), '+'),
-                DiffKind::Del => (Style::default().fg(Color::Red), '-'),
-                DiffKind::Ctx => (Style::default(), ' '),
-                DiffKind::Hunk => (Style::default().fg(Color::Cyan), ' '),
-                DiffKind::Meta => (dim(), ' '),
+            let syntax = fv.syntax(r);
+            // Changed lines get a tinted background so syntax colors stay readable; without
+            // highlighting, the text itself is colored as well.
+            let tinted = |bg: Color, fg: Color| {
+                let s = Style::default().bg(bg);
+                if syntax.is_empty() { s.fg(fg) } else { s }
+            };
+            let (style, sign, sign_style) = match l.kind {
+                DiffKind::Add => (tinted(ADD_BG, Color::Green), '+', Style::default().fg(Color::Green).bg(ADD_BG)),
+                DiffKind::Del => (tinted(DEL_BG, Color::Red), '-', Style::default().fg(Color::Red).bg(DEL_BG)),
+                DiffKind::Ctx => (Style::default(), ' ', Style::default()),
+                DiffKind::Hunk => (Style::default().fg(Color::Cyan), ' ', Style::default()),
+                DiffKind::Meta => (dim(), ' ', Style::default()),
             };
             let marker = if commented(num) { "●" } else { " " };
             let fmt = |n: Option<usize>| n.map_or(String::new(), |n| n.to_string());
@@ -248,9 +262,13 @@ impl App {
             let mut spans = vec![
                 Span::styled(gutter[..gutter.len() - marker.len() - 2].to_owned(), dim()),
                 Span::styled(marker.to_owned(), Style::default().fg(Color::Yellow)),
-                Span::styled(format!("{sign} "), style),
+                Span::styled(format!("{sign} "), sign_style),
             ];
-            spans.extend(styled(text, style, &[], sel, cur, fv.hscroll, text_w));
+            spans.extend(styled(text, style, &Marks { syntax, sel, cursor: cur, ..Marks::default() }, fv.hscroll, text_w));
+            if let Some(bg) = style.bg {
+                let used: usize = spans.iter().map(|s| s.width()).sum();
+                spans.push(Span::styled(" ".repeat((body.width as usize).saturating_sub(used)), Style::default().bg(bg)));
+            }
             lines.push(Line::from(spans));
         }
         f.render_widget(Paragraph::new(lines), body);

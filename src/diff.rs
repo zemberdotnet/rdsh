@@ -63,6 +63,8 @@ pub struct FileDiff {
     pub removed: usize,
     /// Set when the file could not be read (binary, missing, permission).
     pub error: Option<String>,
+    /// The HEAD version of a modified file, for highlighting deleted lines.
+    pub head_source: Option<String>,
 }
 
 const MAX_FULL_LINES: usize = 50_000;
@@ -132,7 +134,12 @@ pub fn load(cwd: &Path, path: &Path) -> FileDiff {
             new: Some(i + 1),
         })
         .collect();
-    FileDiff { path: path.to_owned(), rel, status, diff, full, added, removed, error }
+    let head_source = (status == Status::Modified)
+        .then(|| path.file_name().map(|n| format!("HEAD:./{}", n.to_string_lossy())))
+        .flatten()
+        .and_then(|spec| git(dir, &["show", &spec]))
+        .and_then(|(ok, text)| ok.then_some(text));
+    FileDiff { path: path.to_owned(), rel, status, diff, full, added, removed, error, head_source }
 }
 
 /// Parses `git diff` output into typed lines with old/new line numbers.

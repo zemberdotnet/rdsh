@@ -48,7 +48,7 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | `:e path[:line]`, `:send`, `:help`, `:q` | commands |
 | Ctrl-C | interrupt the turn, clear input, or quit (press twice) |
 
-In the file view, the diff against HEAD is shown first; untracked files show as fully added. Tab switches to the full file with changed lines marked. `v`/`V` then `c`, or Enter, comments on lines, and commented lines show `●`. `r` reloads; `q` goes back.
+In the file view, the diff against HEAD is shown first; untracked files show as fully added. Code is syntax-highlighted with tree-sitter (Rust, Python, JavaScript, TypeScript and TSX, Go, C, C++, JSON, Bash, TOML, YAML, Nix, Markdown). Deleted lines are highlighted from the HEAD version, and changed lines get a tinted background. Tab switches to the full file with changed lines marked. `v`/`V` then `c`, or Enter, comments on lines, and commented lines show `●`. `r` reloads; `q` goes back.
 
 Queued comments are sent with your next message inside a `<review_comments>` block. Each comment quotes the chat text or diff lines it refers to.
 
