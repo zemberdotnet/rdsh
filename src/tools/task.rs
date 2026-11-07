@@ -54,6 +54,12 @@ impl Task {
 }
 
 impl Tool for Task {
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Start independent task calls together in one response; they run in parallel. Give each subagent complete instructions, and split parallel write work into disjoint files or directories. Collect every result you need before giving the final answer, then review the combined changes and run the relevant tests.",
+        )
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "task".into(),
@@ -95,7 +101,7 @@ impl Tool for Task {
             let mut agent = Agent::new(AgentOptions {
                 provider: self.provider.clone(),
                 tools: self.tools.clone(),
-                system_prompt: prompt::subagent(&ctx.cwd),
+                system_prompt: prompt::subagent(self.provider.model(), &self.tools),
                 max_steps: self.max_steps,
                 cwd: ctx.cwd.clone(),
                 bash_timeout: self.bash_timeout,

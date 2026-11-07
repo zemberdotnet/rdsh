@@ -146,7 +146,7 @@ impl App {
     pub fn load_history(&mut self, history: &[Message]) {
         for m in history {
             match m {
-                Message::System { .. } => {}
+                Message::System { .. } | Message::Context { .. } => {}
                 Message::User { content } => {
                     self.transcript.push(Kind::User, content.clone());
                     self.history.push(content.clone());
@@ -171,7 +171,7 @@ impl App {
                 }
             }
         }
-        if !history.iter().all(|m| matches!(m, Message::System { .. })) {
+        if history.iter().any(|m| matches!(m, Message::User { .. })) {
             self.transcript.push(Kind::Info, format!("resumed session {}", self.session_id));
             self.mode = Mode::Insert;
         }

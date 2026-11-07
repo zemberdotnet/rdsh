@@ -11,6 +11,12 @@ const MAX_LINE_CHARS: usize = 2000;
 pub struct ReadFile;
 
 impl Tool for ReadFile {
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Use read_file — not shell commands like cat, sed, head, or tail — to inspect text files. Use offset and limit to read a line range or continue a large file.",
+        )
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
@@ -84,6 +90,12 @@ async fn read(args: &Value, ctx: &ToolCtx) -> Result<String, String> {
 pub struct WriteFile;
 
 impl Tool for WriteFile {
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Read an existing file before overwriting it with write_file, and prefer edit_file for targeted changes.",
+        )
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "write_file".into(),
@@ -123,6 +135,12 @@ impl Tool for WriteFile {
 pub struct EditFile;
 
 impl Tool for EditFile {
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Change files only with edit_file or write_file — never with sed -i, perl -pi, awk, or scripts that edit by line number. Read a file before editing it unless you just created or edited it in this session, and include enough surrounding lines in old_string to match one place.",
+        )
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_file".into(),

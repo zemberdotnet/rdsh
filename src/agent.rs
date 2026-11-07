@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     llm::{Delta, Message, Provider, Request, ToolCall, ToolSpec, Usage},
+    prompt,
     tools::{Registry, ToolCtx, ToolOutput},
     trace::{Trace, TraceEvent},
     util::truncate_middle,
@@ -152,6 +153,14 @@ impl Agent {
     /// @param cancel interrupts the model request or running tools.
     /// @returns the final assistant text and how the turn ended.
     pub async fn run_turn(&mut self, input: String, sink: EventSink, cancel: CancellationToken) -> TurnOutcome {
+        let context = prompt::runtime_context(&self.opts.cwd);
+        let latest = self.history.iter().rev().find_map(|m| match m {
+            Message::Context { content } => Some(content),
+            _ => None,
+        });
+        if latest != Some(&context) {
+            self.push(Message::Context { content: context });
+        }
         self.push(Message::User { content: input });
         let mut last_text = String::new();
         for _ in 0..self.opts.max_steps {

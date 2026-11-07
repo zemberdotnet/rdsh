@@ -10,6 +10,12 @@ use crate::llm::{BoxFuture, ToolSpec};
 pub struct Bash;
 
 impl Tool for Bash {
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Check the [exit code N] marker on bash results and investigate failures before moving on. Do not use bash to read, search, or edit files when a dedicated tool does it.",
+        )
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "bash".into(),

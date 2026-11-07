@@ -162,6 +162,9 @@ fn print_trace(path: &std::path::Path) -> Result<()> {
             trace::TraceEvent::Message { message } => match message {
                 Message::System { .. } => println!("\n[system prompt]"),
                 Message::User { content } => println!("\n› user\n{content}"),
+                Message::Context { content } => {
+                    println!("\n[runtime context] {}", content.lines().skip(2).collect::<Vec<_>>().join(" · "))
+                }
                 Message::Assistant { content, reasoning, tool_calls } => {
                     if let Some(r) = reasoning {
                         println!("\n∴ reasoning ({} chars)", r.len());

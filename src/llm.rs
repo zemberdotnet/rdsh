@@ -26,6 +26,10 @@ pub enum Message {
     User {
         content: String,
     },
+    /// Runtime facts (working directory, platform, date), sent to the model as a user message.
+    Context {
+        content: String,
+    },
     Assistant {
         #[serde(default)]
         content: String,
@@ -124,6 +128,7 @@ pub fn wire_messages(messages: &[Message]) -> Vec<Value> {
         .map(|(i, m)| match m {
             Message::System { content } => json!({"role": "system", "content": content}),
             Message::User { content } => json!({"role": "user", "content": content}),
+            Message::Context { content } => json!({"role": "user", "content": content}),
             Message::Assistant { content, reasoning, tool_calls } => {
                 let mut v = json!({"role": "assistant", "content": content});
                 if !tool_calls.is_empty() {

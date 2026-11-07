@@ -28,6 +28,12 @@ fn rel(root: &Path, p: &Path) -> String {
 pub struct Glob;
 
 impl Tool for Glob {
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Use glob — not shell find or ls -R — to discover files by path pattern.",
+        )
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "glob".into(),
@@ -89,6 +95,12 @@ fn glob(root: &Path, pattern: &str) -> Result<String, String> {
 pub struct Grep;
 
 impl Tool for Grep {
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Use grep — not shell grep or rg — to search file contents. Use read_file on a match when you need surrounding context.",
+        )
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "grep".into(),

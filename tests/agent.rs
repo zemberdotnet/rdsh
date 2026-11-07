@@ -176,7 +176,8 @@ async fn trace_rebuilds_model_visible_history() {
     agent.run_turn("say hi".into(), sink, CancellationToken::new()).await;
     let loaded = trace::load(&traces.path().join("parent.jsonl")).unwrap();
     assert_eq!(loaded.messages, agent.history());
-    let Message::Tool { content, .. } = &loaded.messages[3] else { panic!() };
+    assert!(matches!(&loaded.messages[1], Message::Context { content } if content.contains("Working directory:")));
+    let Message::Tool { content, .. } = &loaded.messages[4] else { panic!("{:?}", loaded.messages) };
     assert_eq!(content.trim(), "hi");
 }
 
@@ -203,4 +204,45 @@ async fn resume_answers_dangling_tool_calls() {
         history,
     );
     assert!(matches!(agent.history().last(), Some(Message::Tool { call_id, .. }) if call_id == "c1"));
+}
+
+#[tokio::test]
+async fn runtime_context_is_sent_once_until_it_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([Message::assistant("a", vec![]), Message::assistant("b", vec![])]));
+    let mut agent = agent_with(provider.clone(), dir.path(), None);
+    let (sink, _) = collecting_sink();
+    agent.run_turn("one".into(), sink.clone(), CancellationToken::new()).await;
+    agent.run_turn("two".into(), sink, CancellationToken::new()).await;
+    let contexts: Vec<_> = agent.history().iter().filter(|m| matches!(m, Message::Context { .. })).collect();
+    assert_eq!(contexts.len(), 1);
+    // The system prompt carries no per-process facts, so it stays a stable cached prefix.
+    let Message::System { content } = &agent.history()[0] else { panic!() };
+    assert!(!content.contains(&dir.path().display().to_string()));
+    // The context precedes the first user message on the wire, as a user-role message.
+    let wire = rdsh::llm::wire_messages(&provider.requests()[0]);
+    assert_eq!(wire[1]["role"], "user");
+    assert!(wire[1]["content"].as_str().unwrap().starts_with("Current runtime context."));
+}
+
+#[test]
+fn system_prompt_carries_guidance_only_for_registered_tools() {
+    let base = tools::builtin();
+    let main = rdsh::prompt::main("deepseek-chat", &base);
+    assert!(main.starts_with("You are rdsh, a coding agent powered by the deepseek-chat model"));
+    assert!(main.contains("Use read_file — not shell commands like cat, sed, head, or tail"));
+    assert!(main.contains("never with sed -i"));
+    assert!(main.contains("Check the [exit code N] marker"));
+    assert!(!main.contains("task calls together"), "task is not registered in the base set");
+    let mut with_task = base.clone();
+    with_task.add(Arc::new(Task::new(
+        Arc::new(ScriptedProvider::default()),
+        Arc::new(base),
+        1,
+        Duration::from_secs(1),
+        30_000,
+        None,
+        "p".into(),
+    )));
+    assert!(rdsh::prompt::main("m", &with_task).contains("task calls together"));
 }

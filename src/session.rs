@@ -55,10 +55,11 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
         Some(dir),
         session_id,
     )));
+    let system_prompt = prompt::main(provider.model(), &registry);
     let opts = AgentOptions {
         provider,
         tools: Arc::new(registry),
-        system_prompt: prompt::main(cwd),
+        system_prompt,
         max_steps: cfg.max_steps,
         cwd: cwd.to_owned(),
         bash_timeout,

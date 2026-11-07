@@ -55,6 +55,11 @@ pub struct ToolCtx {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
+    /// Usage rules added to the system prompt of every agent that has this tool.
+    fn guidance(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this tool may run concurrently with other parallel-safe calls of one response.
     fn parallel_safe(&self) -> bool {
         false
@@ -87,6 +92,11 @@ impl Registry {
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tools.iter().map(|(n, _)| n.as_str())
+    }
+
+    /// System-prompt guidance of the registered tools, in registration order.
+    pub fn guidance(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.tools.iter().filter_map(|(_, t)| t.guidance())
     }
 }
 
