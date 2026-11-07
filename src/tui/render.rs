@@ -188,7 +188,7 @@ impl App {
             let sel = sel_range(self.mode, self.chat_cursor.pos, r, len);
             let cur = (show_cursor && r == self.chat_cursor.pos.row).then_some(self.chat_cursor.pos.col);
             let mut spans = vec![Span::styled(row.gutter, row.gutter_style)];
-            spans.extend(styled(&row.text, row.style, &Marks { links: &links, sel, cursor: cur, ..Marks::default() }, 0, text_w));
+            spans.extend(styled(&row.text, row.style, &Marks { syntax: &row.runs, links: &links, sel, cursor: cur }, 0, text_w));
             if let Some(bg) = row.style.bg {
                 let used: usize = spans.iter().map(|s| s.width()).sum();
                 let fill = (area.width as usize).saturating_sub(used);

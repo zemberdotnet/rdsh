@@ -366,3 +366,62 @@ fn file_view_highlights_added_and_deleted_lines() {
     assert_eq!(cell.bg, super::theme::ADD_BG);
     assert_eq!(h.term.backend().buffer()[(79, y)].bg, super::theme::ADD_BG, "tint fills the row");
 }
+
+#[test]
+fn assistant_markdown_renders_and_quotes_keep_the_source() {
+    use ratatui::style::Modifier;
+    let mut h = Harness::new();
+    h.keys("explain");
+    h.key(KeyCode::Enter);
+    h.sent();
+    let md = "**What it does:** loads `src/lib.rs:2` config\n- `Config` struct, *strict*";
+    h.agent(AgentEvent::TextDelta(md.into()));
+    h.agent(AgentEvent::Assistant { message: Message::assistant(md, vec![]), usage: None });
+    h.agent(AgentEvent::TurnEnd { cancelled: false, error: None });
+    let screen = h.screen();
+    assert!(screen.contains("● What it does: loads src/lib.rs:2 config"), "{screen}");
+    assert!(screen.contains("  • Config struct, strict"), "{screen}");
+    assert!(!screen.contains("**") && !screen.contains('`'), "{screen}");
+    let y = screen.lines().position(|l| l.starts_with("● What")).unwrap() as u16;
+    let buf = h.term.backend().buffer();
+    assert!(buf[(2, y)].modifier.contains(Modifier::BOLD), "bold run is drawn bold");
+    // The path inside the code span is still a link, and the code keeps its color under it.
+    let x = screen.lines().nth(y as usize).unwrap().find("src/lib.rs").unwrap() as u16;
+    assert!(buf[(x, y)].modifier.contains(Modifier::UNDERLINED));
+
+    // Select the whole first line linewise and comment: the quote is the source markdown.
+    h.key(KeyCode::Esc);
+    h.keys("gg}V");
+    h.key(KeyCode::Char('c'));
+    h.keys("ok");
+    h.key(KeyCode::Enter);
+    match &h.app.queue[0].anchor {
+        crate::comments::Anchor::Chat { quote, .. } => {
+            assert_eq!(quote, "**What it does:** loads `src/lib.rs:2` config")
+        }
+        a => panic!("{a:?}"),
+    }
+    // Charwise selection of just the path inside the code span quotes it with its backticks.
+    h.keys("0/src");
+    h.key(KeyCode::Enter);
+    h.keys("v");
+    for _ in 0.."src/lib.rs:2".len() - 1 {
+        h.key(KeyCode::Char('l'));
+    }
+    h.key(KeyCode::Char('c'));
+    h.keys("path?");
+    h.key(KeyCode::Enter);
+    match &h.app.queue[1].anchor {
+        crate::comments::Anchor::Chat { quote, .. } => assert_eq!(quote, "`src/lib.rs:2`"),
+        a => panic!("{a:?}"),
+    }
+}
+
+#[test]
+fn user_messages_are_not_rendered_as_markdown() {
+    let mut h = Harness::new();
+    h.keys("keep **this** and `that`");
+    h.key(KeyCode::Enter);
+    h.sent();
+    assert!(h.screen().contains("› keep **this** and `that`"));
+}

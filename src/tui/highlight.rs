@@ -170,6 +170,30 @@ fn config(lang: Lang) -> Option<&'static HighlightConfiguration> {
     CONFIGS[lang as usize].get_or_init(|| build(lang)).as_ref()
 }
 
+/// Highlights a fenced code block by its info-string language name (`rust`, `py`, `sh`, …).
+///
+/// @returns per-line runs, or None for unknown languages.
+pub fn highlight_lang(name: &str, source: &str) -> Option<Vec<Vec<Run>>> {
+    let ext = match name.to_ascii_lowercase().as_str() {
+        "rust" | "rs" => "rs",
+        "python" | "py" | "python3" => "py",
+        "javascript" | "js" | "jsx" | "mjs" => "js",
+        "typescript" | "ts" => "ts",
+        "tsx" => "tsx",
+        "go" | "golang" => "go",
+        "c" | "h" => "c",
+        "cpp" | "c++" | "cc" | "cxx" | "hpp" => "cpp",
+        "json" | "jsonc" => "json",
+        "sh" | "bash" | "shell" | "zsh" | "console" => "sh",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "nix" => "nix",
+        "md" | "markdown" => "md",
+        _ => return None,
+    };
+    highlight(Path::new(&format!("block.{ext}")), source)
+}
+
 /// Display column of every char boundary in `line` (index = raw char index), matching
 /// `util::sanitize`: tabs widen to four columns and control characters take none.
 fn display_cols(line: &str) -> Vec<usize> {

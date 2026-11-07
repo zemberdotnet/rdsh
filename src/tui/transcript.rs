@@ -1,12 +1,14 @@
 //! The conversation as display rows: entries are rendered to logical lines, wrapped to the
 //! viewport width and cached per entry, so streaming only re-wraps the entry that changed.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthChar;
 
 use super::{
+    highlight::Run,
+    markdown::{self, RawLine},
     motion::{Lines, Pos},
     theme::*,
 };
@@ -89,6 +91,10 @@ pub struct Row {
     pub gutter_style: Style,
     /// Links with char offsets relative to this row.
     pub links: Vec<Link>,
+    /// Inline styling (markdown, code highlighting) with char offsets relative to this row.
+    pub runs: Vec<Run>,
+    /// Source of the logical line when its display text differs (rendered markdown).
+    pub raw: Option<Arc<RawLine>>,
     pub entry: usize,
     /// Index of the logical line within the entry.
     pub logical: usize,
@@ -99,6 +105,8 @@ pub struct Row {
 struct LLine {
     text: String,
     style: Style,
+    runs: Vec<Run>,
+    raw: Option<Arc<RawLine>>,
     gutter: &'static str,
     gutter_style: Style,
     linkify: bool,
@@ -106,7 +114,15 @@ struct LLine {
 
 impl LLine {
     fn new(text: impl Into<String>, style: Style) -> Self {
-        Self { text: text.into(), style, gutter: "  ", gutter_style: Style::default(), linkify: true }
+        Self {
+            text: text.into(),
+            style,
+            runs: Vec::new(),
+            raw: None,
+            gutter: "  ",
+            gutter_style: Style::default(),
+            linkify: true,
+        }
     }
     fn gutter(mut self, g: &'static str, s: Style) -> Self {
         self.gutter = g;
@@ -134,20 +150,8 @@ fn logical_lines(e: &Entry) -> Vec<LLine> {
             }
         }
         Kind::Assistant => {
-            let mut in_code = false;
-            for (i, l) in sanitize(&e.text).lines().enumerate() {
-                let fence = l.trim_start().starts_with("```");
-                let style = if fence {
-                    in_code = !in_code;
-                    dim()
-                } else if in_code {
-                    Style::default().fg(YELLOW)
-                } else if l.starts_with('#') {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                let line = LLine::new(l, style);
+            for (i, r) in markdown::render(&sanitize(&e.text)).into_iter().enumerate() {
+                let line = LLine { runs: r.runs, raw: r.raw, ..LLine::new(r.text, r.style) };
                 out.push(if i == 0 { line.gutter("● ", Style::default().fg(FG)) } else { line });
             }
         }
@@ -265,12 +269,20 @@ fn render_entry(index: usize, e: &Entry, width: usize, resolver: &mut LinkResolv
                     line: lk.line,
                 })
                 .collect();
+            let runs = l
+                .runs
+                .iter()
+                .filter(|r| r.start < offset + len && r.end > offset)
+                .map(|r| Run { start: r.start.max(offset) - offset, end: r.end.min(offset + len) - offset, style: r.style })
+                .collect();
             rows.push(Row {
                 text,
                 style: l.style,
                 gutter: if k == 0 { l.gutter } else { "  " },
                 gutter_style: l.gutter_style,
                 links: row_links,
+                runs,
+                raw: l.raw.clone(),
                 entry: index,
                 logical: li,
                 offset,
@@ -370,8 +382,16 @@ impl Transcript {
         }
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
         let b = Pos { row: b.row.min(self.total - 1), col: b.col };
-        let mut out = String::new();
-        let mut prev: Option<(usize, usize)> = None;
+        // One segment per logical line: the selected display range within it, the displayed
+        // text of that range, and the line's source for rendered markdown.
+        struct Seg {
+            key: (usize, usize),
+            start: usize,
+            end: usize,
+            shown: String,
+            raw: Option<Arc<RawLine>>,
+        }
+        let mut segs: Vec<Seg> = Vec::new();
         let mut sources: Vec<usize> = Vec::new();
         for r in a.row..=b.row {
             let row = self.row(r);
@@ -382,18 +402,27 @@ impl Transcript {
                 (if r == a.row { a.col.min(len) } else { 0 }, if r == b.row { (b.col + 1).min(len) } else { len })
             };
             let piece: String = row.text.chars().skip(s).take(e.saturating_sub(s)).collect();
-            if let Some(p) = prev
-                && !(p == (row.entry, row.logical) && row.offset > 0)
-            {
-                out.push('\n');
-            }
-            out.push_str(&piece);
-            prev = Some((row.entry, row.logical));
             if !piece.trim().is_empty() && sources.last() != Some(&row.entry) {
                 sources.push(row.entry);
             }
+            let key = (row.entry, row.logical);
+            match segs.last_mut() {
+                Some(seg) if seg.key == key => {
+                    seg.end = row.offset + e;
+                    seg.shown.push_str(&piece);
+                }
+                _ => segs.push(Seg { key, start: row.offset + s, end: row.offset + e, shown: piece, raw: row.raw.clone() }),
+            }
         }
-        let text = out.trim_matches('\n').trim_end().to_owned();
+        // Quotes carry the source markdown, so the model can find them in its own message.
+        let pieces: Vec<String> = segs
+            .into_iter()
+            .map(|s| match &s.raw {
+                Some(raw) if s.end > s.start => raw.slice(s.start, s.end),
+                _ => s.shown,
+            })
+            .collect();
+        let text = pieces.join("\n").trim_matches('\n').trim_end().to_owned();
         if text.trim().is_empty() {
             return None;
         }
