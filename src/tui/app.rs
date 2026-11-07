@@ -205,6 +205,10 @@ impl App {
             self.ctrl_c();
             return;
         }
+        if ctrl && k.code == KeyCode::Enter {
+            self.send_now();
+            return;
+        }
         self.ctrl_c_armed = false;
         self.flash = None;
         match self.mode {
@@ -274,6 +278,22 @@ impl App {
             InputAction::Edited => self.hist_pos = None,
             _ => {}
         }
+    }
+
+    /// Ctrl-Enter from any mode: finish the comment being written, then send the queue and prompt.
+    fn send_now(&mut self) {
+        self.ctrl_c_armed = false;
+        self.flash = None;
+        match self.mode {
+            Mode::Comment => self.save_comment(),
+            Mode::Visual { .. } | Mode::Search { .. } | Mode::Command => self.mode = Mode::Normal,
+            Mode::Normal | Mode::Insert => {}
+        }
+        if self.queue.is_empty() && self.prompt.is_blank() {
+            self.set_flash("nothing to send — comment with c or type with i");
+            return;
+        }
+        self.submit();
     }
 
     /// Sends the prompt plus all queued comments as the next user message.
@@ -562,24 +582,27 @@ impl App {
         self.mode = Mode::Comment;
     }
 
+    /// Saves the comment being edited into the queue (or updates the edited one).
+    fn save_comment(&mut self) {
+        let body = self.comment.take();
+        if body.trim().is_empty() {
+            self.set_flash("empty comment discarded");
+        } else if let Some(i) = self.editing.take() {
+            if let Some(c) = self.queue.get_mut(i) {
+                c.body = body;
+            }
+        } else if let Some(anchor) = self.comment_target.take() {
+            self.queue.push(Comment { anchor, body });
+            let n = self.queue.len();
+            self.set_flash(format!("comment queued ({n}) — sent with your next message"));
+        }
+        self.comment_target = None;
+        self.mode = Mode::Normal;
+    }
+
     fn comment_key(&mut self, k: KeyEvent) {
         match self.comment.handle(k) {
-            InputAction::Submit => {
-                let body = self.comment.take();
-                if body.trim().is_empty() {
-                    self.set_flash("empty comment discarded");
-                } else if let Some(i) = self.editing.take() {
-                    if let Some(c) = self.queue.get_mut(i) {
-                        c.body = body;
-                    }
-                } else if let Some(anchor) = self.comment_target.take() {
-                    self.queue.push(Comment { anchor, body });
-                    let n = self.queue.len();
-                    self.set_flash(format!("comment queued ({n}) — sent with your next message"));
-                }
-                self.comment_target = None;
-                self.mode = Mode::Normal;
-            }
+            InputAction::Submit => self.save_comment(),
             InputAction::Cancel => {
                 self.comment_target = None;
                 self.editing = None;

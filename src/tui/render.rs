@@ -365,7 +365,7 @@ impl App {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
             .title(format!(" Comment on {label} "))
-            .title_bottom(Span::styled(" Enter save · Shift-Enter newline · Esc cancel ", dim()));
+            .title_bottom(Span::styled(" Enter save · Ctrl-Enter save & send · Shift-Enter newline · Esc cancel ", dim()));
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(lines).block(block), area);
         let y = area.y + 1 + input_start as u16 + cur.1 - skip as u16;
@@ -403,9 +403,9 @@ impl App {
     fn draw_prompt(&self, f: &mut Frame, area: Rect, lines: &[String], cur: (u16, u16)) {
         if self.prompt.text.is_empty() && self.mode != Mode::Insert {
             let hint = if self.queue.is_empty() {
-                "  press i to type · Enter sends"
+                "  press i to type · Enter sends · Ctrl-Enter sends from any mode"
             } else {
-                "  press i to add a message, Enter sends it with the queued comments (or :send)"
+                "  Ctrl-Enter sends the queued comments · i adds a message"
             };
             f.render_widget(Paragraph::new(Line::from(vec![Span::styled("›", dim()), Span::styled(hint, dim())])), area);
             return;
@@ -509,7 +509,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l(""),
         h("Other"),
         l("  Tab or za expands/collapses tool output · Q comment queue (e edit, dd delete, D clear)"),
-        l("  :send sends queued comments · :dropcomments · :q quit · Ctrl-C interrupts / clears / quits (twice)"),
+        l("  Ctrl-Enter (any mode) sends queued comments + prompt text; in a comment it saves, then sends"),
+        l("  :send · :dropcomments · :q quit · Ctrl-C interrupts / clears / quits (twice)"),
     ];
     f.render_widget(Paragraph::new(text), area);
 }

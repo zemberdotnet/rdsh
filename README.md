@@ -40,6 +40,7 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | `/ ? n N` | search (smartcase) |
 | `v` / `V` | charwise / linewise select; `o` swaps ends, `y` yanks via OSC 52 |
 | `c` (or Enter in visual) | comment on the selection (or the current line) |
+| Ctrl-Enter (any mode) | send queued comments plus any prompt text; inside a comment, save it then send |
 | Enter / `gf` / mouse click on a path | open the file's diff view |
 | Tab / `za` | expand or collapse tool output and reasoning |
 | `Q` | comment queue (`e` edit, `dd` delete, `D` clear) |

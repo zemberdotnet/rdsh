@@ -294,3 +294,32 @@ fn shift_enter_adds_a_newline_in_comments() {
     h.key(KeyCode::Enter);
     assert_eq!(h.app.queue[0].body, "first\nsecond");
 }
+
+#[test]
+fn ctrl_enter_sends_from_any_mode() {
+    let ctrl_enter = || Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    let mut h = Harness::new();
+    h.keys("start");
+    h.key(KeyCode::Enter);
+    h.sent();
+    h.complete_turn();
+    h.key(KeyCode::Esc);
+    // Nothing queued or typed: nothing is sent.
+    h.app.on_event(ctrl_enter());
+    assert!(h.rx.try_recv().is_err());
+    // Normal mode: queue a comment, then Ctrl-Enter sends it without entering insert mode.
+    h.keys("gg}c");
+    h.keys("one");
+    h.key(KeyCode::Enter);
+    h.app.on_event(ctrl_enter());
+    let sent = h.sent();
+    assert!(sent.contains("Comment: one") && sent.ends_with("</review_comments>"), "{sent}");
+    assert_eq!(h.app.mode, Mode::Normal);
+    h.complete_turn();
+    // Inside the comment editor: Ctrl-Enter saves the comment and sends.
+    h.keys("gg}c");
+    h.keys("two");
+    h.app.on_event(ctrl_enter());
+    assert!(h.sent().contains("Comment: two"));
+    assert!(h.app.queue.is_empty());
+}
