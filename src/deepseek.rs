@@ -26,7 +26,7 @@ impl DeepSeek {
         let api_key = cfg
             .api_key
             .clone()
-            .context("DEEPSEEK_API_KEY is not set (environment or ./.env)")?;
+            .context("no API key: run `rdsh login` (or set DEEPSEEK_API_KEY)")?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .build()

@@ -1,7 +1,8 @@
 //! Runtime configuration: defaults, `~/.config/rdsh/config.json`, then environment.
 //!
 //! Precedence (later wins): built-in defaults, config file, `.env` in the working
-//! directory, process environment. Invalid config files fail loudly at startup.
+//! directory, process environment. The API key falls back to `rdsh login` credentials.
+//! Invalid config files fail loudly at startup.
 
 use std::{
     collections::HashMap,
@@ -82,7 +83,10 @@ impl Config {
         if let Some(v) = var("RDSH_MODEL") {
             cfg.model = v;
         }
-        cfg.api_key = var("DEEPSEEK_API_KEY");
+        cfg.api_key = match var("DEEPSEEK_API_KEY") {
+            Some(k) => Some(k),
+            None => crate::auth::load()?,
+        };
         cfg.validate()?;
         Ok(cfg)
     }
@@ -116,11 +120,16 @@ fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+/// `$XDG_CONFIG_HOME/rdsh` (default `~/.config/rdsh`).
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"));
-    Some(base.join("rdsh").join("config.json"))
+        .unwrap_or_else(|| home().join(".config"))
+        .join("rdsh")
+}
+
+fn config_path() -> Option<PathBuf> {
+    Some(config_dir().join("config.json"))
 }
 
 fn data_home() -> PathBuf {

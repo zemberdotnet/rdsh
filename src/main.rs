@@ -16,6 +16,8 @@ rdsh — terminal coding agent for DeepSeek models
 USAGE:
     rdsh [OPTIONS]                 interactive TUI
     rdsh run [OPTIONS] <PROMPT>    run one turn headless (stdout: answer, stderr: progress)
+    rdsh login                     store a DeepSeek API key (~/.config/rdsh/credentials.json)
+    rdsh logout                    remove the stored key
     rdsh sessions [--all]          list recorded sessions
     rdsh trace [ID|last]           print a session trace as readable text
 
@@ -27,7 +29,7 @@ OPTIONS:
     -V, --version          show version
 
 ENVIRONMENT:
-    DEEPSEEK_API_KEY       required for model requests (also read from ./.env)
+    DEEPSEEK_API_KEY       API key; overrides `rdsh login` (also read from ./.env)
     DEEPSEEK_BASE_URL      API base URL (default https://api.deepseek.com)
 
 Config file: ~/.config/rdsh/config.json (see README).";
@@ -61,7 +63,7 @@ fn parse_args() -> Result<Option<Args>> {
             "--all" => a.all = true,
             "--" => a.positional.extend(it.by_ref()),
             s if s.starts_with('-') && s.len() > 1 => bail!("unknown option {s} (see --help)"),
-            "run" | "sessions" | "trace" if a.command.is_none() && a.positional.is_empty() => {
+            "run" | "sessions" | "trace" | "login" | "logout" if a.command.is_none() && a.positional.is_empty() => {
                 a.command = Some(arg.clone())
             }
             _ => a.positional.push(arg.clone()),
@@ -91,6 +93,15 @@ fn real_main() -> Result<i32> {
         cfg.model = m.clone();
     }
     match args.command.as_deref() {
+        Some("login") => runtime()?.block_on(rdsh::auth::login(&cfg.base_url)),
+        Some("logout") => {
+            if rdsh::auth::logout()? {
+                eprintln!("removed {}", rdsh::auth::credentials_path().display());
+            } else {
+                eprintln!("not logged in");
+            }
+            Ok(0)
+        }
         Some("sessions") => {
             for s in trace::list_sessions(&cfg.sessions_dir()) {
                 if s.parent.is_some() && !args.all {

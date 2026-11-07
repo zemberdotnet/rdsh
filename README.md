@@ -9,8 +9,8 @@ chat text, and send all queued comments, quoted, with your next message.
 
 ```sh
 direnv allow                     # loads flake.nix (cargo, rustc, clippy) and ./.env
-echo 'DEEPSEEK_API_KEY=sk-...' > .env
 cargo build --release
+./target/release/rdsh login      # paste your key; it is verified and saved to ~/.config/rdsh/credentials.json (0600)
 ./target/release/rdsh            # TUI in the current directory
 ./target/release/rdsh -C ~/some/project
 ./target/release/rdsh run "fix the failing test"   # one headless turn
@@ -18,7 +18,7 @@ cargo build --release
 ./target/release/rdsh trace last # readable trace (subagent traces are <id>-subN)
 ```
 
-Without direnv, use `nix develop`. Options: `-m/--model` (default `deepseek-chat`, env `RDSH_MODEL`), `-C/--cwd`, `-r/--resume`. `DEEPSEEK_BASE_URL` points at any OpenAI-compatible endpoint. rdsh also reads `.env` in its working directory.
+Without direnv, use `nix develop`. `DEEPSEEK_API_KEY` (environment or `.env`) overrides the stored login; `rdsh logout` removes it. Options: `-m/--model` (default `deepseek-chat`, env `RDSH_MODEL`), `-C/--cwd`, `-r/--resume`. `DEEPSEEK_BASE_URL` points at any OpenAI-compatible endpoint. rdsh also reads `.env` in its working directory.
 
 Optional `~/.config/rdsh/config.json` (all keys optional):
 

@@ -1,6 +1,7 @@
 //! rdsh: a fast, low-footprint terminal coding agent for DeepSeek models.
 
 pub mod agent;
+pub mod auth;
 pub mod comments;
 pub mod config;
 pub mod deepseek;
