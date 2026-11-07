@@ -37,6 +37,8 @@ pub struct Config {
     pub sessions_dir: Option<PathBuf>,
     /// Ask the decision model how long each reply should be (top-level TUI turns only).
     pub length_routing: bool,
+    /// Name new sessions with a short model-written title for the session rail.
+    pub session_titles: bool,
     /// System One decisions endpoint; defaults to OpenRouter's, or TypeSafe's for a TypeSafe key.
     pub decision_url: Option<String>,
     /// Decision model id; defaults to Jev for the chosen endpoint.
@@ -66,6 +68,7 @@ impl Default for Config {
             stream_idle_timeout_secs: 180,
             sessions_dir: None,
             length_routing: true,
+            session_titles: true,
             decision_url: None,
             decision_model: None,
             decision_timeout_ms: 2500,

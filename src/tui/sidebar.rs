@@ -82,7 +82,8 @@ impl Sidebar {
         let mut rows = Vec::new();
         for s in infos.iter().filter(|s| s.parent.is_none() && s.cwd == cwd) {
             let live = running.contains(&s.id).then_some(Live::Running);
-            rows.push(Row { id: s.id.clone(), depth: 0, title: s.title.clone(), live });
+            let title = s.slug.clone().unwrap_or_else(|| s.title.clone());
+            rows.push(Row { id: s.id.clone(), depth: 0, title, live });
             if let Some(mut children) = subs.remove(s.id.as_str()) {
                 children.sort_by_key(|r| sub_number(&r.id));
                 rows.extend(children);
@@ -138,6 +139,7 @@ mod tests {
             parent: parent.map(str::to_owned),
             cwd: cwd.into(),
             title: title.into(),
+            slug: None,
         }
     }
 
@@ -180,6 +182,16 @@ mod tests {
         live.insert("b-sub1".into(), LiveSub { parent: "b".into(), title: "inspect manifest".into(), state: Live::Done });
         assert_eq!(Sidebar::build(&infos, "/p", &live, &HashSet::new()).rows()[1].title, "inspect manifest");
         assert_eq!(Sidebar::build(&infos, "/p", &HashMap::new(), &HashSet::new()).rows()[1].title, "read Cargo.toml and report");
+    }
+
+    #[test]
+    fn sessions_show_their_short_title_when_they_have_one() {
+        let mut named = info("b", "please refactor the whole parser module so that it", None, "/p");
+        named.slug = Some("refactor parser".into());
+        let infos = vec![named, info("a", "fix the bug", None, "/p")];
+        let sb = Sidebar::build(&infos, "/p", &HashMap::new(), &HashSet::new());
+        let titles: Vec<_> = sb.rows().iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles, ["refactor parser", "fix the bug"]);
     }
 
     #[test]

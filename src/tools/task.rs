@@ -126,6 +126,7 @@ impl Tool for Task {
                 max_tool_output: self.max_tool_output,
                 trace,
                 length: None,
+                titler: None,
             });
             let parent = ctx.sink.clone();
             let call_id = ctx.call_id.clone();

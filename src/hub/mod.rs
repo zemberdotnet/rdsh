@@ -224,12 +224,19 @@ impl Hub {
     }
 
     fn publish(&self, id: &str, ev: AgentEvent) {
-        let mut st = self.state();
-        if let Some(slot) = st.sessions.get_mut(id) {
-            slot.record(&ev);
+        let titled = matches!(ev, AgentEvent::Titled { .. });
+        {
+            let mut st = self.state();
+            if let Some(slot) = st.sessions.get_mut(id) {
+                slot.record(&ev);
+            }
+            for c in st.clients.iter().filter(|c| c.subscribed.contains(id)) {
+                let _ = c.tx.send(Notice::Event { session_id: id.to_owned(), event: ev.clone() });
+            }
         }
-        for c in st.clients.iter().filter(|c| c.subscribed.contains(id)) {
-            let _ = c.tx.send(Notice::Event { session_id: id.to_owned(), event: ev.clone() });
+        // Every client's rail shows titles, not only subscribers'.
+        if titled {
+            self.broadcast_sessions();
         }
     }
 

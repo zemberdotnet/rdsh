@@ -26,6 +26,7 @@ fn options(provider: Arc<dyn Provider>, cwd: &Path, t: trace::Trace) -> AgentOpt
         max_tool_output: 30_000,
         trace: Some(t),
         length: None,
+        titler: None,
     }
 }
 

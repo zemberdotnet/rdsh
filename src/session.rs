@@ -9,6 +9,7 @@ use crate::{
     config::Config,
     decision::SystemOne,
     length::LengthRouter,
+    title::Titler,
     llm::Provider,
     prompt,
     tools::{self, task::Task},
@@ -58,6 +59,7 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
         session_id,
     )));
     let system_prompt = prompt::main(provider.model(), &registry);
+    let provider_for_titles = provider.clone();
     let length = match cfg.length_routing {
         true => SystemOne::from_config(cfg)?.map(|d| Arc::new(LengthRouter::new(Arc::new(d)))),
         false => None,
@@ -72,6 +74,7 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
         max_tool_output: cfg.max_tool_output_chars,
         trace: Some(trace),
         length,
+        titler: cfg.session_titles.then(|| Arc::new(Titler::new(provider_for_titles.clone()))),
     };
     Ok(match history {
         Some(h) => Agent::resume(opts, h),

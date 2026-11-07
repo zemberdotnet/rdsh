@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     length::{LengthRouter, Routing},
+    title::{self, Titler},
     llm::{Delta, Message, Provider, Request, ToolCall, ToolSpec, Usage},
     prompt,
     tools::{Registry, ToolCtx, ToolOutput},
@@ -20,6 +21,8 @@ use crate::{
 pub enum AgentEvent {
     /// A turn began with this user message (always the first event of a turn).
     TurnStarted { text: String },
+    /// The session got its short title (written next to its trace).
+    Titled { title: String },
     TextDelta(String),
     ReasoningDelta(String),
     /// The model started emitting a call to `name` (arguments still streaming).
@@ -61,6 +64,8 @@ pub struct AgentOptions {
     pub trace: Option<Trace>,
     /// Picks the reply length each turn; `None` for subagents and headless runs.
     pub length: Option<Arc<LengthRouter>>,
+    /// Names the session after its first message; `None` for subagents and headless runs.
+    pub titler: Option<Arc<Titler>>,
 }
 
 pub struct Agent {
@@ -101,6 +106,36 @@ impl Agent {
             }
         }
         agent
+    }
+
+    /// Starts naming the session in the background, once, if it has a trace and no title yet.
+    /// Uses the session's first user message (from history when resumed). Failures leave the
+    /// session unnamed; the rail then shows its first message.
+    fn name_session(&mut self, input: &str, sink: &EventSink) {
+        let (Some(titler), Some(trace)) = (self.opts.titler.take(), self.opts.trace.as_ref()) else { return };
+        let path = title::path_for(&trace.path);
+        if path.exists() {
+            return;
+        }
+        let first = self
+            .history
+            .iter()
+            .find_map(|m| match m {
+                Message::User { content } => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| input.to_owned());
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            match titler.title(&first).await {
+                Ok(t) => match std::fs::write(&path, format!("{t}\n")) {
+                    Ok(()) => sink(AgentEvent::Titled { title: t }),
+                    Err(e) => sink(AgentEvent::Warning(format!("could not save the session title: {e}"))),
+                },
+                // An unnamed session is fine; the rail falls back to its first message.
+                Err(_) => {}
+            }
+        });
     }
 
     fn bare(opts: AgentOptions, history: Vec<Message>) -> Self {
@@ -164,6 +199,7 @@ impl Agent {
     /// @returns the final assistant text and how the turn ended.
     pub async fn run_turn(&mut self, input: String, sink: EventSink, cancel: CancellationToken) -> TurnOutcome {
         sink(AgentEvent::TurnStarted { text: input.clone() });
+        self.name_session(&input, &sink);
         let context = prompt::runtime_context(&self.opts.cwd);
         let latest = self.history.iter().rev().find_map(|m| match m {
             Message::Context { content } => Some(content),

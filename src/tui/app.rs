@@ -1328,6 +1328,8 @@ impl App {
 
     pub fn on_agent(&mut self, ev: AgentEvent) {
         match ev {
+            // The rail picks titles up from the hub's next `Sessions` notice.
+            AgentEvent::Titled { .. } => {}
             AgentEvent::TurnStarted { text } => {
                 self.close_streams();
                 self.cur.transcript.push(Kind::User, text);

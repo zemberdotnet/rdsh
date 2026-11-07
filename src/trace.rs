@@ -156,6 +156,9 @@ pub struct SessionInfo {
     pub parent: Option<String>,
     /// Working directory the session ran in.
     pub cwd: String,
+    /// Short model-written title, when one was saved (`title::read`).
+    #[serde(default)]
+    pub slug: Option<String>,
     pub title: String,
 }
 
@@ -186,7 +189,8 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionInfo> {
                 }
             }
             let id = path.file_stem()?.to_string_lossy().into_owned();
-            Some(SessionInfo { id, path, modified, parent, cwd, title })
+            let slug = crate::title::read(&path);
+            Some(SessionInfo { id, path, modified, parent, cwd, title, slug })
         })
         .collect();
     out.sort_by_key(|s| std::cmp::Reverse(s.modified));

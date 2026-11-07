@@ -14,6 +14,7 @@ pub mod links;
 pub mod llm;
 pub mod prompt;
 pub mod session;
+pub mod title;
 pub mod tools;
 pub mod trace;
 pub mod tui;

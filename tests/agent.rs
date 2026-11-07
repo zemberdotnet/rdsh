@@ -38,6 +38,7 @@ fn agent_with(provider: Arc<dyn Provider>, cwd: &std::path::Path, trace_dir: Opt
         max_tool_output: 30_000,
         trace,
         length: None,
+        titler: None,
     })
 }
 
@@ -202,6 +203,7 @@ async fn resume_answers_dangling_tool_calls() {
             max_tool_output: 30_000,
             trace: None,
             length: None,
+            titler: None,
         },
         history,
     );
@@ -307,6 +309,7 @@ async fn length_note_follows_the_user_message_but_not_subagent_tasks() {
             max_tool_output: 30_000,
             trace: None,
             length: Some(Arc::new(LengthRouter::new(decider.clone()))),
+            titler: None,
         })
     };
     let (sink, events) = collecting_sink();
@@ -334,4 +337,41 @@ async fn length_note_follows_the_user_message_but_not_subagent_tasks() {
     let evs = events.lock().unwrap();
     assert!(evs.iter().any(|e| matches!(e, AgentEvent::Warning(w) if w.contains("503"))));
     assert!(evs.iter().any(|e| matches!(e, AgentEvent::ResponseLength(Routing::Unavailable { .. }))));
+}
+
+#[tokio::test]
+async fn sessions_are_titled_once_in_the_background() {
+    let dir = tempfile::tempdir().unwrap();
+    let traces = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([Message::assistant("a", vec![]), Message::assistant("b", vec![])]));
+    let namer = Arc::new(ScriptedProvider::new([Message::assistant("Fix Markdown Rendering.", vec![])]));
+    let t = trace::Trace::create(traces.path(), "s1", "scripted", dir.path(), None).unwrap();
+    let path = t.path.clone();
+    let mut agent = Agent::new(AgentOptions {
+        provider: provider.clone(),
+        tools: Arc::new(tools::builtin()),
+        system_prompt: "sys".into(),
+        max_steps: 3,
+        cwd: dir.path().to_path_buf(),
+        bash_timeout: Duration::from_secs(5),
+        max_tool_output: 30_000,
+        trace: Some(t),
+        length: None,
+        titler: Some(Arc::new(rdsh::title::Titler::new(namer.clone()))),
+    });
+    let (sink, events) = collecting_sink();
+    agent.run_turn("the markdown renderer eats my asterisks".into(), sink.clone(), CancellationToken::new()).await;
+    for _ in 0..50 {
+        if events.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::Titled { .. })) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(events.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::Titled { title } if title == "Fix Markdown Rendering")));
+    assert_eq!(rdsh::title::read(&path).as_deref(), Some("Fix Markdown Rendering"));
+    assert_eq!(trace::list_sessions(traces.path())[0].slug.as_deref(), Some("Fix Markdown Rendering"));
+    // The title request never reaches the session's own history or model.
+    assert!(provider.requests().iter().all(|r| r.iter().all(|m| !matches!(m, Message::System { content } if content.contains("2 to 5 word")))));
+    agent.run_turn("again".into(), sink, CancellationToken::new()).await;
+    assert_eq!(namer.requests().len(), 1, "named once");
 }
