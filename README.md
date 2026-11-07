@@ -45,6 +45,7 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | Tab / `za` | expand or collapse tool output and reasoning |
 | `Q` | comment queue (`e` edit, `dd` delete, `D` clear) |
 | `F` | list changed files (`git status`) |
+| `S`, `Ctrl-w h` / `Ctrl-w l` | show or hide the session rail; move focus into it and back (`j k g G`, Enter shows how to resume, `y` copies the id) |
 | `:e path[:line]`, `:send`, `:help`, `:q` | commands |
 | Ctrl-C | interrupt the turn, clear input, or quit (press twice) |
 

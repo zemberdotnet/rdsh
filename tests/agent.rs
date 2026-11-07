@@ -246,3 +246,29 @@ fn system_prompt_carries_guidance_only_for_registered_tools() {
     )));
     assert!(rdsh::prompt::main("m", &with_task).contains("task calls together"));
 }
+
+#[tokio::test]
+async fn subagent_ids_continue_after_existing_traces_and_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let traces = tempfile::tempdir().unwrap();
+    // A resumed session already has two subagent traces on disk.
+    for n in [1, 2] {
+        trace::Trace::create(traces.path(), &format!("parent-sub{n}"), "m", dir.path(), Some("parent")).unwrap();
+    }
+    let provider = Arc::new(ScriptedProvider::new([
+        Message::assistant("", vec![call("t1", "task", serde_json::json!({"description": "scan lexer", "prompt": "go"}))]),
+        Message::assistant("sub done", vec![]),
+        Message::assistant("all done", vec![]),
+    ]));
+    let mut agent = agent_with(provider, dir.path(), Some(traces.path()));
+    let (sink, events) = collecting_sink();
+    let out = agent.run_turn("x".into(), sink, CancellationToken::new()).await;
+    assert_eq!(out.text, "all done");
+    assert!(traces.path().join("parent-sub3.jsonl").exists());
+    let evs = events.lock().unwrap();
+    let started = evs.iter().find_map(|e| match e {
+        AgentEvent::SubagentStarted { call_id, session_id, title } => Some((call_id.clone(), session_id.clone(), title.clone())),
+        _ => None,
+    });
+    assert_eq!(started, Some(("t1".into(), "parent-sub3".into(), "scan lexer".into())));
+}

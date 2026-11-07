@@ -1,14 +1,14 @@
 //! `task`: delegate work to a subagent with its own context window and trace.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicUsize, atomic::Ordering},
     time::Duration,
 };
 
 use serde_json::{Value, json};
 
-use super::{Registry, Tool, ToolCtx, ToolOutput, schema, str_arg};
+use super::{Registry, Tool, ToolCtx, ToolOutput, opt_str, schema, str_arg};
 use crate::{
     agent::{Agent, AgentEvent, AgentOptions, EventSink},
     llm::{BoxFuture, Provider, ToolSpec},
@@ -40,17 +40,25 @@ impl Task {
         trace_dir: Option<PathBuf>,
         parent_session: String,
     ) -> Self {
-        Self {
-            provider,
-            tools,
-            max_steps,
-            bash_timeout,
-            max_tool_output,
-            trace_dir,
-            parent_session,
-            counter: AtomicUsize::new(0),
-        }
+        let counter = AtomicUsize::new(trace_dir.as_deref().map_or(0, |d| highest_sub(d, &parent_session)));
+        Self { provider, tools, max_steps, bash_timeout, max_tool_output, trace_dir, parent_session, counter }
     }
+}
+
+/// Highest `N` among existing `<parent>-sub<N>.jsonl` traces, so a resumed session keeps
+/// numbering after its earlier subagents instead of colliding with them.
+fn highest_sub(dir: &Path, parent: &str) -> usize {
+    let prefix = format!("{parent}-sub");
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&prefix)?.strip_suffix(".jsonl")?.parse::<usize>().ok()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 impl Tool for Task {
@@ -87,17 +95,27 @@ impl Tool for Task {
                 Ok(p) => p,
                 Err(e) => return ToolOutput::err(e),
             };
-            let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
-            let child_id = format!("{}-sub{n}", self.parent_session);
+            let title = opt_str(&args, "description").unwrap_or_else(|| "subagent".into());
+            let next_id = || format!("{}-sub{}", self.parent_session, self.counter.fetch_add(1, Ordering::Relaxed) + 1);
+            let mut child_id = next_id();
             let trace = match &self.trace_dir {
                 Some(dir) => {
-                    match Trace::create(dir, &child_id, self.provider.model(), &ctx.cwd, Some(&self.parent_session)) {
-                        Ok(t) => Some(t),
-                        Err(e) => return ToolOutput::err(format!("could not create subagent trace: {e:#}")),
+                    // Another process (or an older run) may already own the next id; skip past it.
+                    let mut attempt = 0;
+                    loop {
+                        match Trace::create(dir, &child_id, self.provider.model(), &ctx.cwd, Some(&self.parent_session)) {
+                            Ok(t) => break Some(t),
+                            Err(_) if attempt < 100 && dir.join(format!("{child_id}.jsonl")).exists() => {
+                                attempt += 1;
+                                child_id = next_id();
+                            }
+                            Err(e) => return ToolOutput::err(format!("could not create subagent trace: {e:#}")),
+                        }
                     }
                 }
                 None => None,
             };
+            (ctx.sink)(AgentEvent::SubagentStarted { call_id: ctx.call_id.clone(), session_id: child_id.clone(), title });
             let mut agent = Agent::new(AgentOptions {
                 provider: self.provider.clone(),
                 tools: self.tools.clone(),

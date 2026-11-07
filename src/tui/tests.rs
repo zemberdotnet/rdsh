@@ -471,3 +471,94 @@ fn sidebar_toggles_with_s_and_hides_on_narrow_terminals() {
     narrow.draw(|f| app.draw(f)).unwrap();
     assert!(h.app.sidebar_area.is_none(), "rail yields to the chat below the width floor");
 }
+
+/// A harness whose session `s1` is recorded on disk, so the rail lists it.
+fn harness_with_session() -> Harness {
+    let mut h = Harness::new();
+    let dir = h._dir.path().join("sessions");
+    let cwd = h.app.transcript.cwd().to_path_buf();
+    crate::trace::Trace::create(&dir, "s0", "m", &cwd, None)
+        .unwrap()
+        .record(crate::trace::TraceEvent::Message { message: Message::user("older work") })
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    crate::trace::Trace::create(&dir, "s1", "m", &cwd, None)
+        .unwrap()
+        .record(crate::trace::TraceEvent::Message { message: Message::user("current work") })
+        .unwrap();
+    h.app.sessions_dir = Some(dir);
+    h.app.sidebar_open = true;
+    h.app.refresh_sidebar();
+    h.draw();
+    h
+}
+
+fn task_call(id: &str) -> ToolCall {
+    ToolCall { id: id.into(), name: "task".into(), arguments: r#"{"description":"d","prompt":"p"}"#.into() }
+}
+
+#[test]
+fn running_subagents_appear_immediately_and_settle() {
+    let mut h = harness_with_session();
+    h.keys("go");
+    h.key(KeyCode::Enter);
+    h.sent();
+    h.agent(AgentEvent::ToolStart { call: task_call("t1") });
+    h.agent(AgentEvent::SubagentStarted { call_id: "t1".into(), session_id: "s1-sub1".into(), title: "scan lexer".into() });
+    let screen = h.screen();
+    let row = screen.lines().find(|l| l.contains("scan lexer")).unwrap_or_else(|| panic!("{screen}"));
+    assert!(super::render::SPINNER.iter().any(|s| row.contains(s)), "running row shows the spinner: {row:?}");
+    let cur = screen.lines().position(|l| l.contains("current work")).unwrap();
+    let sub = screen.lines().position(|l| l.contains("scan lexer")).unwrap();
+    assert_eq!(sub, cur + 1, "nested under the current session");
+
+    h.agent(AgentEvent::Subagent { call_id: "t1".into(), event: Box::new(AgentEvent::TurnEnd { cancelled: false, error: None }) });
+    h.agent(AgentEvent::ToolEnd { call_id: "t1".into(), output: ToolOutput::ok("x"), duration_ms: 5 });
+    assert!(h.screen().lines().any(|l| l.contains("● scan lexer")));
+    h.agent(AgentEvent::TurnEnd { cancelled: false, error: None });
+
+    // A later turn: the reported id is used as is, and a failure shows ✗.
+    h.keys("again");
+    h.key(KeyCode::Enter);
+    h.sent();
+    h.agent(AgentEvent::ToolStart { call: task_call("t2") });
+    h.agent(AgentEvent::SubagentStarted { call_id: "t2".into(), session_id: "s1-sub2".into(), title: "check docs".into() });
+    h.agent(AgentEvent::ToolEnd { call_id: "t2".into(), output: ToolOutput::err("boom"), duration_ms: 5 });
+    let screen = h.screen();
+    assert!(screen.lines().any(|l| l.contains("✗ check docs")), "{screen}");
+    assert!(screen.lines().any(|l| l.contains("● scan lexer")), "{screen}");
+}
+
+#[test]
+fn rail_focus_selection_and_mouse() {
+    let mut h = harness_with_session();
+    h.key(KeyCode::Esc);
+    h.app.on_event(Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+    h.key(KeyCode::Char('h'));
+    assert!(h.app.sidebar_focus);
+    assert!(h.screen().contains(" sessions "), "status shows the focused view");
+    // The selection starts on the current session; j moves to the older one.
+    assert_eq!(h.app.sidebar.rows()[h.app.sidebar_sel].id, "s1");
+    h.key(KeyCode::Char('j'));
+    assert_eq!(h.app.sidebar.rows()[h.app.sidebar_sel].id, "s0");
+    h.key(KeyCode::Enter);
+    assert!(h.screen().contains("resume: rdsh --resume s0"), "{}", h.screen());
+    h.key(KeyCode::Char('y'));
+    assert!(h.app.osc_out.as_deref().is_some_and(|s| s.starts_with("\x1b]52;c;")));
+    // Navigation keys no longer reach the chat while the rail has focus.
+    h.key(KeyCode::Char('k'));
+    assert_eq!(h.app.sidebar.rows()[h.app.sidebar_sel].id, "s1");
+    h.key(KeyCode::Esc);
+    assert!(!h.app.sidebar_focus);
+    // Clicking a row focuses the rail and selects it; clicking the chat returns focus.
+    let screen = h.screen();
+    let y = screen.lines().position(|l| l.contains("older work")).unwrap() as u16;
+    let click = |row: u16, col: u16| {
+        Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: col, row, modifiers: KeyModifiers::NONE })
+    };
+    h.app.on_event(click(y, 3));
+    assert!(h.app.sidebar_focus);
+    assert_eq!(h.app.sidebar.rows()[h.app.sidebar_sel].id, "s0");
+    h.app.on_event(click(1, 50));
+    assert!(!h.app.sidebar_focus);
+}

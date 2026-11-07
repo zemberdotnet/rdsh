@@ -24,6 +24,8 @@ pub enum AgentEvent {
     Assistant { message: Message, usage: Option<Usage> },
     ToolStart { call: ToolCall },
     ToolEnd { call_id: String, output: ToolOutput, duration_ms: u64 },
+    /// The `task` call `call_id` started a subagent recorded as session `session_id`.
+    SubagentStarted { call_id: String, session_id: String, title: String },
     /// An event from the subagent running inside tool call `call_id`.
     Subagent { call_id: String, event: Box<AgentEvent> },
     /// Non-fatal problem (for example, the trace could not be written).

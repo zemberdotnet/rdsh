@@ -153,6 +153,8 @@ pub struct SessionInfo {
     pub path: PathBuf,
     pub modified: SystemTime,
     pub parent: Option<String>,
+    /// Working directory the session ran in.
+    pub cwd: String,
     pub title: String,
 }
 
@@ -167,10 +169,14 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionInfo> {
             let modified = e.metadata().ok()?.modified().ok()?;
             let file = File::open(&path).ok()?;
             let mut parent = None;
+            let mut cwd = String::new();
             let mut title = String::new();
             for line in BufReader::new(file).lines().take(8).map_while(Result::ok) {
                 match serde_json::from_str::<Record>(&line).map(|r| r.event) {
-                    Ok(TraceEvent::SessionStart { parent: p, .. }) => parent = p,
+                    Ok(TraceEvent::SessionStart { parent: p, cwd: c, .. }) => {
+                        parent = p;
+                        cwd = c;
+                    }
                     Ok(TraceEvent::Message { message: Message::User { content } }) => {
                         title = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(80).collect();
                         break;
@@ -179,7 +185,7 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionInfo> {
                 }
             }
             let id = path.file_stem()?.to_string_lossy().into_owned();
-            Some(SessionInfo { id, path, modified, parent, title })
+            Some(SessionInfo { id, path, modified, parent, cwd, title })
         })
         .collect();
     out.sort_by_key(|s| std::cmp::Reverse(s.modified));

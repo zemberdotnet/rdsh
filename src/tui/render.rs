@@ -21,7 +21,7 @@ use crate::{comments::Anchor, diff::Kind as DiffKind};
 
 /// Width of the file view's `old new ●+ ` gutter.
 pub const FILE_GUTTER: usize = 14;
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_PROMPT_ROWS: usize = 8;
 /// Fixed width of the session rail.
 pub const SIDEBAR_WIDTH: u16 = 28;
@@ -217,33 +217,55 @@ impl App {
 
     /// Draws the session rail: one row per session, its subagents indented beneath.
     fn draw_sidebar(&mut self, f: &mut Frame, area: Rect) {
-        let base = Style::default().bg(PANEL);
+        let base = Style::default().bg(PANEL).fg(FG_DIM);
         f.render_widget(Block::default().style(base), area);
-        let mut lines: Vec<Line> = Vec::new();
-        for row in self.sidebar.rows().iter().take(area.height as usize) {
-            let current = !self.session_id.is_empty() && row.id == self.session_id;
-            let (glyph, color) = match row.live {
-                Some(Live::Running) => ("◐", YELLOW),
-                Some(Live::Done) => ("●", GREEN),
-                Some(Live::Failed) => ("✗", RED),
-                None if row.depth == 0 => ("▸", if current { ORANGE } else { FG_DIM }),
-                None => ("·", GRAY),
-            };
-            // Always a solid `PANEL` background so the rail reads as a distinct column.
-            let mut style = Style::default().bg(PANEL).fg(if row.depth == 0 { FG } else { FG_DIM });
-            if current {
-                style = style.bg(SELECTION).fg(FG).add_modifier(Modifier::BOLD);
-            }
-            let pad = " ".repeat(1 + row.depth as usize * 2);
-            let label = Sidebar::fit(&row.title, row.depth, area.width);
-            lines.push(Line::from(vec![
-                Span::styled(pad, style),
-                Span::styled(glyph.to_owned(), style.fg(color)),
-                Span::styled(label, style),
-            ]));
+        let header = if self.sidebar_focus {
+            Style::default().bg(PANEL).fg(AQUA).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(PANEL).fg(GRAY).add_modifier(Modifier::BOLD)
+        };
+        let mut lines: Vec<Line> = vec![Line::from(Span::styled(" SESSIONS", header))];
+        let rows = self.sidebar.rows();
+        if rows.is_empty() {
+            lines.push(Line::from(Span::styled(" none in this directory", base.fg(GRAY))));
         }
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled(" no sessions", dim().bg(PANEL))));
+        // Keep the selection visible below the header.
+        let visible = (area.height as usize).saturating_sub(1).max(1);
+        self.sidebar_sel = self.sidebar_sel.min(rows.len().saturating_sub(1));
+        if self.sidebar_sel < self.sidebar_scroll {
+            self.sidebar_scroll = self.sidebar_sel;
+        } else if self.sidebar_sel >= self.sidebar_scroll + visible {
+            self.sidebar_scroll = self.sidebar_sel + 1 - visible;
+        }
+        let width = area.width as usize;
+        for (i, row) in rows.iter().enumerate().skip(self.sidebar_scroll).take(visible) {
+            let current = row.depth == 0 && row.id == self.session_id;
+            let selected = self.sidebar_focus && i == self.sidebar_sel;
+            let mut style = base.fg(if row.depth == 0 { FG } else { FG_DIM });
+            if current {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if selected {
+                style = style.bg(SELECTION).fg(FG);
+            }
+            let (prefix, glyph, color) = match (row.depth, row.live) {
+                (0, _) if current => (" ", "▸ ", ORANGE),
+                (0, _) => (" ", "  ", FG_DIM),
+                (_, Some(Live::Running)) => ("   ", SPINNER[self.spinner % SPINNER.len()], YELLOW),
+                (_, Some(Live::Done)) => ("   ", "●", GREEN),
+                (_, Some(Live::Failed)) => ("   ", "✗", RED),
+                (_, None) => ("   ", "·", GRAY),
+            };
+            let glyph = if row.depth == 0 { glyph.to_owned() } else { format!("{glyph} ") };
+            let used = prefix.chars().count() + glyph.chars().count();
+            let label = Sidebar::fit(&row.title, width.saturating_sub(used + 1));
+            let fill = width.saturating_sub(used + unicode_width::UnicodeWidthStr::width(label.as_str()));
+            lines.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(glyph, style.fg(color)),
+                Span::styled(label, style),
+                Span::styled(" ".repeat(fill), style),
+            ]));
         }
         f.render_widget(Paragraph::new(lines), area);
     }
@@ -526,6 +548,7 @@ impl App {
             }
             _ => {
                 let view = match &self.view {
+                    _ if self.sidebar_focus => "sessions",
                     View::Chat => "chat",
                     View::File(_) => "file",
                     View::Queue { .. } => "comments",
@@ -581,9 +604,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l("  F lists changed files · :e path[:line] opens any file · r reloads · q or Esc goes back"),
         l(""),
         h("Sessions"),
-        l("  S toggles the left rail: recorded sessions, with their subagents nested beneath"),
-        l("  ◐ running · ● done · ✗ failed (live only for this process) · ▸ the session you are in"),
-        l("  The rail hides itself on narrow terminals; `rdsh sessions` and `rdsh -r` work outside it"),
+        l("  S shows or hides the left rail: this directory's sessions, subagents nested beneath"),
+        l("  Ctrl-w h (or click) focuses it: j k g G Ctrl-d/u move · Enter shows how to open · y copies the id"),
+        l("  Esc, l, Tab or Ctrl-w l return to the chat · ▸ marks the current session"),
+        l("  Subagents: spinner running · ● done · ✗ failed (live for this process; others show ·)"),
         l(""),
         h("Other"),
         l("  Tab or za expands/collapses tool output · Q comment queue (e edit, dd delete, D clear)"),

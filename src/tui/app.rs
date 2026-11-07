@@ -12,7 +12,7 @@ use super::{
     input::{Input, InputAction},
     motion::{self, Cursor, Lines, Motion, Pos},
     render::FILE_GUTTER,
-    sidebar::{Live, Sidebar},
+    sidebar::{Live, LiveSub, Sidebar},
     transcript::{GUTTER, Kind, ToolEntry, ToolStatus, Transcript},
 };
 use crate::{
@@ -27,11 +27,6 @@ use crate::{
 /// Requests from the UI to the agent task.
 pub enum AgentCmd {
     Turn { text: String, cancel: CancellationToken },
-}
-
-/// Subagent ids are `<parent>-sub<N>` (`tools::task`); `n` counts `task` calls this turn.
-fn subagent_id(parent: &str, n: usize) -> String {
-    format!("{parent}-sub{n}")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,13 +90,17 @@ pub struct App {
     /// Where the session rail is drawn; `None` when it is hidden.
     pub(crate) sidebar_area: Option<Rect>,
     /// Sessions with subagents nested beneath them.
-    pub(crate) sidebar: crate::tui::sidebar::Sidebar,
-    /// Live outcome of subagents this process watched run, keyed by subagent id.
-    pub(crate) subagent_live: HashMap<String, crate::tui::sidebar::Live>,
-    /// `task` calls seen this turn; mirrors the tool's own counter to derive subagent ids.
-    pub(crate) task_count: usize,
-    /// Tool call id → subagent id, for `task` calls in flight.
+    pub(crate) sidebar: Sidebar,
+    /// Subagents this process saw start, keyed by their session id.
+    pub(crate) subagent_live: HashMap<String, LiveSub>,
+    /// Tool call id → subagent session id, for `task` calls in flight (from `SubagentStarted`).
     pub(crate) subagent_calls: HashMap<String, String>,
+    /// Keys go to the rail instead of the main view.
+    pub(crate) sidebar_focus: bool,
+    /// Selected rail row.
+    pub(crate) sidebar_sel: usize,
+    /// First visible rail row.
+    pub(crate) sidebar_scroll: usize,
     /// Where traces live; the rail is rebuilt from here.
     pub(crate) sessions_dir: Option<PathBuf>,
     /// Whether the session rail is shown.
@@ -153,8 +152,10 @@ impl App {
             sidebar_area: None,
             sidebar: Default::default(),
             subagent_live: HashMap::new(),
-            task_count: 0,
             subagent_calls: HashMap::new(),
+            sidebar_focus: false,
+            sidebar_sel: 0,
+            sidebar_scroll: 0,
             sessions_dir: None,
             sidebar_open: false,
             history: Vec::new(),
@@ -210,7 +211,84 @@ impl App {
     pub fn refresh_sidebar(&mut self) {
         let Some(dir) = &self.sessions_dir else { return };
         let infos = crate::trace::list_sessions(dir);
-        self.sidebar = Sidebar::build(&infos, &self.subagent_live);
+        let selected = self.sidebar.rows().get(self.sidebar_sel).map(|r| r.id.clone());
+        let cwd = self.transcript.cwd().display().to_string();
+        self.sidebar = Sidebar::build(&infos, &cwd, &self.subagent_live);
+        // Keep the selection on the same session when rows shift.
+        let fallback = self.sidebar.index_of(&self.session_id).unwrap_or(0);
+        self.sidebar_sel = selected.and_then(|id| self.sidebar.index_of(&id)).unwrap_or(fallback);
+    }
+
+    fn set_sidebar_focus(&mut self, focus: bool) {
+        if focus && !self.sidebar_open {
+            self.sidebar_open = true;
+            self.refresh_sidebar();
+        }
+        self.sidebar_focus = focus && self.sidebar_open;
+        self.mode = Mode::Normal;
+    }
+
+    /// Keys while the rail has focus. Esc, `l`, Tab or `Ctrl-w l` return to the main view.
+    fn sidebar_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let n = self.sidebar.rows().len();
+        let last = n.saturating_sub(1);
+        let half = (self.sidebar_area.map_or(10, |a| a.height as usize) / 2).max(1);
+        if self.pending.take() == Some('W') {
+            if matches!(k.code, KeyCode::Char('l' | 'w') | KeyCode::Right) {
+                self.sidebar_focus = false;
+            }
+            return;
+        }
+        match (k.code, ctrl) {
+            (KeyCode::Char('j') | KeyCode::Down, false) => self.sidebar_sel = (self.sidebar_sel + 1).min(last),
+            (KeyCode::Char('k') | KeyCode::Up, false) => self.sidebar_sel = self.sidebar_sel.saturating_sub(1),
+            (KeyCode::Char('g') | KeyCode::Home, false) => self.sidebar_sel = 0,
+            (KeyCode::Char('G') | KeyCode::End, false) => self.sidebar_sel = last,
+            (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => self.sidebar_sel = (self.sidebar_sel + half).min(last),
+            (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => self.sidebar_sel = self.sidebar_sel.saturating_sub(half),
+            (KeyCode::Char('w'), true) => self.pending = Some('W'),
+            (KeyCode::Enter, _) => self.preview_session(),
+            (KeyCode::Char('y'), false) => {
+                if let Some(r) = self.sidebar.rows().get(self.sidebar_sel) {
+                    let id = r.id.clone();
+                    self.osc_out = Some(format!("\x1b]52;c;{}\x07", base64(id.as_bytes())));
+                    self.set_flash(format!("copied {id}"));
+                }
+            }
+            (KeyCode::Char('r'), false) => {
+                self.refresh_sidebar();
+                self.set_flash("sessions reloaded");
+            }
+            (KeyCode::Char('S'), false) => {
+                self.sidebar_open = false;
+                self.sidebar_focus = false;
+            }
+            (KeyCode::Char('i' | 'a'), false) => {
+                self.sidebar_focus = false;
+                self.mode = Mode::Insert;
+            }
+            (KeyCode::Char(':'), false) => {
+                self.minibuf = Input::default();
+                self.mode = Mode::Command;
+            }
+            (KeyCode::Esc | KeyCode::Tab | KeyCode::Char('l' | 'q') | KeyCode::Right, _) => self.sidebar_focus = false,
+            _ => {}
+        }
+    }
+
+    /// Enter on a rail row: says what the row is and how to open it. Switching sessions in
+    /// place is not supported yet; resuming happens from the command line.
+    fn preview_session(&mut self) {
+        let Some(row) = self.sidebar.rows().get(self.sidebar_sel).cloned() else { return };
+        let msg = if row.id == self.session_id {
+            "this is the current session".to_owned()
+        } else if row.depth == 0 {
+            format!("resume: rdsh --resume {} · y copies the id", row.id)
+        } else {
+            format!("subagent trace: rdsh trace {} · y copies the id", row.id)
+        };
+        self.set_flash(msg);
     }
 
     pub(crate) fn set_flash(&mut self, s: impl Into<String>) {
@@ -252,6 +330,7 @@ impl App {
             Mode::Comment => self.comment_key(k),
             Mode::Search { forward } => self.search_key(k, forward),
             Mode::Command => self.command_key(k),
+            Mode::Normal if self.sidebar_focus => self.sidebar_key(k),
             Mode::Normal | Mode::Visual { .. } => match self.view {
                 View::Chat | View::File(_) => self.buffer_key(k),
                 View::Queue { .. } => self.queue_key(k),
@@ -545,10 +624,13 @@ impl App {
             (KeyCode::Char('F'), false) => self.open_files(),
             (KeyCode::Char('S'), false) => {
                 self.sidebar_open = !self.sidebar_open;
+                self.sidebar_focus = false;
                 if self.sidebar_open {
                     self.refresh_sidebar();
                 }
             }
+            // Ctrl-w h / Ctrl-w w: focus the session rail (vim window motions).
+            (KeyCode::Char('w'), true) => self.pending = Some('W'),
             (KeyCode::F(1), _) => self.view = View::Help,
             _ => {}
         }
@@ -561,6 +643,7 @@ impl App {
                 Some(n) => self.motion(Motion::Row(n.saturating_sub(1))),
                 None => self.motion(Motion::Top),
             },
+            ('W', KeyCode::Char('h' | 'w') | KeyCode::Left) => self.set_sidebar_focus(true),
             ('g', KeyCode::Char('f')) => {
                 if !self.open_link_at_cursor(false) {
                     self.set_flash("no file link on this line");
@@ -924,6 +1007,28 @@ impl App {
     }
 
     pub(crate) fn on_mouse(&mut self, m: MouseEvent) {
+        if let Some(rail) = self.sidebar_area
+            && rail.contains((m.column, m.row).into())
+        {
+            let last = self.sidebar.rows().len().saturating_sub(1);
+            match m.kind {
+                // Row 0 of the rail is its header.
+                MouseEventKind::Down(MouseButton::Left) if m.row > rail.y => {
+                    let i = self.sidebar_scroll + (m.row - rail.y - 1) as usize;
+                    if i <= last && !self.sidebar.rows().is_empty() {
+                        self.set_sidebar_focus(true);
+                        self.sidebar_sel = i;
+                    }
+                }
+                MouseEventKind::ScrollDown => self.sidebar_sel = (self.sidebar_sel + 1).min(last),
+                MouseEventKind::ScrollUp => self.sidebar_sel = self.sidebar_sel.saturating_sub(1),
+                _ => {}
+            }
+            return;
+        }
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.sidebar_focus = false;
+        }
         match m.kind {
             MouseEventKind::ScrollDown => match &mut self.view {
                 View::Queue { sel } => *sel = (*sel + 1).min(self.queue.len().saturating_sub(1)),
@@ -972,6 +1077,15 @@ impl App {
     }
 
     // ------------------------------------------------------- agent events
+
+    fn set_sub_state(&mut self, id: &str, state: Live) {
+        if let Some(s) = self.subagent_live.get_mut(id)
+            && s.state != state
+        {
+            s.state = state;
+            self.refresh_sidebar();
+        }
+    }
 
     fn finish_tool(&mut self, i: usize, output: String, failed: bool, duration_ms: Option<u64>) {
         let e = self.transcript.entry_mut(i);
@@ -1044,34 +1158,29 @@ impl App {
             }
             AgentEvent::ToolStart { call } => {
                 self.close_streams();
-                if call.name == "task" {
-                    self.task_count += 1;
-                    let id = subagent_id(&self.session_id, self.task_count);
-                    self.subagent_calls.insert(call.id.clone(), id.clone());
-                    self.subagent_live.insert(id, Live::Running);
-                    self.refresh_sidebar();
-                }
                 let i = self.transcript.push(Kind::Tool(Box::new(tool_entry(&call.id, &call.name, &call.arguments))), "");
                 self.tool_entries.insert(call.id, i);
                 self.activity = Some(format!("running {}", call.name));
+            }
+            AgentEvent::SubagentStarted { call_id, session_id, title } => {
+                self.subagent_calls.insert(call_id, session_id.clone());
+                let parent = self.session_id.clone();
+                self.subagent_live.insert(session_id, LiveSub { parent, title, state: Live::Running });
+                self.refresh_sidebar();
             }
             AgentEvent::ToolEnd { call_id, output, duration_ms } => {
                 if let Some(&i) = self.tool_entries.get(&call_id) {
                     self.finish_tool(i, output.content, output.is_error, Some(duration_ms));
                 }
-                if let Some(id) = self.subagent_calls.get(&call_id) {
-                    let state = if output.is_error { Live::Failed } else { Live::Done };
-                    self.subagent_live.insert(id.clone(), state);
-                    self.refresh_sidebar();
+                if let Some(id) = self.subagent_calls.remove(&call_id) {
+                    self.set_sub_state(&id, if output.is_error { Live::Failed } else { Live::Done });
                 }
             }
             AgentEvent::Subagent { call_id, event } => {
                 if let AgentEvent::TurnEnd { cancelled, error } = &*event
                     && let Some(id) = self.subagent_calls.get(&call_id).cloned()
                 {
-                    let state = if *cancelled || error.is_some() { Live::Failed } else { Live::Done };
-                    self.subagent_live.insert(id, state);
-                    self.refresh_sidebar();
+                    self.set_sub_state(&id, if *cancelled || error.is_some() { Live::Failed } else { Live::Done });
                 }
                 let Some(&i) = self.tool_entries.get(&call_id) else { return };
                 let line = match *event {
@@ -1114,8 +1223,10 @@ impl App {
                 if cancelled {
                     self.transcript.push(Kind::Info, "interrupted");
                 }
-                self.task_count = 0;
-                self.subagent_calls.clear();
+                // A turn that ended with subagents still in flight was interrupted.
+                for (_, id) in std::mem::take(&mut self.subagent_calls) {
+                    self.set_sub_state(&id, Live::Failed);
+                }
                 self.refresh_sidebar();
                 if let Some(msg) = self.queued_send.take() {
                     self.start_turn(msg);
