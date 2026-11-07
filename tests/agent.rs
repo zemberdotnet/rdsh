@@ -1,0 +1,206 @@
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use rdsh::{
+    agent::{Agent, AgentEvent, AgentOptions, EventSink},
+    llm::{Message, Provider, ScriptedProvider, ToolCall},
+    tools::{self, task::Task},
+    trace,
+};
+use tokio_util::sync::CancellationToken;
+
+fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
+    ToolCall { id: id.into(), name: name.into(), arguments: args.to_string() }
+}
+
+fn agent_with(provider: Arc<dyn Provider>, cwd: &std::path::Path, trace_dir: Option<&std::path::Path>) -> Agent {
+    let base = Arc::new(tools::builtin());
+    let mut reg = (*base).clone();
+    reg.add(Arc::new(Task::new(
+        provider.clone(),
+        base,
+        10,
+        Duration::from_secs(10),
+        30_000,
+        trace_dir.map(|d| d.to_path_buf()),
+        "parent".into(),
+    )));
+    let trace = trace_dir.map(|d| trace::Trace::create(d, "parent", "scripted", cwd, None).unwrap());
+    Agent::new(AgentOptions {
+        provider,
+        tools: Arc::new(reg),
+        system_prompt: "sys".into(),
+        max_steps: 10,
+        cwd: cwd.to_path_buf(),
+        bash_timeout: Duration::from_secs(10),
+        max_tool_output: 30_000,
+        trace,
+    })
+}
+
+fn collecting_sink() -> (EventSink, Arc<Mutex<Vec<AgentEvent>>>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let e = events.clone();
+    (Arc::new(move |ev| e.lock().unwrap().push(ev)), events)
+}
+
+#[tokio::test]
+async fn tool_loop_edits_file_and_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello world\n").unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        Message::assistant("", vec![call("c1", "read_file", serde_json::json!({"path": "a.txt"}))]),
+        Message::assistant(
+            "",
+            vec![call("c2", "edit_file", serde_json::json!({"path": "a.txt", "old_string": "world", "new_string": "rust"}))],
+        ),
+        Message::assistant("done", vec![]),
+    ]));
+    let mut agent = agent_with(provider.clone(), dir.path(), None);
+    let (sink, events) = collecting_sink();
+    let out = agent.run_turn("change it".into(), sink, CancellationToken::new()).await;
+    assert_eq!(out.text, "done");
+    assert!(!out.cancelled && out.error.is_none());
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "hello rust\n");
+    let reqs = provider.requests();
+    assert_eq!(reqs.len(), 3);
+    // Second request carries the read_file result with line numbers.
+    let Message::Tool { content, .. } = reqs[1].last().unwrap() else { panic!() };
+    assert!(content.contains("     1\thello world"));
+    let evs = events.lock().unwrap();
+    assert!(matches!(evs.last(), Some(AgentEvent::TurnEnd { cancelled: false, error: None })));
+    assert_eq!(evs.iter().filter(|e| matches!(e, AgentEvent::ToolEnd { .. })).count(), 2);
+}
+
+#[tokio::test]
+async fn bad_tool_calls_are_reported_to_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        Message::assistant(
+            "",
+            vec![
+                ToolCall { id: "1".into(), name: "nope".into(), arguments: "{}".into() },
+                ToolCall { id: "2".into(), name: "bash".into(), arguments: "{not json".into() },
+            ],
+        ),
+        Message::assistant("ok", vec![]),
+    ]));
+    let mut agent = agent_with(provider.clone(), dir.path(), None);
+    let (sink, _) = collecting_sink();
+    agent.run_turn("x".into(), sink, CancellationToken::new()).await;
+    let req = &provider.requests()[1];
+    let tool_msgs: Vec<_> = req.iter().filter_map(|m| match m { Message::Tool { content, .. } => Some(content.clone()), _ => None }).collect();
+    assert!(tool_msgs[0].starts_with("Error: unknown tool `nope`"));
+    assert!(tool_msgs[1].starts_with("Error: invalid JSON arguments for bash"));
+}
+
+#[tokio::test]
+async fn parallel_subagents_run_concurrently_and_write_traces() {
+    let dir = tempfile::tempdir().unwrap();
+    let traces = tempfile::tempdir().unwrap();
+    // Each request waits 300 ms. Parent asks for two tasks; each subagent answers immediately.
+    let provider = Arc::new(
+        ScriptedProvider::new([
+            Message::assistant(
+                "",
+                vec![
+                    call("t1", "task", serde_json::json!({"description": "a", "prompt": "do a"})),
+                    call("t2", "task", serde_json::json!({"description": "b", "prompt": "do b"})),
+                ],
+            ),
+            Message::assistant("sub answer 1", vec![]),
+            Message::assistant("sub answer 2", vec![]),
+            Message::assistant("combined", vec![]),
+        ])
+        .with_delay(Duration::from_millis(300)),
+    );
+    let mut agent = agent_with(provider.clone(), dir.path(), Some(traces.path()));
+    let (sink, events) = collecting_sink();
+    let start = std::time::Instant::now();
+    let out = agent.run_turn("go".into(), sink, CancellationToken::new()).await;
+    let elapsed = start.elapsed();
+    assert_eq!(out.text, "combined");
+    // Sequential would take 4 × 300 ms; parallel subagents overlap.
+    assert!(elapsed < Duration::from_millis(1100), "took {elapsed:?}");
+    let evs = events.lock().unwrap();
+    assert!(evs.iter().any(|e| matches!(e, AgentEvent::Subagent { call_id, .. } if call_id == "t1")));
+    let sessions = trace::list_sessions(traces.path());
+    assert_eq!(sessions.len(), 3);
+    let child = trace::load(&traces.path().join("parent-sub1.jsonl")).unwrap();
+    assert_eq!(child.parent.as_deref(), Some("parent"));
+    // The parent's history records both task results.
+    let results: Vec<_> = agent
+        .history()
+        .iter()
+        .filter_map(|m| match m { Message::Tool { content, .. } => Some(content.clone()), _ => None })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.contains("sub answer")));
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_running_bash() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([Message::assistant(
+        "",
+        vec![call("b", "bash", serde_json::json!({"command": "sleep 30"}))],
+    )]));
+    let mut agent = agent_with(provider, dir.path(), None);
+    let (sink, _) = collecting_sink();
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        c2.cancel();
+    });
+    let start = std::time::Instant::now();
+    let out = agent.run_turn("x".into(), sink, cancel).await;
+    assert!(out.cancelled);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    // History stays valid: the call has a result.
+    assert!(matches!(agent.history().last(), Some(Message::Tool { content, .. }) if content.contains("interrupted")));
+}
+
+#[tokio::test]
+async fn trace_rebuilds_model_visible_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let traces = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        Message::assistant("", vec![call("c1", "bash", serde_json::json!({"command": "echo hi"}))]),
+        Message::assistant("said hi", vec![]),
+    ]));
+    let mut agent = agent_with(provider, dir.path(), Some(traces.path()));
+    let (sink, _) = collecting_sink();
+    agent.run_turn("say hi".into(), sink, CancellationToken::new()).await;
+    let loaded = trace::load(&traces.path().join("parent.jsonl")).unwrap();
+    assert_eq!(loaded.messages, agent.history());
+    let Message::Tool { content, .. } = &loaded.messages[3] else { panic!() };
+    assert_eq!(content.trim(), "hi");
+}
+
+#[tokio::test]
+async fn resume_answers_dangling_tool_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider::new([]));
+    let history = vec![
+        Message::System { content: "sys".into() },
+        Message::user("x"),
+        Message::assistant("", vec![call("c1", "bash", serde_json::json!({"command": "true"}))]),
+    ];
+    let agent = Agent::resume(
+        AgentOptions {
+            provider,
+            tools: Arc::new(tools::builtin()),
+            system_prompt: "sys".into(),
+            max_steps: 3,
+            cwd: dir.path().to_path_buf(),
+            bash_timeout: Duration::from_secs(5),
+            max_tool_output: 30_000,
+            trace: None,
+        },
+        history,
+    );
+    assert!(matches!(agent.history().last(), Some(Message::Tool { call_id, .. }) if call_id == "c1"));
+}
