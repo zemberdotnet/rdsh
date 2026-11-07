@@ -155,8 +155,8 @@ impl App {
             self.draw_sidebar(f, rail);
         }
 
-        if let Some(id) = self.preview_id() {
-            self.draw_preview(f, main, &id);
+        if let Some((host, id)) = self.preview_id() {
+            self.draw_preview(f, main, host, &id);
         } else {
             match self.view {
                 View::Chat => self.draw_chat(f, main),
@@ -180,7 +180,7 @@ impl App {
         if total == 0 {
             let text = vec![
                 Line::from(Span::styled("rdsh", Style::default().add_modifier(Modifier::BOLD))),
-                Line::from(Span::styled(format!("{} · {}", self.cur.model, self.cur.transcript.cwd().display()), dim())),
+                Line::from(Span::styled(format!("{} · {}", self.cur.model, self.cur.cwd.display()), dim())),
                 Line::from(""),
                 Line::from("Type a message and press Enter. Esc switches to normal mode:"),
                 Line::from("  j/k w/b gg/G Ctrl-d/u  move      { }  previous/next message      / ?  search"),
@@ -222,7 +222,7 @@ impl App {
     }
 
     /// Shows the rail selection in the main area without switching to it.
-    fn draw_preview(&mut self, f: &mut Frame, area: Rect, id: &str) {
+    fn draw_preview(&mut self, f: &mut Frame, area: Rect, host: usize, id: &str) {
         let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
         let title = self.sidebar.rows().get(self.sidebar_sel).map_or_else(|| id.to_owned(), |r| r.title.clone());
         let action = if self.sidebar_focus { "Enter switches · Esc back" } else { "click to focus the rail" };
@@ -235,7 +235,7 @@ impl App {
             head,
         );
         self.previewing = true;
-        let shown = self.with_view(id, |app| app.draw_chat(f, body));
+        let shown = self.with_view(host, id, |app| app.draw_chat(f, body));
         self.previewing = false;
         if shown.is_none() {
             f.render_widget(Paragraph::new(Span::styled(" loading…", dim())), body);
@@ -266,8 +266,19 @@ impl App {
         }
         let width = area.width as usize;
         for (i, row) in rows.iter().enumerate().skip(self.sidebar_scroll).take(visible) {
-            let current = row.depth == 0 && row.id == self.cur.session_id;
             let selected = self.sidebar_focus && i == self.sidebar_sel;
+            if row.header {
+                let connected = self.hosts.get(row.host).is_some_and(|h| h.connected);
+                let mut st = base.fg(if connected { AQUA } else { RED }).add_modifier(Modifier::BOLD);
+                if selected {
+                    st = st.bg(SELECTION);
+                }
+                let label = Sidebar::fit(&format!("{} {}", if connected { "◆" } else { "✗" }, row.title), width.saturating_sub(2));
+                let fill = width.saturating_sub(1 + unicode_width::UnicodeWidthStr::width(label.as_str()));
+                lines.push(Line::from(vec![Span::styled(" ", st), Span::styled(label, st), Span::styled(" ".repeat(fill), st)]));
+                continue;
+            }
+            let current = row.depth == 0 && row.host == self.cur.host && row.id == self.cur.session_id;
             let mut style = base.fg(if row.depth == 0 { FG } else { FG_DIM });
             if current {
                 style = style.add_modifier(Modifier::BOLD);
@@ -277,13 +288,14 @@ impl App {
             }
             let (prefix, glyph, color) = match (row.depth, row.live) {
                 (0, _) if current => (" ", "▸ ", ORANGE),
+                (0, Some(Live::Running)) => (" ", SPINNER[self.spinner % SPINNER.len()], YELLOW),
                 (0, _) => (" ", "  ", FG_DIM),
                 (_, Some(Live::Running)) => ("   ", SPINNER[self.spinner % SPINNER.len()], YELLOW),
                 (_, Some(Live::Done)) => ("   ", "●", GREEN),
                 (_, Some(Live::Failed)) => ("   ", "✗", RED),
                 (_, None) => ("   ", "·", GRAY),
             };
-            let glyph = if row.depth == 0 { glyph.to_owned() } else { format!("{glyph} ") };
+            let glyph = if glyph.chars().count() > 1 { glyph.to_owned() } else { format!("{glyph} ") };
             let used = prefix.chars().count() + glyph.chars().count();
             let label = Sidebar::fit(&row.title, width.saturating_sub(used + 1));
             let fill = width.saturating_sub(used + unicode_width::UnicodeWidthStr::width(label.as_str()));
@@ -428,7 +440,7 @@ impl App {
     }
 
     fn draw_files(&self, f: &mut Frame, area: Rect) {
-        let View::Files { items, sel } = &self.view else { return };
+        let View::Files { items, sel, .. } = &self.view else { return };
         let mut lines = vec![
             Line::from(vec![
                 Span::styled(" Changed files ", Style::default().add_modifier(Modifier::BOLD).bg(PANEL)),
@@ -589,7 +601,12 @@ impl App {
             }
         }
         let u = self.cur.usage;
-        let short: String = self.cur.session_id.chars().take(15).collect();
+        let mut short: String = self.cur.session_id.chars().take(15).collect();
+        if self.hosts.len() > 1
+            && let Some(h) = self.hosts.get(self.cur.host)
+        {
+            short = format!("{} @ {short}", h.name);
+        }
         let length = self.cur.length.as_deref().map_or(String::new(), |l| format!("len {l} · "));
         let right = format!(
             "{length}{} · ↑{} ↓{} · {short} ",

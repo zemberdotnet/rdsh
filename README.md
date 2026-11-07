@@ -73,3 +73,25 @@ Queued comments are sent with your next message inside a `<review_comments>` blo
 - `src/tui/`: UI (`app.rs` state and keys, `render.rs`, `transcript.rs` wrapped rows, `motion.rs` vim motions, `fileview.rs`)
 
 `cargo test` runs the unit tests, the agent-loop integration tests (scripted provider) and the TUI behavior tests (key events against a test backend).
+
+## Sessions, the hub, and other machines
+
+Sessions run in a background **hub**, not in the TUI. `rdsh` starts the hub on first use (`rdsh serve`, listening on `$XDG_RUNTIME_DIR/rdsh/hub.sock`, a directory only you can read) and attaches to it. Closing the TUI leaves running sessions running; the next `rdsh` attaches again, and several terminals can watch the same session. The hub exits after `serve_idle_secs` (default 1800) with no clients and no running turns. `--no-daemon` runs sessions inside the TUI process instead.
+
+Other machines are reached over SSH. The remote machine needs rdsh installed and logged in (`rdsh login` there; its own key is used):
+
+```sh
+rdsh --host me@build-box                    # attach to build-box's hub too
+rdsh --host me@build-box:/srv/app           # new sessions there start in /srv/app; the rail lists only those
+```
+
+`--host` runs `ssh -T me@build-box rdsh connect`, which relays the hub protocol (newline-delimited JSON) over the SSH connection; SSH does all authentication and encryption, and no hub ever listens on the network. Hosts can also be configured once:
+
+```json
+{ "hosts": [ { "name": "build", "ssh": "me@build-box", "dir": "/srv/app" } ],
+  "ssh_program": "ssh", "remote_command": ["rdsh", "connect"] }
+```
+
+If rdsh is not on the remote `PATH` for non-interactive shells, set `remote_command` to its full path, e.g. `["/home/me/.cargo/bin/rdsh", "connect"]`.
+
+With several hosts the rail groups sessions under a heading per host (`◆ build`; `✗ build (disconnected)` when the connection drops). Enter on a heading starts a session on that host. Everything about a remote session happens on its host: its agent and tools run there, and file links, diffs (`Enter`/`gf`, `r` to reload) and the changed-files list (`F`) are read there. The status line shows `host @ session`.

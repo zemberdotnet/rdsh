@@ -34,6 +34,8 @@ pub struct FileView {
     pub blocks: Vec<usize>,
     pub cursor: Cursor,
     pub scroll: usize,
+    /// `(host, cwd)` when the file lives on a remote host (reloads go through it).
+    pub remote: Option<(usize, String)>,
     /// First visible text column (long lines scroll horizontally with the cursor).
     pub hscroll: usize,
     /// Syntax runs per line of the current file (index = new line number - 1).
@@ -64,6 +66,7 @@ impl FileView {
             cursor: Cursor::default(),
             scroll: 0,
             hscroll: 0,
+            remote: None,
             hl_new: Vec::new(),
             hl_old: Vec::new(),
         };
@@ -140,6 +143,18 @@ impl FileView {
     pub fn toggle_full(&mut self) {
         let line = self.current_line_number();
         self.full = !self.full;
+        self.rebuild();
+        if let Some(l) = line {
+            self.jump_to_line(l);
+        }
+    }
+
+    /// Shows a freshly loaded copy of the same file, keeping the line under the cursor.
+    pub fn replace(&mut self, file: FileDiff) {
+        let line = self.current_line_number();
+        self.file = file;
+        self.full = self.full || self.file.diff.is_empty();
+        self.highlight();
         self.rebuild();
         if let Some(l) = line {
             self.jump_to_line(l);

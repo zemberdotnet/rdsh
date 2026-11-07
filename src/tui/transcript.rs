@@ -306,6 +306,11 @@ impl Transcript {
         Self { entries: Vec::new(), offsets: Vec::new(), total: 0, width: 0, resolver: LinkResolver::new(cwd), stale: false }
     }
 
+    /// A transcript of a session on another machine: file links are not checked locally.
+    pub fn remote(cwd: PathBuf) -> Self {
+        Self { resolver: LinkResolver::trusting(cwd), ..Self::new(PathBuf::new()) }
+    }
+
     pub fn cwd(&self) -> &std::path::Path {
         self.resolver.cwd()
     }

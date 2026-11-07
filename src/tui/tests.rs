@@ -4,7 +4,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, Mous
 use ratatui::{Terminal, backend::TestBackend};
 use tokio::sync::mpsc;
 
-use super::app::{App, Mode, View};
+use super::app::{App, Host, Mode, View};
 use crate::{
     agent::AgentEvent,
     hub::{Notice, Request, Snapshot},
@@ -14,7 +14,7 @@ use crate::{
 };
 
 fn snapshot(id: &str) -> Snapshot {
-    Snapshot { session_id: id.into(), model: "test-model".into(), history: Vec::new(), turn: Vec::new(), running: false, usage: Usage::default() }
+    Snapshot { session_id: id.into(), model: "test-model".into(), cwd: String::new(), history: Vec::new(), turn: Vec::new(), running: false, usage: Usage::default() }
 }
 
 struct Harness {
@@ -40,9 +40,9 @@ impl Harness {
         git(&["commit", "-qm", "init"]);
         std::fs::write(root.join("src/lib.rs"), "fn a() {}\nfn b2() {}\nfn c() {}\nfn d() {}\n").unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut app = App::new(root.to_path_buf(), tx);
-        app.expect_open();
-        app.on_notice(Notice::Opened { snapshot: snapshot("s1") });
+        let mut app = App::new(root.to_path_buf(), vec![Host::new("local", true, None, tx)]);
+        app.expect_open(0);
+        app.on_notice(0, Notice::Opened { snapshot: snapshot("s1") });
         let term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut h = Self { app, term, rx, _dir: dir };
         h.draw();
@@ -97,7 +97,7 @@ impl Harness {
     }
 
     fn notice(&mut self, n: Notice) {
-        self.app.on_notice(n);
+        self.app.on_notice(0, n);
         self.draw();
     }
 
@@ -674,6 +674,7 @@ fn subagent_rows_open_read_only_traces_and_new_starts_a_session() {
     assert_eq!(h.request(), Request::ReadTrace { session_id: "s1-sub1".into() });
     h.notice(Notice::Trace {
         session_id: "s1-sub1".into(),
+        cwd: String::new(),
         history: vec![Message::user("scan the lexer"), Message::assistant("lexer is fine", vec![])],
     });
     assert_eq!(h.app.cur.session_id, "s1-sub1");
@@ -687,10 +688,11 @@ fn subagent_rows_open_read_only_traces_and_new_starts_a_session() {
     h.key(KeyCode::Esc);
     h.keys(":new");
     h.key(KeyCode::Enter);
-    assert_eq!(h.request(), Request::New);
+    assert!(matches!(h.request(), Request::New { cwd: Some(_) }), "new sessions start in this directory");
     h.notice(Notice::Opened { snapshot: snapshot("s2") });
     assert_eq!(h.app.cur.session_id, "s2");
-    assert_eq!(h.app.open_sessions(), vec!["s2", "s1"], "read-only traces are not listed as resumable");
+    let open: Vec<String> = h.app.open_sessions().into_iter().map(|(_, id)| id).collect();
+    assert_eq!(open, ["s2", "s1"], "read-only traces are not listed as resumable");
 }
 
 #[test]
@@ -709,7 +711,7 @@ fn focusing_the_rail_starts_on_the_session_on_screen() {
 }
 
 fn trace_of(id: &str, answer: &str) -> Notice {
-    Notice::Trace { session_id: id.into(), history: vec![Message::user("older work"), Message::assistant(answer, vec![])] }
+    Notice::Trace { session_id: id.into(), cwd: String::new(), history: vec![Message::user("older work"), Message::assistant(answer, vec![])] }
 }
 
 #[test]
@@ -776,4 +778,139 @@ fn hovering_previews_and_open_sessions_preview_live() {
     let screen = h.screen();
     assert!(screen.contains("streaming now"), "{screen}");
     assert_eq!(h.app.cur.session_id, "s1");
+}
+
+/// A local host plus a remote `box` whose sessions live in `/srv/app`.
+struct TwoHosts {
+    h: Harness,
+    remote: mpsc::UnboundedReceiver<Request>,
+}
+
+fn two_hosts() -> TwoHosts {
+    let mut h = harness_with_session();
+    let (tx, remote) = mpsc::unbounded_channel();
+    h.app.hosts.push(Host::new("box", false, Some(std::path::PathBuf::from("/srv/app")), tx));
+    let info = |id: &str, title: &str| crate::trace::SessionInfo {
+        id: id.into(),
+        path: format!("/srv/sessions/{id}.jsonl").into(),
+        modified: std::time::SystemTime::now(),
+        parent: None,
+        cwd: "/srv/app".into(),
+        title: title.into(),
+        slug: None,
+    };
+    h.app.on_notice(1, Notice::Sessions { recorded: vec![info("r1", "remote build fix")], open: vec![], running: vec![] });
+    h.draw();
+    TwoHosts { h, remote }
+}
+
+impl TwoHosts {
+    fn remote_request(&mut self) -> Request {
+        loop {
+            match self.remote.try_recv() {
+                Ok(Request::List) => continue,
+                Ok(r) => return r,
+                Err(e) => panic!("no remote request: {e}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn several_hosts_share_the_rail_and_requests_go_to_the_sessions_host() {
+    let mut t = two_hosts();
+    let screen = t.h.screen();
+    let local = screen.lines().position(|l| l.contains("◆ local")).unwrap_or_else(|| panic!("{screen}"));
+    let remote = screen.lines().position(|l| l.contains("◆ box")).unwrap();
+    let row = screen.lines().position(|l| l.contains("remote build fix")).unwrap();
+    assert!(local < remote && remote < row, "{screen}");
+
+    // Open the remote session from the rail: the request goes to box, not to the local hub.
+    t.h.key(KeyCode::Esc);
+    t.h.ctrl('w');
+    t.h.key(KeyCode::Char('h'));
+    t.h.key(KeyCode::Char('G'));
+    assert_eq!(t.h.rail_id(), "r1");
+    assert_eq!(t.remote_request(), Request::ReadTrace { session_id: "r1".into() }, "preview reads it on box");
+    t.h.key(KeyCode::Enter);
+    assert_eq!(t.remote_request(), Request::Open { session_id: "r1".into() });
+    assert!(t.h.rx.try_recv().is_err(), "nothing went to the local hub");
+    let mut snap = snapshot("r1");
+    snap.cwd = "/srv/app".into();
+    snap.history = vec![Message::user("fix the build"), Message::assistant("edited src/build.rs:7 for you", vec![])];
+    t.h.app.on_notice(1, Notice::Opened { snapshot: snap });
+    t.h.draw();
+    assert_eq!((t.h.app.cur.host, t.h.app.cur.session_id.as_str()), (1, "r1"));
+    assert!(t.h.screen().contains("box @ r1"), "status names the host");
+
+    // Sending goes to box.
+    t.h.keys("ithanks");
+    t.h.key(KeyCode::Enter);
+    assert_eq!(t.remote_request(), Request::Send { session_id: "r1".into(), text: "thanks".into() });
+
+    // A file link in a remote session is read on box (no local file exists).
+    t.h.key(KeyCode::Esc);
+    t.h.keys("gg}");
+    t.h.keys("w");
+    t.h.key(KeyCode::Enter);
+    assert_eq!(t.remote_request(), Request::ReadFile { cwd: "/srv/app".into(), path: "/srv/app/src/build.rs".into() });
+    let file = crate::diff::FileDiff {
+        path: "/srv/app/src/build.rs".into(),
+        rel: "src/build.rs".into(),
+        status: crate::diff::Status::Modified,
+        diff: crate::diff::parse_unified("@@ -7,1 +7,1 @@\n-old()\n+new()\n"),
+        full: vec![],
+        added: 1,
+        removed: 1,
+        error: None,
+        head_source: None,
+    };
+    t.h.app.on_notice(1, Notice::File { file: Box::new(file.clone()) });
+    t.h.draw();
+    let View::File(fv) = &t.h.app.view else { panic!("file view") };
+    assert_eq!(fv.lines[fv.cursor.pos.row].text, "new()", "cursor on the linked line");
+    assert!(t.h.screen().contains("src/build.rs"));
+    // Reloading asks box again.
+    t.h.key(KeyCode::Char('r'));
+    assert_eq!(t.remote_request(), Request::ReadFile { cwd: "/srv/app".into(), path: "/srv/app/src/build.rs".into() });
+    t.h.key(KeyCode::Char('q'));
+
+    // Changed files come from box too.
+    t.h.key(KeyCode::Char('F'));
+    assert_eq!(t.remote_request(), Request::ChangedFiles { cwd: "/srv/app".into() });
+    t.h.app.on_notice(1, Notice::ChangedFiles { cwd: "/srv/app".into(), files: vec![("M".into(), "src/build.rs".into())] });
+    t.h.draw();
+    assert!(t.h.screen().contains("Changed files"));
+    t.h.key(KeyCode::Enter);
+    assert_eq!(t.remote_request(), Request::ReadFile { cwd: "/srv/app".into(), path: "/srv/app/src/build.rs".into() });
+}
+
+#[test]
+fn a_host_heading_starts_a_session_there_and_disconnects_show() {
+    let mut t = two_hosts();
+    t.h.key(KeyCode::Esc);
+    t.h.ctrl('w');
+    t.h.key(KeyCode::Char('h'));
+    // Move up to the box heading (the row above its session).
+    t.h.key(KeyCode::Char('G'));
+    t.h.key(KeyCode::Char('k'));
+    assert!(t.h.app.sidebar.rows()[t.h.app.sidebar_sel].header);
+    let _ = t.remote.try_recv();
+    t.h.key(KeyCode::Enter);
+    assert_eq!(t.remote_request(), Request::New { cwd: Some("/srv/app".into()) });
+    let mut snap = snapshot("r2");
+    snap.cwd = "/srv/app".into();
+    t.h.app.on_notice(1, Notice::Opened { snapshot: snap });
+    t.h.draw();
+    assert_eq!((t.h.app.cur.host, t.h.app.cur.session_id.as_str()), (1, "r2"));
+
+    t.h.app.on_disconnect(1);
+    t.h.draw();
+    let screen = t.h.screen();
+    assert!(screen.contains("✗ box (disconnected)") && screen.contains("lost the connection to box"), "{screen}");
+    t.h.keys("ihello");
+    t.h.key(KeyCode::Enter);
+    assert!(t.h.screen().contains("not connected to box"));
+    // The local host is unaffected.
+    assert!(t.h.screen().contains("◆ local"));
 }

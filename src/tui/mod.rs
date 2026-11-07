@@ -26,28 +26,52 @@ use crossterm::{
     execute,
 };
 use futures_util::StreamExt;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::hub::{Notice, Request};
-use app::App;
+use app::{App, Host};
+
+/// One hub connection for the TUI.
+pub struct HostLink {
+    pub name: String,
+    /// The hub runs on this machine (its sessions' files can be read directly).
+    pub local: bool,
+    /// Directory for new sessions there; also filters the rail.
+    pub dir: Option<PathBuf>,
+    pub req_tx: UnboundedSender<Request>,
+    pub notices: UnboundedReceiver<Notice>,
+}
 
 /// Runs the TUI until the user quits.
 ///
-/// @param req_tx / notices the client end of a hub connection.
-/// @param cwd working directory used to resolve file links and filter the session rail.
-/// @param first `Request::New` or `Request::Open`, the session shown at startup.
-pub async fn run(
-    req_tx: UnboundedSender<Request>,
-    mut notices: UnboundedReceiver<Notice>,
-    cwd: PathBuf,
-    first: Request,
-) -> Result<()> {
-    let mut app = App::new(cwd, req_tx.clone());
+/// @param links hub connections; the first one shows the startup session.
+/// @param cwd working directory used for local file links and to filter the local rail.
+/// @param first `Request::New` or `Request::Open` for the first host.
+pub async fn run(links: Vec<HostLink>, cwd: PathBuf, first: Request) -> Result<()> {
+    // One stream for all hosts; `None` marks a host whose connection ended.
+    let (merged_tx, mut notices) = mpsc::unbounded_channel::<(usize, Option<Notice>)>();
+    let mut hosts = Vec::new();
+    for (i, link) in links.into_iter().enumerate() {
+        // A closed hub surfaces when its notices end (below) and as a flash on later requests.
+        let _ = link.req_tx.send(Request::List);
+        if i == 0 {
+            let _ = link.req_tx.send(first.clone());
+        }
+        let tx = merged_tx.clone();
+        let mut rx = link.notices;
+        tokio::spawn(async move {
+            while let Some(n) = rx.recv().await {
+                if tx.send((i, Some(n))).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send((i, None));
+        });
+        hosts.push(Host::new(link.name, link.local, link.dir, link.req_tx));
+    }
+    let mut app = App::new(cwd, hosts);
     app.sidebar_open = true;
-    app.expect_open();
-    // A closed hub surfaces as a flash on the first request the user makes.
-    let _ = req_tx.send(Request::List);
-    let _ = req_tx.send(first);
+    app.expect_open(0);
 
     let mut terminal = ratatui::init();
     let mut out = std::io::stdout();
@@ -69,8 +93,12 @@ pub async fn run(
     }
     let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
-    for id in app.open_sessions() {
-        println!("session {id} — resume with: rdsh --resume {id}");
+    for (host, id) in app.open_sessions() {
+        if host == "local" {
+            println!("session {id} — resume with: rdsh --resume {id}");
+        } else {
+            println!("session {id} on {host}");
+        }
     }
     result
 }
@@ -78,7 +106,7 @@ pub async fn run(
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    notices: &mut UnboundedReceiver<Notice>,
+    notices: &mut UnboundedReceiver<(usize, Option<Notice>)>,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -94,7 +122,7 @@ async fn event_loop(
         if app.quit {
             return Ok(());
         }
-        let animating = app.cur.running || !app.hub_running.is_empty();
+        let animating = app.cur.running || app.hosts.iter().any(|h| !h.running.is_empty());
         tokio::select! {
             ev = events.next() => match ev {
                 Some(Ok(ev)) => {
@@ -103,10 +131,10 @@ async fn event_loop(
                 Some(Err(e)) => return Err(e.into()),
                 None => return Ok(()),
             },
-            Some(n) = notices.recv() => {
-                app.on_notice(n);
-                while let Ok(n) = notices.try_recv() {
-                    app.on_notice(n);
+            Some((host, n)) = notices.recv() => {
+                deliver(app, host, n);
+                while let Ok((host, n)) = notices.try_recv() {
+                    deliver(app, host, n);
                 }
             }
             _ = tick.tick(), if animating => {
@@ -115,5 +143,12 @@ async fn event_loop(
         }
     }
 }
+fn deliver(app: &mut App, host: usize, n: Option<Notice>) {
+    match n {
+        Some(n) => app.on_notice(host, n),
+        None => app.on_disconnect(host),
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -2,7 +2,8 @@ use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use rdsh::{
-    config::Config,
+    config::{Config, HostConfig},
+    hub::{Factory, Hub, OpenKind, Request, net},
     deepseek::DeepSeek,
     headless,
     llm::{Message, Provider},
@@ -18,6 +19,8 @@ USAGE:
     rdsh run [OPTIONS] <PROMPT>    run one turn headless (stdout: answer, stderr: progress)
     rdsh login                     store a DeepSeek API key (~/.config/rdsh/credentials.json)
     rdsh logout                    remove the stored key
+    rdsh serve [--socket PATH]     run the session hub in the foreground (rdsh starts it on demand)
+    rdsh connect [--socket PATH]   relay stdin/stdout to the local hub (used over SSH)
     rdsh sessions [--all]          list recorded sessions
     rdsh trace [ID|last]           print a session trace as readable text
 
@@ -25,6 +28,9 @@ OPTIONS:
     -m, --model <MODEL>    model id (default: deepseek-chat, env RDSH_MODEL)
     -r, --resume <ID>      resume a session by id, prefix, or `last`
     -C, --cwd <DIR>        working directory (default: current)
+        --host <DEST[:DIR]>  also attach to the hub on an SSH host (repeatable; or a config host name)
+        --no-daemon        run sessions inside this process instead of the background hub
+        --socket <PATH>    hub socket (default $XDG_RUNTIME_DIR/rdsh/hub.sock)
     -h, --help             show this help
     -V, --version          show version
 
@@ -41,10 +47,23 @@ struct Args {
     resume: Option<String>,
     cwd: Option<PathBuf>,
     all: bool,
+    hosts: Vec<String>,
+    no_daemon: bool,
+    socket: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Option<Args>> {
-    let mut a = Args { command: None, positional: Vec::new(), model: None, resume: None, cwd: None, all: false };
+    let mut a = Args {
+        command: None,
+        positional: Vec::new(),
+        model: None,
+        resume: None,
+        cwd: None,
+        all: false,
+        hosts: Vec::new(),
+        no_daemon: false,
+        socket: None,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = |name: &str| it.next().with_context(|| format!("{name} needs a value"));
@@ -61,9 +80,12 @@ fn parse_args() -> Result<Option<Args>> {
             "-r" | "--resume" => a.resume = Some(value("--resume")?),
             "-C" | "--cwd" => a.cwd = Some(PathBuf::from(value("--cwd")?)),
             "--all" => a.all = true,
+            "--host" => a.hosts.push(value("--host")?),
+            "--no-daemon" => a.no_daemon = true,
+            "--socket" => a.socket = Some(PathBuf::from(value("--socket")?)),
             "--" => a.positional.extend(it.by_ref()),
             s if s.starts_with('-') && s.len() > 1 => bail!("unknown option {s} (see --help)"),
-            "run" | "sessions" | "trace" | "login" | "logout" if a.command.is_none() && a.positional.is_empty() => {
+            "run" | "sessions" | "trace" | "login" | "logout" | "serve" | "connect" if a.command.is_none() && a.positional.is_empty() => {
                 a.command = Some(arg.clone())
             }
             _ => a.positional.push(arg.clone()),
@@ -130,37 +152,98 @@ fn real_main() -> Result<i32> {
                 Ok(headless::run(agent, prompt).await)
             })
         }
+        Some("serve") => {
+            let socket = args.socket.clone().unwrap_or_else(net::default_socket);
+            let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
+            let idle = (cfg.serve_idle_secs > 0).then(|| std::time::Duration::from_secs(cfg.serve_idle_secs));
+            let sessions_dir = cfg.sessions_dir();
+            let factory = factory(cfg, cwd, provider);
+            runtime()?.block_on(async {
+                net::serve(Hub::new(factory, Some(sessions_dir)), &socket, idle).await?;
+                Ok(0)
+            })
+        }
+        Some("connect") => {
+            let socket = args.socket.clone().unwrap_or_else(net::default_socket);
+            let exe = std::env::current_exe().context("locating the rdsh binary")?;
+            runtime()?.block_on(async {
+                net::bridge(&socket, &exe).await?;
+                Ok(0)
+            })
+        }
         _ => {
             if let Some(p) = args.positional.first() {
                 bail!("unexpected argument {p:?} (did you mean `rdsh run`?)");
             }
-            let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
             // Fail before the TUI starts when the session to resume does not exist.
             let first = match args.resume.as_deref() {
                 Some(q) => {
                     let path = trace::find_session(&cfg.sessions_dir(), q)?;
                     let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    rdsh::hub::Request::Open { session_id: id }
+                    Request::Open { session_id: id }
                 }
-                None => rdsh::hub::Request::New,
+                None => Request::New { cwd: Some(cwd.display().to_string()) },
             };
-            let sessions_dir = cfg.sessions_dir();
-            let factory_cwd = cwd.clone();
-            let factory: rdsh::hub::Factory = Arc::new(move |kind| {
-                let start = match &kind {
-                    rdsh::hub::OpenKind::New => Start::New,
-                    rdsh::hub::OpenKind::Resume(id) => Start::Resume(id),
+            let mut remotes = cfg.hosts.clone();
+            for spec in &args.hosts {
+                let h = match cfg.hosts.iter().find(|h| h.name == *spec) {
+                    Some(known) => known.clone(),
+                    None => HostConfig::parse(spec)?,
                 };
-                session::build(&cfg, &factory_cwd, provider.clone(), start)
-            });
+                if !remotes.iter().any(|r| r.name == h.name) {
+                    remotes.push(h);
+                }
+            }
+            let ssh_program = cfg.ssh_program.clone();
+            let remote_command = cfg.remote_command.clone();
+            let socket = args.socket.clone().unwrap_or_else(net::default_socket);
+            let no_daemon = args.no_daemon;
             runtime()?.block_on(async {
-                let hub = rdsh::hub::Hub::new(factory, Some(sessions_dir));
-                let (req_tx, notices) = hub.connect();
-                tui::run(req_tx, notices, cwd, first).await?;
+                let (req_tx, notices) = if no_daemon {
+                    let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
+                    let sessions_dir = cfg.sessions_dir();
+                    Hub::new(factory(cfg, cwd.clone(), provider), Some(sessions_dir)).connect()
+                } else {
+                    if net::connect_socket(&socket).await.is_err() {
+                        // Starting the hub: check the key here so the error is readable.
+                        DeepSeek::new(&cfg)?;
+                        let exe = std::env::current_exe().context("locating the rdsh binary")?;
+                        net::ensure_server(&socket, &exe).await?;
+                    }
+                    net::connect_socket(&socket).await?
+                };
+                let mut links = vec![tui::HostLink { name: "local".into(), local: true, dir: None, req_tx, notices }];
+                for h in remotes {
+                    let mut ssh_args = vec!["-T".to_owned(), h.ssh.clone()];
+                    ssh_args.extend(remote_command.iter().cloned());
+                    let (req_tx, notices) = net::connect_command(&ssh_program, &ssh_args)?;
+                    links.push(tui::HostLink { name: h.name, local: false, dir: h.dir.map(PathBuf::from), req_tx, notices });
+                }
+                tui::run(links, cwd, first).await?;
                 Ok(0)
             })
         }
     }
+}
+
+/// Builds agents for a hub: new sessions in the requested directory (default `default_cwd`),
+/// resumed ones in the directory recorded in their trace.
+fn factory(cfg: Config, default_cwd: PathBuf, provider: Arc<dyn Provider>) -> Factory {
+    Arc::new(move |kind| match kind {
+        OpenKind::New(dir) => {
+            let dir = dir.unwrap_or_else(|| default_cwd.clone());
+            if !dir.is_dir() {
+                bail!("{} is not a directory on this host", dir.display());
+            }
+            session::build(&cfg, &dir, provider.clone(), Start::New)
+        }
+        OpenKind::Resume(id) => {
+            let path = trace::find_session(&cfg.sessions_dir(), &id)?;
+            let recorded = trace::load(&path)?.cwd;
+            let dir = if recorded.is_empty() { default_cwd.clone() } else { PathBuf::from(recorded) };
+            session::build(&cfg, &dir, provider.clone(), Start::Resume(&id))
+        }
+    })
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {

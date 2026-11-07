@@ -5,6 +5,7 @@
 //! process or behind a socket. Each session's agent runs in its own task and keeps running
 //! while no client is looking at it.
 
+pub mod net;
 pub mod proto;
 
 use std::{
@@ -27,7 +28,8 @@ use crate::{
 
 /// How the hub asks for an agent.
 pub enum OpenKind {
-    New,
+    /// In this directory, or the factory's default when `None`.
+    New(Option<PathBuf>),
     /// An exact session id.
     Resume(String),
 }
@@ -64,6 +66,7 @@ struct Slot {
     cmd_tx: UnboundedSender<String>,
     cancel: Option<CancellationToken>,
     model: String,
+    cwd: String,
     /// History as of the start of the current turn (or the end of the last one).
     history: Vec<Message>,
     /// Events of the current turn, with consecutive text deltas merged.
@@ -77,6 +80,7 @@ impl Slot {
         Snapshot {
             session_id: session_id.to_owned(),
             model: self.model.clone(),
+            cwd: self.cwd.clone(),
             history: self.history.clone(),
             turn: self.turn.clone(),
             running: self.running,
@@ -128,6 +132,16 @@ impl Hub {
         (req_tx, nrx)
     }
 
+    /// Connected clients.
+    pub fn clients(&self) -> usize {
+        self.state().clients.len()
+    }
+
+    /// Whether any session is mid-turn.
+    pub fn busy(&self) -> bool {
+        self.state().sessions.values().any(|s| s.running)
+    }
+
     fn notify(&self, client: u64, notice: Notice) {
         if let Some(c) = self.state().clients.iter().find(|c| c.id == client) {
             // A closed receiver means the client is going away; its task cleans up.
@@ -145,7 +159,7 @@ impl Hub {
                 let n = self.sessions_notice();
                 self.notify(client, n);
             }
-            Request::New => match (self.inner.factory)(OpenKind::New) {
+            Request::New { cwd } => match (self.inner.factory)(OpenKind::New(cwd.map(PathBuf::from))) {
                 Ok(agent) => {
                     let id = self.spawn(agent);
                     self.subscribe(client, &id);
@@ -187,6 +201,19 @@ impl Hub {
                     c.subscribed.remove(&session_id);
                 }
             }
+            Request::ReadFile { cwd, path } => {
+                let cwd = PathBuf::from(cwd);
+                let full = crate::tools::resolve_path(&cwd, &path);
+                if full.is_file() {
+                    self.notify(client, Notice::File { file: Box::new(crate::diff::load(&cwd, &full)) });
+                } else {
+                    self.error(client, None, format!("no such file on this host: {}", full.display()));
+                }
+            }
+            Request::ChangedFiles { cwd } => {
+                let files = crate::diff::changed_files(std::path::Path::new(&cwd));
+                self.notify(client, Notice::ChangedFiles { cwd, files });
+            }
             Request::ReadTrace { session_id } => {
                 let loaded = self
                     .resolve(&session_id)
@@ -195,7 +222,7 @@ impl Hub {
                         Ok((id.clone(), trace::load(&trace::find_session(dir, &id)?)?))
                     });
                 match loaded {
-                    Ok((id, l)) => self.notify(client, Notice::Trace { session_id: id, history: l.messages }),
+                    Ok((id, l)) => self.notify(client, Notice::Trace { session_id: id, cwd: l.cwd, history: l.messages }),
                     Err(e) => self.error(client, Some(session_id), format!("{e:#}")),
                 }
             }
@@ -268,6 +295,7 @@ impl Hub {
                 cmd_tx,
                 cancel: None,
                 model: agent.model().to_owned(),
+                cwd: agent.cwd().display().to_string(),
                 history: agent.history().to_vec(),
                 turn: Vec::new(),
                 running: false,

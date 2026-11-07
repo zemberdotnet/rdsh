@@ -38,7 +38,7 @@ fn hub(provider: Arc<ScriptedProvider>, dir: PathBuf, builds: Arc<AtomicUsize>) 
         builds.fetch_add(1, Ordering::SeqCst);
         let p: Arc<dyn Provider> = provider.clone();
         Ok(match kind {
-            OpenKind::New => {
+            OpenKind::New(_) => {
                 let id = format!("s{}", n.fetch_add(1, Ordering::SeqCst) + 1);
                 Agent::new(options(p, &d, trace::Trace::create(&d, &id, "scripted", &d, None)?))
             }
@@ -96,7 +96,7 @@ async fn two_clients_see_the_same_session_and_a_late_joiner_misses_nothing() {
     let (a_tx, mut a_rx) = hub.connect();
     let (b_tx, mut b_rx) = hub.connect();
 
-    a_tx.send(Request::New).unwrap();
+    a_tx.send(Request::New { cwd: None }).unwrap();
     let Notice::Opened { snapshot } = next_non_list(&mut a_rx).await else { panic!() };
     let id = snapshot.session_id.clone();
     assert_eq!(id, "s1");
@@ -138,7 +138,7 @@ async fn sessions_keep_running_without_viewers_and_resume_on_open() {
     let builds = Arc::new(AtomicUsize::new(0));
     let hub1 = hub(provider.clone(), dir.path().to_path_buf(), builds.clone());
     let (tx, mut rx) = hub1.connect();
-    tx.send(Request::New).unwrap();
+    tx.send(Request::New { cwd: None }).unwrap();
     let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
     let id = snapshot.session_id;
     // Stop watching, then send: the turn still runs.
@@ -179,7 +179,7 @@ async fn cancel_read_trace_and_errors() {
     let provider = Arc::new(ScriptedProvider::new([Message::assistant("slow", vec![])]).with_delay(Duration::from_secs(30)));
     let hub = hub(provider, dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0)));
     let (tx, mut rx) = hub.connect();
-    tx.send(Request::New).unwrap();
+    tx.send(Request::New { cwd: None }).unwrap();
     let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
     let id = snapshot.session_id;
     tx.send(Request::Send { session_id: id.clone(), text: "x".into() }).unwrap();

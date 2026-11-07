@@ -39,6 +39,14 @@ pub struct Config {
     pub length_routing: bool,
     /// Name new sessions with a short model-written title for the session rail.
     pub session_titles: bool,
+    /// Remote machines whose hubs the TUI also attaches to (over SSH).
+    pub hosts: Vec<HostConfig>,
+    /// SSH client used for remote hosts.
+    pub ssh_program: String,
+    /// Command run on a remote host to reach its hub.
+    pub remote_command: Vec<String>,
+    /// `rdsh serve` exits after this long with no clients and no running turns; 0 never exits.
+    pub serve_idle_secs: u64,
     /// System One decisions endpoint; defaults to OpenRouter's, or TypeSafe's for a TypeSafe key.
     pub decision_url: Option<String>,
     /// Decision model id; defaults to Jev for the chosen endpoint.
@@ -55,6 +63,34 @@ pub struct Config {
     pub api_key: Option<String>,
 }
 
+/// A remote machine in the session rail.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfig {
+    /// Label in the rail.
+    pub name: String,
+    /// SSH destination, e.g. `me@build-box`.
+    pub ssh: String,
+    /// Directory for new sessions there; only sessions from it are listed. Default: all.
+    #[serde(default)]
+    pub dir: Option<String>,
+}
+
+impl HostConfig {
+    /// Parses `--host DEST[:DIR]` (`me@box:/srv/app`); the name is the host part of DEST.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let (dest, dir) = match spec.split_once(':') {
+            Some((d, dir)) if !dir.is_empty() => (d, Some(dir.to_owned())),
+            _ => (spec.trim_end_matches(':'), None),
+        };
+        if dest.is_empty() {
+            bail!("--host needs an SSH destination, like me@box or me@box:/path");
+        }
+        let name = dest.rsplit('@').next().unwrap_or(dest).to_owned();
+        Ok(Self { name, ssh: dest.to_owned(), dir })
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -69,6 +105,10 @@ impl Default for Config {
             sessions_dir: None,
             length_routing: true,
             session_titles: true,
+            hosts: Vec::new(),
+            ssh_program: "ssh".into(),
+            remote_command: vec!["rdsh".into(), "connect".into()],
+            serve_idle_secs: 1800,
             decision_url: None,
             decision_model: None,
             decision_timeout_ms: 2500,
@@ -124,6 +164,12 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.model.trim().is_empty() {
             bail!("config: `model` must not be empty");
+        }
+        if self.remote_command.is_empty() {
+            bail!("config: `remote_command` must name a program");
+        }
+        if let Some(h) = self.hosts.iter().find(|h| h.name.is_empty() || h.ssh.is_empty() || h.name == "local") {
+            bail!("config: host entries need a `name` (not \"local\") and an `ssh` destination: {h:?}");
         }
         if self.max_steps == 0 || self.subagent_max_steps == 0 {
             bail!("config: `max_steps` and `subagent_max_steps` must be at least 1");
@@ -205,6 +251,15 @@ mod tests {
         assert_eq!(m["B"], "two");
         assert_eq!(m["C"], "3");
         assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn host_specs() {
+        let h = HostConfig::parse("me@build:/srv/app").unwrap();
+        assert_eq!((h.name.as_str(), h.ssh.as_str(), h.dir.as_deref()), ("build", "me@build", Some("/srv/app")));
+        let h = HostConfig::parse("box").unwrap();
+        assert_eq!((h.name.as_str(), h.dir), ("box", None));
+        assert!(HostConfig::parse(":/x").is_err());
     }
 
     #[test]

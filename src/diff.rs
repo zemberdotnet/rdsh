@@ -7,7 +7,7 @@ use std::{
     process::Command,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     /// `diff --git`, `index`, `---`, `+++` and similar header lines.
     Meta,
@@ -18,7 +18,7 @@ pub enum Kind {
     Ctx,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DiffLine {
     pub kind: Kind,
     /// Line text without the diff prefix (`+`, `-`, ` `); full text for Meta/Hunk.
@@ -39,7 +39,7 @@ impl DiffLine {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     /// Tracked with uncommitted changes.
     Modified,
@@ -51,6 +51,7 @@ pub enum Status {
     NoRepo,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FileDiff {
     pub path: PathBuf,
     /// Path relative to the working directory when possible.

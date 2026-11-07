@@ -48,7 +48,8 @@ pub enum View {
     Chat,
     File(Box<FileView>),
     Queue { sel: usize },
-    Files { items: Vec<(String, String)>, sel: usize },
+    /// Changed files under `cwd` on `host`.
+    Files { items: Vec<(String, String)>, sel: usize, host: usize, cwd: PathBuf },
     Help,
 }
 
@@ -63,6 +64,10 @@ struct Active<'a> {
 /// What the TUI shows for one session. The agent itself runs in the hub; this is only the
 /// view, kept up to date from the hub's events whether or not it is on screen.
 pub struct SessionView {
+    /// Index of the host the session lives on.
+    pub(crate) host: usize,
+    /// Working directory of the session on its host.
+    pub(crate) cwd: PathBuf,
     pub(crate) session_id: String,
     pub(crate) model: String,
     pub(crate) transcript: Transcript,
@@ -92,11 +97,15 @@ pub struct SessionView {
 }
 
 impl SessionView {
-    pub fn new(cwd: PathBuf, session_id: String, model: String) -> Self {
+    /// @param local whether the session's files are on this machine (decides link checking).
+    pub fn new(host: usize, cwd: PathBuf, local: bool, session_id: String, model: String) -> Self {
+        let transcript = if local { Transcript::new(cwd.clone()) } else { Transcript::remote(cwd.clone()) };
         Self {
+            host,
+            cwd,
             session_id,
             model,
-            transcript: Transcript::new(cwd),
+            transcript,
             chat_cursor: Cursor::default(),
             chat_scroll: 0,
             follow: true,
@@ -120,9 +129,42 @@ impl SessionView {
 /// A session the user asked to see; the next matching `Opened` or `Trace` becomes current.
 #[derive(Clone, Debug, PartialEq)]
 enum PendingOpen {
-    /// Whatever opens next (startup, `:new`).
-    Any,
-    Id(String),
+    /// Whatever opens next on this host (startup, `:new`).
+    Any(usize),
+    Id(usize, String),
+}
+
+/// One attached hub: this machine's or a remote one.
+pub struct Host {
+    pub name: String,
+    /// Files of this host's sessions are on this machine (links are checked, diffs read directly).
+    pub local: bool,
+    /// Directory for new sessions; also limits the rail to sessions from it.
+    pub dir: Option<PathBuf>,
+    req_tx: UnboundedSender<Request>,
+    pub connected: bool,
+    /// From the host's last `Sessions` notice.
+    pub recorded: Vec<SessionInfo>,
+    pub open: HashSet<String>,
+    pub running: HashSet<String>,
+    /// Subagents seen starting in this host's sessions, keyed by their session id.
+    pub live: HashMap<String, LiveSub>,
+}
+
+impl Host {
+    pub fn new(name: impl Into<String>, local: bool, dir: Option<PathBuf>, req_tx: UnboundedSender<Request>) -> Self {
+        Self {
+            name: name.into(),
+            local,
+            dir,
+            req_tx,
+            connected: true,
+            recorded: Vec::new(),
+            open: HashSet::new(),
+            running: HashSet::new(),
+            live: HashMap::new(),
+        }
+    }
 }
 
 pub struct App {
@@ -130,15 +172,14 @@ pub struct App {
     pub(crate) cur: SessionView,
     /// Other sessions this TUI has open; they keep receiving events.
     pub(crate) others: Vec<SessionView>,
+    /// This TUI's working directory (local default for new sessions and placeholders).
     cwd: PathBuf,
-    req_tx: UnboundedSender<Request>,
+    pub(crate) hosts: Vec<Host>,
     pending_open: Option<PendingOpen>,
+    /// Line to place the cursor on when a requested remote file arrives.
+    pending_file: Option<Option<usize>>,
     /// Set while applying a background session's event, so view-level side effects stay off.
     background: bool,
-    /// From the hub's last `Sessions` notice.
-    pub(crate) recorded: Vec<SessionInfo>,
-    pub(crate) hub_open: HashSet<String>,
-    pub(crate) hub_running: HashSet<String>,
     pub(crate) view: View,
     pub(crate) mode: Mode,
     mode_before_search: Mode,
@@ -158,8 +199,6 @@ pub struct App {
     pub(crate) sidebar_area: Option<Rect>,
     /// Sessions with subagents nested beneath them.
     pub(crate) sidebar: Sidebar,
-    /// Subagents seen starting in any open session, keyed by their session id.
-    pub(crate) subagent_live: HashMap<String, LiveSub>,
     /// Keys go to the rail instead of the main view.
     pub(crate) sidebar_focus: bool,
     /// Selected rail row.
@@ -169,8 +208,8 @@ pub struct App {
     /// Whether the session rail is shown.
     pub(crate) sidebar_open: bool,
     /// Read-only views of rail rows loaded for previewing, with their trace's age when loaded.
-    previews: HashMap<String, (Option<std::time::SystemTime>, SessionView)>,
-    preview_requested: HashSet<String>,
+    previews: HashMap<(usize, String), (Option<std::time::SystemTime>, SessionView)>,
+    preview_requested: HashSet<(usize, String)>,
     /// The mouse is over the rail (previews without taking focus).
     pub(crate) hover: bool,
     /// Building a preview: its messages stay out of the prompt history.
@@ -187,19 +226,17 @@ pub struct App {
 }
 
 impl App {
-    /// Creates a TUI talking to the hub through `req_tx`. No session is shown until the hub
+    /// Creates a TUI attached to `hosts` (index 0 first). No session is shown until a hub
     /// answers an `Open`/`New` request with `Opened` (see `expect_open`).
-    pub fn new(cwd: PathBuf, req_tx: UnboundedSender<Request>) -> Self {
+    pub fn new(cwd: PathBuf, hosts: Vec<Host>) -> Self {
         Self {
-            cur: SessionView::new(cwd.clone(), String::new(), String::new()),
+            cur: SessionView::new(0, cwd.clone(), true, String::new(), String::new()),
             others: Vec::new(),
             cwd,
-            req_tx,
+            hosts,
             pending_open: None,
+            pending_file: None,
             background: false,
-            recorded: Vec::new(),
-            hub_open: HashSet::new(),
-            hub_running: HashSet::new(),
             view: View::Chat,
             mode: Mode::Insert,
             mode_before_search: Mode::Normal,
@@ -217,7 +254,6 @@ impl App {
             prompt_area: Rect::default(),
             sidebar_area: None,
             sidebar: Default::default(),
-            subagent_live: HashMap::new(),
             sidebar_focus: false,
             sidebar_sel: 0,
             sidebar_scroll: 0,
@@ -235,80 +271,130 @@ impl App {
         }
     }
 
-    /// The next `Opened` (or `Trace`) notice becomes the session on screen.
-    pub fn expect_open(&mut self) {
-        self.pending_open = Some(PendingOpen::Any);
+    /// The next `Opened` (or `Trace`) notice from `host` becomes the session on screen.
+    pub fn expect_open(&mut self, host: usize) {
+        self.pending_open = Some(PendingOpen::Any(host));
     }
 
-    /// Sends a request to the hub; a closed hub is reported once in the transcript.
-    fn request(&mut self, req: Request) {
-        if self.req_tx.send(req).is_err() {
-            self.set_flash("the session hub has stopped; restart rdsh");
+    /// Sends a request to `host`; a closed connection is reported in the status line.
+    fn request(&mut self, host: usize, req: Request) {
+        let Some(h) = self.hosts.get(host) else { return };
+        if !h.connected || h.req_tx.send(req).is_err() {
+            let name = h.name.clone();
+            self.set_flash(format!("not connected to {name}"));
         }
     }
 
-    /// Applies one hub notice.
-    pub fn on_notice(&mut self, n: Notice) {
+    /// The default directory for new sessions on `host`.
+    fn new_session_dir(&self, host: usize) -> Option<String> {
+        let h = self.hosts.get(host)?;
+        match (&h.dir, h.local) {
+            (Some(d), _) => Some(d.display().to_string()),
+            (None, true) => Some(self.cwd.display().to_string()),
+            (None, false) => None,
+        }
+    }
+
+    /// The hub on `host` went away: its views stay readable, nothing more can be sent there.
+    pub fn on_disconnect(&mut self, host: usize) {
+        let Some(h) = self.hosts.get_mut(host) else { return };
+        h.connected = false;
+        h.running.clear();
+        let name = h.name.clone();
+        for v in std::iter::once(&mut self.cur).chain(self.others.iter_mut()) {
+            if v.host == host {
+                v.running = false;
+            }
+        }
+        self.set_flash(format!("lost the connection to {name}"));
+        self.refresh_sidebar();
+    }
+
+    /// Applies one notice from `host`.
+    pub fn on_notice(&mut self, host: usize, n: Notice) {
+        if host >= self.hosts.len() {
+            return;
+        }
         match n {
             Notice::Sessions { recorded, open, running } => {
-                self.recorded = recorded;
                 // Drop previews of sessions whose trace changed since they were loaded.
-                let stale: Vec<String> = self
-                    .previews
-                    .iter()
-                    .filter(|(id, (m, _))| self.recorded_modified(id) != *m)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for id in stale {
-                    self.previews.remove(&id);
-                }
-                self.hub_open = open.into_iter().collect();
-                self.hub_running = running.into_iter().collect();
+                let modified: HashMap<&str, std::time::SystemTime> = recorded.iter().map(|s| (s.id.as_str(), s.modified)).collect();
+                self.previews
+                    .retain(|(h, id), (m, _)| *h != host || modified.get(id.as_str()).copied() == *m);
+                let h = &mut self.hosts[host];
+                h.recorded = recorded;
+                h.open = open.into_iter().collect();
+                h.running = running.into_iter().collect();
                 self.refresh_sidebar();
             }
             Notice::Opened { snapshot } => {
-                let id = snapshot.session_id.clone();
-                let current = self.claims(&id);
-                self.install(snapshot, current);
+                let current = self.claims(host, &snapshot.session_id);
+                self.install(host, snapshot, current);
             }
-            Notice::Trace { session_id, history } => {
-                self.preview_requested.remove(&session_id);
-                let current = self.claims(&session_id);
+            Notice::Trace { session_id, cwd, history } => {
+                self.preview_requested.remove(&(host, session_id.clone()));
+                let current = self.claims(host, &session_id);
                 let snapshot = Snapshot {
                     session_id: session_id.clone(),
                     model: "trace".into(),
+                    cwd,
                     history,
                     turn: Vec::new(),
                     running: false,
                     usage: Usage::default(),
                 };
                 if current {
-                    self.previews.remove(&session_id);
-                    self.install(snapshot, true);
+                    self.previews.remove(&(host, session_id));
+                    self.install(host, snapshot, true);
                     self.cur.read_only = true;
                 } else {
                     // Answer to a preview request: cache it, stamped with the trace's age.
                     self.preview_loading = true;
-                    let mut view = self.build_view(snapshot);
+                    let mut view = self.build_view(host, snapshot);
                     self.preview_loading = false;
                     view.read_only = true;
-                    let modified = self.recorded_modified(&session_id);
-                    self.previews.insert(session_id, (modified, view));
+                    let modified = self.recorded_modified(host, &session_id);
+                    self.previews.insert((host, session_id), (modified, view));
                 }
             }
-            Notice::Event { session_id, event } => self.on_session_event(&session_id, event),
+            Notice::File { file } => {
+                if let Some(line) = self.pending_file.take() {
+                    let cwd = self.cur.cwd.display().to_string();
+                    let mut fv = FileView::new(*file, line);
+                    fv.remote = Some((host, cwd));
+                    self.view = View::File(Box::new(fv));
+                    self.mode = Mode::Normal;
+                } else if let View::File(fv) = &mut self.view
+                    && fv.remote.as_ref().is_some_and(|(h, _)| *h == host)
+                {
+                    // A reload.
+                    fv.replace(*file);
+                }
+            }
+            Notice::ChangedFiles { cwd, files } => {
+                if files.is_empty() {
+                    self.set_flash("no uncommitted changes");
+                } else {
+                    self.view = View::Files { items: files, sel: 0, host, cwd: PathBuf::from(cwd) };
+                    self.mode = Mode::Normal;
+                }
+            }
+            Notice::Event { session_id, event } => self.on_session_event(host, &session_id, event),
             Notice::Error { message, .. } => {
                 self.pending_open = None;
-                self.set_flash(message);
+                self.pending_file = None;
+                let name = &self.hosts[host].name;
+                let msg = if self.hosts.len() > 1 { format!("{name}: {message}") } else { message };
+                self.set_flash(msg);
             }
         }
     }
 
     /// Whether an arriving session answers the user's pending open (and so goes on screen).
-    fn claims(&mut self, id: &str) -> bool {
+    fn claims(&mut self, host: usize, id: &str) -> bool {
         let hit = match &self.pending_open {
-            Some(PendingOpen::Any) => true,
-            Some(PendingOpen::Id(want)) => id.starts_with(want.as_str()) || want == "last",
+            Some(PendingOpen::Any(h)) => *h == host,
+            Some(PendingOpen::Id(h, want)) => *h == host && (id.starts_with(want.as_str()) || want == "last"),
             None => false,
         };
         if hit {
@@ -317,10 +403,15 @@ impl App {
         hit
     }
 
-    /// Replaces any view of `snapshot.session_id` with one rebuilt from the snapshot.
+    fn placeholder(&self) -> SessionView {
+        SessionView::new(0, self.cwd.clone(), true, String::new(), String::new())
+    }
+
     /// Builds a view from a snapshot without touching what is on screen.
-    fn build_view(&mut self, snapshot: Snapshot) -> SessionView {
-        let view = SessionView::new(self.cwd.clone(), snapshot.session_id.clone(), snapshot.model.clone());
+    fn build_view(&mut self, host: usize, snapshot: Snapshot) -> SessionView {
+        let cwd = if snapshot.cwd.is_empty() { self.cwd.clone() } else { PathBuf::from(&snapshot.cwd) };
+        let local = self.hosts.get(host).is_none_or(|h| h.local);
+        let view = SessionView::new(host, cwd, local, snapshot.session_id.clone(), snapshot.model.clone());
         let previous = std::mem::replace(&mut self.cur, view);
         let was_background = std::mem::replace(&mut self.background, true);
         self.load_history(&snapshot.history);
@@ -333,63 +424,72 @@ impl App {
         std::mem::replace(&mut self.cur, previous)
     }
 
-    fn recorded_modified(&self, id: &str) -> Option<std::time::SystemTime> {
-        self.recorded.iter().find(|s| s.id == id).map(|s| s.modified)
+    fn recorded_modified(&self, host: usize, id: &str) -> Option<std::time::SystemTime> {
+        self.hosts.get(host)?.recorded.iter().find(|s| s.id == id).map(|s| s.modified)
+    }
+
+    fn other_index(&self, host: usize, id: &str) -> Option<usize> {
+        self.others.iter().position(|v| v.host == host && v.session_id == id)
     }
 
     /// The rail row being previewed: the selection, while the rail is focused or hovered, when
-    /// it is not the session on screen.
-    pub(crate) fn preview_id(&self) -> Option<String> {
+    /// it is a session that is not the one on screen.
+    pub(crate) fn preview_id(&self) -> Option<(usize, String)> {
         if !self.sidebar_open || !(self.sidebar_focus || self.hover) {
             return None;
         }
         let row = self.sidebar.rows().get(self.sidebar_sel)?;
-        (row.id != self.cur.session_id).then(|| row.id.clone())
+        (!row.header && !(row.host == self.cur.host && row.id == self.cur.session_id)).then(|| (row.host, row.id.clone()))
     }
 
-    /// Asks the hub for the previewed session's trace unless a view of it is already here.
+    /// Asks the row's host for the previewed session's trace unless a view of it is already here.
     fn request_preview(&mut self) {
-        let Some(id) = self.preview_id() else { return };
-        let have = self.others.iter().any(|v| v.session_id == id) || self.previews.contains_key(&id);
-        if !have && self.preview_requested.insert(id.clone()) {
-            self.request(Request::ReadTrace { session_id: id });
+        let Some((host, id)) = self.preview_id() else { return };
+        let key = (host, id.clone());
+        let have = self.other_index(host, &id).is_some() || self.previews.contains_key(&key);
+        if !have && self.preview_requested.insert(key) {
+            self.request(host, Request::ReadTrace { session_id: id });
         }
     }
 
-    /// Runs `f` with the view of `id` swapped in as `cur`, for drawing a preview.
-    pub(crate) fn with_view<R>(&mut self, id: &str, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
-        let mut slot = if let Some(i) = self.others.iter().position(|v| v.session_id == id) {
-            std::mem::replace(&mut self.others[i], SessionView::new(self.cwd.clone(), String::new(), String::new()))
-        } else {
-            self.previews.remove(id)?.1
+    /// Runs `f` with the view of `(host, id)` swapped in as `cur`, for drawing a preview.
+    pub(crate) fn with_view<R>(&mut self, host: usize, id: &str, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let key = (host, id.to_owned());
+        let from_others = self.other_index(host, id);
+        let mut slot = match from_others {
+            Some(i) => {
+                let empty = self.placeholder();
+                std::mem::replace(&mut self.others[i], empty)
+            }
+            None => self.previews.remove(&key)?.1,
         };
         std::mem::swap(&mut self.cur, &mut slot);
         let r = f(self);
         std::mem::swap(&mut self.cur, &mut slot);
-        match self.others.iter().position(|v| v.session_id.is_empty()) {
+        match from_others {
             Some(i) => self.others[i] = slot,
             None => {
-                let m = self.recorded_modified(id);
-                self.previews.insert(id.to_owned(), (m, slot));
+                let m = self.recorded_modified(host, id);
+                self.previews.insert(key, (m, slot));
             }
         }
         Some(r)
     }
 
-    fn install(&mut self, snapshot: Snapshot, make_current: bool) {
+    fn install(&mut self, host: usize, snapshot: Snapshot, make_current: bool) {
         let id = snapshot.session_id.clone();
-        self.others.retain(|v| v.session_id != id);
+        self.others.retain(|v| !(v.host == host && v.session_id == id));
+        let same = self.cur.host == host && self.cur.session_id == id;
         // Keep the draft and queued comments of a view being refreshed.
-        let carried = (self.cur.session_id == id)
-            .then(|| (std::mem::take(&mut self.cur.prompt), std::mem::take(&mut self.cur.queue)));
-        let mut fresh = self.build_view(snapshot);
+        let carried = same.then(|| (std::mem::take(&mut self.cur.prompt), std::mem::take(&mut self.cur.queue)));
+        let mut fresh = self.build_view(host, snapshot);
         if let Some((prompt, queue)) = carried {
             fresh.prompt = prompt;
             fresh.queue = queue;
         }
         let previous = std::mem::replace(&mut self.cur, fresh);
-        let keep_previous = !previous.session_id.is_empty() && previous.session_id != id;
-        if make_current {
+        let keep_previous = !previous.session_id.is_empty() && !same;
+        if make_current || same {
             if keep_previous {
                 self.others.push(previous);
             }
@@ -400,17 +500,17 @@ impl App {
         }
         self.refresh_sidebar();
         if make_current {
-            self.sidebar_sel = self.sidebar.index_of(&id).unwrap_or(self.sidebar_sel);
+            self.sidebar_sel = self.sidebar.index_of(host, &id).unwrap_or(self.sidebar_sel);
         }
     }
 
     /// Routes a session event to its view, on screen or not.
-    fn on_session_event(&mut self, id: &str, ev: AgentEvent) {
-        if self.cur.session_id == id {
+    fn on_session_event(&mut self, host: usize, id: &str, ev: AgentEvent) {
+        if self.cur.host == host && self.cur.session_id == id {
             self.on_agent(ev);
             return;
         }
-        let Some(i) = self.others.iter().position(|v| v.session_id == id) else { return };
+        let Some(i) = self.other_index(host, id) else { return };
         std::mem::swap(&mut self.cur, &mut self.others[i]);
         let was = std::mem::replace(&mut self.background, true);
         self.on_agent(ev);
@@ -425,48 +525,61 @@ impl App {
         self.mode = Mode::Normal;
         self.sidebar_focus = false;
         self.refresh_sidebar();
-        self.sidebar_sel = self.sidebar.index_of(&self.cur.session_id).unwrap_or(self.sidebar_sel);
+        self.sidebar_sel = self.sidebar.index_of(self.cur.host, &self.cur.session_id).unwrap_or(self.sidebar_sel);
     }
 
-    /// Enter on a rail row: show that session, resuming it in the hub if needed. Subagent
-    /// rows open their trace read-only.
+    /// Starts a new session on `host` and shows it when it opens.
+    fn new_session(&mut self, host: usize) {
+        self.pending_open = Some(PendingOpen::Any(host));
+        let cwd = self.new_session_dir(host);
+        self.request(host, Request::New { cwd });
+    }
+
+    /// Enter on a rail row: show that session, resuming it on its host if needed. Subagent
+    /// rows open their trace read-only; a host heading starts a new session there.
     fn open_selected(&mut self) {
         let Some(row) = self.sidebar.rows().get(self.sidebar_sel).cloned() else { return };
-        if row.id == self.cur.session_id {
-            self.sidebar_focus = false;
+        self.sidebar_focus = false;
+        self.mode = Mode::Normal;
+        if row.header {
+            let name = self.hosts.get(row.host).map(|h| h.name.clone()).unwrap_or_default();
+            self.set_flash(format!("starting a session on {name}…"));
+            return self.new_session(row.host);
+        }
+        if row.host == self.cur.host && row.id == self.cur.session_id {
             return;
         }
-        if let Some(i) = self.others.iter().position(|v| v.session_id == row.id) {
-            self.switch_to(i);
-            return;
+        if let Some(i) = self.other_index(row.host, &row.id) {
+            return self.switch_to(i);
         }
         // A subagent trace already loaded for the preview opens as is.
         if row.depth > 0
-            && let Some((_, view)) = self.previews.remove(&row.id)
+            && let Some((_, view)) = self.previews.remove(&(row.host, row.id.clone()))
         {
             self.others.push(view);
             let i = self.others.len() - 1;
-            self.switch_to(i);
-            return;
+            return self.switch_to(i);
         }
-        self.pending_open = Some(PendingOpen::Id(row.id.clone()));
+        self.pending_open = Some(PendingOpen::Id(row.host, row.id.clone()));
         if row.depth == 0 {
             self.set_flash(format!("opening {}…", row.id));
-            self.request(Request::Open { session_id: row.id });
+            self.request(row.host, Request::Open { session_id: row.id });
         } else {
             self.set_flash(format!("loading subagent trace {}…", row.id));
             // A preview load already in flight answers this open too.
-            if self.preview_requested.insert(row.id.clone()) {
-                self.request(Request::ReadTrace { session_id: row.id });
+            if self.preview_requested.insert((row.host, row.id.clone())) {
+                self.request(row.host, Request::ReadTrace { session_id: row.id });
             }
         }
-        self.sidebar_focus = false;
-        self.mode = Mode::Normal;
     }
 
-    /// Sessions running in the hub other than the one on screen.
+    /// Sessions running on any host other than the one on screen.
     fn others_running(&self) -> usize {
-        self.hub_running.iter().filter(|id| **id != self.cur.session_id).count()
+        self.hosts
+            .iter()
+            .enumerate()
+            .map(|(i, h)| h.running.iter().filter(|id| !(i == self.cur.host && **id == self.cur.session_id)).count())
+            .sum()
     }
 
     #[cfg(test)]
@@ -474,12 +587,13 @@ impl App {
         self.history.iter().any(|h| h == text)
     }
 
-    /// Ids of the sessions this TUI shows (current first), for the exit message.
-    pub fn open_sessions(&self) -> Vec<String> {
+    /// `(host name, session id)` of the sessions this TUI shows (current first), for the exit
+    /// message.
+    pub fn open_sessions(&self) -> Vec<(String, String)> {
         std::iter::once(&self.cur)
             .chain(&self.others)
             .filter(|v| !v.session_id.is_empty() && !v.read_only)
-            .map(|v| v.session_id.clone())
+            .map(|v| (self.hosts.get(v.host).map(|h| h.name.clone()).unwrap_or_default(), v.session_id.clone()))
             .collect()
     }
 
@@ -519,15 +633,41 @@ impl App {
         }
     }
 
-    /// Rebuilds the session rail from the hub's last session list and the live subagents seen.
-    /// Cheap: no filesystem work happens here.
+    /// Rebuilds the session rail from the hosts' last session lists and the live subagents
+    /// seen. Cheap: no filesystem work happens here.
     pub fn refresh_sidebar(&mut self) {
-        let selected = self.sidebar.rows().get(self.sidebar_sel).map(|r| r.id.clone());
-        let cwd = self.cwd.display().to_string();
-        self.sidebar = Sidebar::build(&self.recorded, &cwd, &self.subagent_live, &self.hub_running);
-        // Keep the selection on the same session when rows shift.
-        let fallback = self.sidebar.index_of(&self.cur.session_id).unwrap_or(0);
-        self.sidebar_sel = selected.and_then(|id| self.sidebar.index_of(&id)).unwrap_or(fallback);
+        let selected = self.sidebar.rows().get(self.sidebar_sel).map(|r| (r.host, r.header, r.id.clone()));
+        let parts: Vec<(String, Sidebar)> = self
+            .hosts
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let filter = match (&h.dir, h.local) {
+                    (Some(d), _) => Some(d.display().to_string()),
+                    (None, true) => Some(self.cwd.display().to_string()),
+                    (None, false) => None,
+                };
+                let title = if h.connected { h.name.clone() } else { format!("{} (disconnected)", h.name) };
+                (title, Sidebar::build(i, &h.recorded, filter.as_deref(), &h.live, &h.running))
+            })
+            .collect();
+        // A single host needs no heading.
+        self.sidebar = if parts.len() == 1 {
+            parts.into_iter().next().map(|(_, s)| s).unwrap_or_default()
+        } else {
+            Sidebar::grouped(parts)
+        };
+        // Keep the selection on the same row when rows shift.
+        let fallback = self.sidebar.index_of(self.cur.host, &self.cur.session_id).unwrap_or(0);
+        self.sidebar_sel = selected
+            .and_then(|(h, header, id)| {
+                if header {
+                    self.sidebar.rows().iter().position(|r| r.header && r.host == h)
+                } else {
+                    self.sidebar.index_of(h, &id)
+                }
+            })
+            .unwrap_or(fallback);
     }
 
     fn set_sidebar_focus(&mut self, focus: bool) {
@@ -537,7 +677,7 @@ impl App {
         }
         if focus && !self.sidebar_focus {
             // Start from the session on screen.
-            self.sidebar_sel = self.sidebar.index_of(&self.cur.session_id).unwrap_or(self.sidebar_sel);
+            self.sidebar_sel = self.sidebar.index_of(self.cur.host, &self.cur.session_id).unwrap_or(self.sidebar_sel);
         }
         self.sidebar_focus = focus && self.sidebar_open;
         self.mode = Mode::Normal;
@@ -646,7 +786,7 @@ impl App {
     fn ctrl_c(&mut self) {
         if self.cur.running {
             let session_id = self.cur.session_id.clone();
-            self.request(Request::Cancel { session_id });
+            self.request(self.cur.host, Request::Cancel { session_id });
             self.set_flash("interrupting…");
             return;
         }
@@ -742,7 +882,7 @@ impl App {
             self.set_flash("queued — sends when the current turn finishes");
         }
         let session_id = self.cur.session_id.clone();
-        self.request(Request::Send { session_id, text: msg });
+        self.request(self.cur.host, Request::Send { session_id, text: msg });
         self.view = View::Chat;
     }
 
@@ -905,9 +1045,16 @@ impl App {
             (KeyCode::Esc, _) if visual => self.mode = Mode::Normal,
             (KeyCode::Esc | KeyCode::Char('q'), _) if in_file => self.close_view(),
             (KeyCode::Char('r'), false) if in_file => {
-                let cwd = self.cur.transcript.cwd().to_owned();
+                let cwd = self.cur.cwd.clone();
+                let mut remote = None;
                 if let View::File(fv) = &mut self.view {
-                    fv.reload(&cwd);
+                    match &fv.remote {
+                        Some((h, c)) => remote = Some((*h, c.clone(), fv.file.path.display().to_string())),
+                        None => fv.reload(&cwd),
+                    }
+                }
+                if let Some((h, c, path)) = remote {
+                    self.request(h, Request::ReadFile { cwd: c, path });
                 }
                 self.set_flash("reloaded");
             }
@@ -1125,8 +1272,7 @@ impl App {
                 n => self.set_flash(format!("{n} other session(s) still running — :q! quits and stops them")),
             },
             "new" => {
-                self.pending_open = Some(PendingOpen::Any);
-                self.request(Request::New);
+                self.new_session(self.cur.host);
             }
             "help" | "h" => self.view = View::Help,
             "files" => self.open_files(),
@@ -1142,8 +1288,8 @@ impl App {
                     Some((p, l)) if l.parse::<usize>().is_ok() => (p, l.parse().ok()),
                     _ => (arg, None),
                 };
-                let path = resolve_path(self.cur.transcript.cwd(), p);
-                if path.is_file() {
+                let path = resolve_path(&self.cur.cwd, p);
+                if !self.host_is_local(self.cur.host) || path.is_file() {
                     self.open_file(path, line);
                 } else {
                     self.set_flash(format!("not a file: {arg}"));
@@ -1172,18 +1318,38 @@ impl App {
         self.mode = Mode::Normal;
     }
 
+    /// Lists changed files of the session on screen, asking its host when it is remote.
     fn open_files(&mut self) {
-        let items = diff::changed_files(self.cur.transcript.cwd());
+        let (host, cwd) = (self.cur.host, self.cur.cwd.clone());
+        if !self.host_is_local(host) {
+            return self.request(host, Request::ChangedFiles { cwd: cwd.display().to_string() });
+        }
+        let items = diff::changed_files(&cwd);
         if items.is_empty() {
             self.set_flash("no uncommitted changes");
             return;
         }
-        self.view = View::Files { items, sel: 0 };
+        self.view = View::Files { items, sel: 0, host, cwd };
         self.mode = Mode::Normal;
     }
 
+    fn host_is_local(&self, host: usize) -> bool {
+        self.hosts.get(host).is_none_or(|h| h.local)
+    }
+
+    /// Opens `path` of the session on screen. Remote files are read on their host; the view
+    /// opens when the `File` notice arrives.
     pub(crate) fn open_file(&mut self, path: PathBuf, line: Option<usize>) {
-        let file = diff::load(self.cur.transcript.cwd(), &path);
+        self.open_file_on(self.cur.host, self.cur.cwd.clone(), path, line);
+    }
+
+    fn open_file_on(&mut self, host: usize, cwd: PathBuf, path: PathBuf, line: Option<usize>) {
+        if !self.host_is_local(host) {
+            self.pending_file = Some(line);
+            let req = Request::ReadFile { cwd: cwd.display().to_string(), path: path.display().to_string() };
+            return self.request(host, req);
+        }
+        let file = diff::load(&cwd, &path);
         self.view = View::File(Box::new(FileView::new(file, line)));
         self.mode = Mode::Normal;
         self.count = None;
@@ -1269,16 +1435,17 @@ impl App {
     }
 
     fn files_key(&mut self, k: KeyEvent) {
-        let View::Files { items, sel } = &mut self.view else { return };
+        let View::Files { items, sel, host, cwd } = &mut self.view else { return };
         let n = items.len();
+        let (host, cwd) = (*host, cwd.clone());
         match k.code {
             KeyCode::Char('j') | KeyCode::Down => *sel = (*sel + 1).min(n.saturating_sub(1)),
             KeyCode::Char('k') | KeyCode::Up => *sel = sel.saturating_sub(1),
             KeyCode::Char('g') => *sel = 0,
             KeyCode::Char('G') => *sel = n.saturating_sub(1),
             KeyCode::Enter | KeyCode::Char('l' | 'o') if *sel < n => {
-                let path = resolve_path(self.cur.transcript.cwd(), &items[*sel].1);
-                self.open_file(path, None);
+                let path = resolve_path(&cwd, &items[*sel].1);
+                self.open_file_on(host, cwd, path, None);
             }
             KeyCode::Char('r') => self.open_files(),
             KeyCode::Char('i') => self.mode = Mode::Insert,
@@ -1393,7 +1560,7 @@ impl App {
     // ------------------------------------------------------- agent events
 
     fn set_sub_state(&mut self, id: &str, state: Live) {
-        if let Some(s) = self.subagent_live.get_mut(id)
+        if let Some(s) = self.hosts.get_mut(self.cur.host).and_then(|h| h.live.get_mut(id))
             && s.state != state
         {
             s.state = state;
@@ -1490,7 +1657,9 @@ impl App {
             AgentEvent::SubagentStarted { call_id, session_id, title } => {
                 self.cur.subagent_calls.insert(call_id, session_id.clone());
                 let parent = self.cur.session_id.clone();
-                self.subagent_live.insert(session_id, LiveSub { parent, title, state: Live::Running });
+                if let Some(h) = self.hosts.get_mut(self.cur.host) {
+                    h.live.insert(session_id, LiveSub { parent, title, state: Live::Running });
+                }
                 self.refresh_sidebar();
             }
             AgentEvent::ToolEnd { call_id, output, duration_ms } => {

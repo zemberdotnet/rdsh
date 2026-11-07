@@ -150,6 +150,11 @@ impl Agent {
         self.opts.trace.as_ref().map(|t| t.session_id.as_str())
     }
 
+    /// Working directory the agent's tools run in.
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.opts.cwd
+    }
+
     pub fn model(&self) -> &str {
         self.opts.provider.model()
     }

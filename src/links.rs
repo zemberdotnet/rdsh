@@ -24,11 +24,25 @@ static CANDIDATE: LazyLock<Regex> =
 pub struct LinkResolver {
     cwd: PathBuf,
     cache: HashMap<String, Option<Arc<PathBuf>>>,
+    /// Files live on another machine: accept path-like candidates without checking the disk.
+    trust: bool,
 }
+
+/// Extensions treated as file names when files cannot be checked (remote sessions).
+const KNOWN_EXTENSIONS: &[&str] = &[
+    "rs", "py", "js", "ts", "tsx", "jsx", "go", "c", "h", "cc", "cpp", "hpp", "java", "kt", "rb", "md", "toml", "json",
+    "yaml", "yml", "nix", "sh", "txt", "lock", "html", "css", "sql", "proto", "cfg", "ini", "xml",
+];
 
 impl LinkResolver {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd, cache: HashMap::new() }
+        Self { cwd, cache: HashMap::new(), trust: false }
+    }
+
+    /// A resolver for files on another machine: paths with a `/` or a known extension link
+    /// without a filesystem check.
+    pub fn trusting(cwd: PathBuf) -> Self {
+        Self { cwd, cache: HashMap::new(), trust: true }
     }
 
     pub fn cwd(&self) -> &Path {
@@ -40,7 +54,12 @@ impl LinkResolver {
             return hit.clone();
         }
         let path = crate::tools::resolve_path(&self.cwd, candidate);
-        let found = path.is_file().then(|| Arc::new(path));
+        let found = if self.trust {
+            let ext = Path::new(candidate).extension().and_then(|e| e.to_str()).unwrap_or("");
+            (candidate.contains('/') || KNOWN_EXTENSIONS.contains(&ext)).then(|| Arc::new(path))
+        } else {
+            path.is_file().then(|| Arc::new(path))
+        };
         if self.cache.len() > 50_000 {
             self.cache.clear();
         }
@@ -101,6 +120,14 @@ mod tests {
         // grep-style output
         let l = r.find("src/main.rs:3: fn main() {}");
         assert_eq!(l[0].line, Some(3));
+    }
+
+    #[test]
+    fn remote_paths_link_without_a_disk_check() {
+        let mut r = LinkResolver::trusting(PathBuf::from("/srv/app"));
+        let l = r.find("see src/main.rs:4, notes.md, e.g. 1.5 and v2.0");
+        let found: Vec<_> = l.iter().map(|k| (k.path.display().to_string(), k.line)).collect();
+        assert_eq!(found, [("/srv/app/src/main.rs".to_owned(), Some(4)), ("/srv/app/notes.md".to_owned(), None)]);
     }
 
     #[test]
