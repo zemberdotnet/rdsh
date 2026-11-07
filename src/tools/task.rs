@@ -125,6 +125,7 @@ impl Tool for Task {
                 bash_timeout: self.bash_timeout,
                 max_tool_output: self.max_tool_output,
                 trace,
+                length: None,
             });
             let parent = ctx.sink.clone();
             let call_id = ctx.call_id.clone();

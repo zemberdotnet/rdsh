@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use crate::{
     agent::{Agent, AgentOptions},
     config::Config,
+    decision::SystemOne,
+    length::LengthRouter,
     llm::Provider,
     prompt,
     tools::{self, task::Task},
@@ -56,6 +58,10 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
         session_id,
     )));
     let system_prompt = prompt::main(provider.model(), &registry);
+    let length = match cfg.length_routing {
+        true => SystemOne::from_config(cfg)?.map(|d| Arc::new(LengthRouter::new(Arc::new(d)))),
+        false => None,
+    };
     let opts = AgentOptions {
         provider,
         tools: Arc::new(registry),
@@ -65,6 +71,7 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
         bash_timeout,
         max_tool_output: cfg.max_tool_output_chars,
         trace: Some(trace),
+        length,
     };
     Ok(match history {
         Some(h) => Agent::resume(opts, h),

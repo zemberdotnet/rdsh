@@ -6,6 +6,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    length::{LengthRouter, Routing},
     llm::{Delta, Message, Provider, Request, ToolCall, ToolSpec, Usage},
     prompt,
     tools::{Registry, ToolCtx, ToolOutput},
@@ -28,6 +29,8 @@ pub enum AgentEvent {
     SubagentStarted { call_id: String, session_id: String, title: String },
     /// An event from the subagent running inside tool call `call_id`.
     Subagent { call_id: String, event: Box<AgentEvent> },
+    /// What the response-length router decided for this turn (top-level agent only).
+    ResponseLength(Routing),
     /// Non-fatal problem (for example, the trace could not be written).
     Warning(String),
     TurnEnd { cancelled: bool, error: Option<String> },
@@ -53,6 +56,8 @@ pub struct AgentOptions {
     pub bash_timeout: Duration,
     pub max_tool_output: usize,
     pub trace: Option<Trace>,
+    /// Picks the reply length each turn; `None` for subagents and headless runs.
+    pub length: Option<Arc<LengthRouter>>,
 }
 
 pub struct Agent {
@@ -163,7 +168,31 @@ impl Agent {
         if latest != Some(&context) {
             self.push(Message::Context { content: context });
         }
+        let directive = match self.opts.length.clone() {
+            Some(router) => {
+                let routed = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    r = router.route(&self.history, &input) => Some(r),
+                };
+                let Some((routing, directive)) = routed else {
+                    self.push(Message::User { content: input });
+                    return self.finish(&sink, String::new(), true, None);
+                };
+                if let Routing::Unavailable { reason } = &routing
+                    && router.first_failure()
+                {
+                    sink(AgentEvent::Warning(format!("response length not routed: {reason}")));
+                }
+                sink(AgentEvent::ResponseLength(routing));
+                directive
+            }
+            None => None,
+        };
         self.push(Message::User { content: input });
+        if let Some(content) = directive {
+            self.push(Message::Directive { content });
+        }
         let mut last_text = String::new();
         for _ in 0..self.opts.max_steps {
             let delta_sink = |d: Delta| {

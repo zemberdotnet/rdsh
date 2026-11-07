@@ -37,6 +37,7 @@ fn agent_with(provider: Arc<dyn Provider>, cwd: &std::path::Path, trace_dir: Opt
         bash_timeout: Duration::from_secs(10),
         max_tool_output: 30_000,
         trace,
+        length: None,
     })
 }
 
@@ -200,6 +201,7 @@ async fn resume_answers_dangling_tool_calls() {
             bash_timeout: Duration::from_secs(5),
             max_tool_output: 30_000,
             trace: None,
+            length: None,
         },
         history,
     );
@@ -271,4 +273,65 @@ async fn subagent_ids_continue_after_existing_traces_and_are_reported() {
         _ => None,
     });
     assert_eq!(started, Some(("t1".into(), "parent-sub3".into(), "scan lexer".into())));
+}
+
+#[tokio::test]
+async fn length_note_follows_the_user_message_but_not_subagent_tasks() {
+    use rdsh::{
+        decision::{Pick, ScriptedDecider},
+        length::{LengthRouter, Routing},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        Message::assistant("", vec![call("t1", "task", serde_json::json!({"description": "look", "prompt": "find it"}))]),
+        Message::assistant("sub report", vec![]),
+        Message::assistant("yes", vec![]),
+        Message::assistant("second", vec![]),
+    ]));
+    let decider = Arc::new(ScriptedDecider::new([
+        Ok(Pick { label: "yesno".into(), confidence: 0.91 }),
+        Err("HTTP 503".into()),
+    ]));
+    let mut agent = {
+        // Same tools as `agent_with`, plus the router.
+        let base = Arc::new(tools::builtin());
+        let mut reg = (*base).clone();
+        reg.add(Arc::new(Task::new(provider.clone(), base, 10, Duration::from_secs(10), 30_000, None, "p".into())));
+        Agent::new(AgentOptions {
+            provider: provider.clone(),
+            tools: Arc::new(reg),
+            system_prompt: "sys".into(),
+            max_steps: 10,
+            cwd: dir.path().to_path_buf(),
+            bash_timeout: Duration::from_secs(10),
+            max_tool_output: 30_000,
+            trace: None,
+            length: Some(Arc::new(LengthRouter::new(decider.clone()))),
+        })
+    };
+    let (sink, events) = collecting_sink();
+    let out = agent.run_turn("is it there?".into(), sink.clone(), CancellationToken::new()).await;
+    assert_eq!(out.text, "yes");
+    let reqs = provider.requests();
+    let is_note = |m: &Message| matches!(m, Message::Directive { content } if content.contains("level=\"yesno\""));
+    // Main agent: the note comes right after the user's message, which keeps its typed text.
+    assert!(is_note(reqs[0].last().unwrap()));
+    assert!(matches!(&reqs[0][reqs[0].len() - 2], Message::User { content } if content == "is it there?"));
+    // Subagent: no note, and the decider was asked only once.
+    assert!(!reqs[1].iter().any(|m| matches!(m, Message::Directive { .. })));
+    assert_eq!(decider.states().len(), 1);
+    assert!(decider.states()[0].ends_with("is it there?"));
+    assert!(events.lock().unwrap().iter().any(|e| matches!(
+        e,
+        AgentEvent::ResponseLength(Routing::Picked { level: "yesno", .. })
+    )));
+
+    // An unavailable decision adds no note and warns once.
+    events.lock().unwrap().clear();
+    agent.run_turn("and then?".into(), sink, CancellationToken::new()).await;
+    let last = provider.requests().last().unwrap().clone();
+    assert!(matches!(last.last().unwrap(), Message::User { content } if content == "and then?"));
+    let evs = events.lock().unwrap();
+    assert!(evs.iter().any(|e| matches!(e, AgentEvent::Warning(w) if w.contains("503"))));
+    assert!(evs.iter().any(|e| matches!(e, AgentEvent::ResponseLength(Routing::Unavailable { .. }))));
 }

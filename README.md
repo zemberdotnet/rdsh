@@ -25,8 +25,16 @@ Optional `~/.config/rdsh/config.json` (all keys optional):
 ```json
 { "model": "deepseek-chat", "max_steps": 100, "subagent_max_steps": 50,
   "max_tool_output_chars": 30000, "bash_timeout_secs": 120, "max_retries": 3,
-  "stream_idle_timeout_secs": 180, "sessions_dir": "/path/to/sessions" }
+  "stream_idle_timeout_secs": 180, "sessions_dir": "/path/to/sessions",
+  "length_routing": true, "decision_url": null, "decision_model": null, "decision_timeout_ms": 2500 }
 ```
+
+**Response length.** With `OPENROUTER_API_KEY` (or `TYPESAFE_API_KEY`) set, each TUI turn first asks
+Jev, TypeSafe's decision model, how long the reply should be (`yesno`, `brief`, `standard`, `detailed`),
+judging from your last few prompts, the start of the last reply and the new prompt. A
+`<response_length>` note goes after your message; the status line shows the pick (`len brief 0.86`).
+A pick below 0.5 confidence, a timeout or an error adds no note. Subagents and `rdsh run` are never
+routed. `decision_url` points at another System One endpoint; a localhost one needs no key.
 
 ## Keys
 

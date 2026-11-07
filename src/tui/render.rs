@@ -563,7 +563,13 @@ impl App {
         }
         let u = self.usage;
         let short: String = self.session_id.chars().take(15).collect();
-        let right = format!("{} · ↑{} ↓{} · {short} ", self.model, compact(u.prompt_tokens), compact(u.completion_tokens));
+        let length = self.length.as_deref().map_or(String::new(), |l| format!("len {l} · "));
+        let right = format!(
+            "{length}{} · ↑{} ↓{} · {short} ",
+            self.model,
+            compact(u.prompt_tokens),
+            compact(u.completion_tokens)
+        );
         let used: usize = spans.iter().map(|s| s.width()).sum();
         let pad = (area.width as usize).saturating_sub(used + right.chars().count());
         spans.push(Span::raw(" ".repeat(pad)));

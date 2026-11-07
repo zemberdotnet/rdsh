@@ -17,6 +17,7 @@ use super::{
 };
 use crate::{
     agent::AgentEvent,
+    length::Routing,
     comments::{Anchor, Comment, compose_message},
     diff,
     llm::{Message, Usage},
@@ -82,6 +83,8 @@ pub struct App {
     pub(crate) model: String,
     pub(crate) session_id: String,
     pub(crate) flash: Option<String>,
+    /// The last turn's response-length pick, shown in the status line.
+    pub(crate) length: Option<String>,
     pub(crate) activity: Option<String>,
     pub quit: bool,
     ctrl_c_armed: bool,
@@ -144,6 +147,7 @@ impl App {
             model,
             session_id,
             flash: None,
+            length: None,
             activity: None,
             quit: false,
             ctrl_c_armed: false,
@@ -174,7 +178,7 @@ impl App {
     pub fn load_history(&mut self, history: &[Message]) {
         for m in history {
             match m {
-                Message::System { .. } | Message::Context { .. } => {}
+                Message::System { .. } | Message::Context { .. } | Message::Directive { .. } => {}
                 Message::User { content } => {
                     self.transcript.push(Kind::User, content.clone());
                     self.history.push(content.clone());
@@ -1199,6 +1203,13 @@ impl App {
                 {
                     t.children.push(l);
                 }
+            }
+            AgentEvent::ResponseLength(r) => {
+                self.length = Some(match r {
+                    Routing::Picked { level, confidence } => format!("{level} {confidence:.2}"),
+                    Routing::Unsure { level, confidence } => format!("unsure ({level} {confidence:.2})"),
+                    Routing::Unavailable { .. } => "unrouted".into(),
+                });
             }
             AgentEvent::Warning(w) => {
                 self.transcript.push(Kind::Info, w);

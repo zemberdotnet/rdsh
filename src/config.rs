@@ -12,6 +12,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::decision::KeySource;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -33,6 +35,19 @@ pub struct Config {
     pub stream_idle_timeout_secs: u64,
     /// Where session traces are written; defaults to `$XDG_DATA_HOME/rdsh/sessions`.
     pub sessions_dir: Option<PathBuf>,
+    /// Ask the decision model how long each reply should be (top-level TUI turns only).
+    pub length_routing: bool,
+    /// System One decisions endpoint; defaults to OpenRouter's, or TypeSafe's for a TypeSafe key.
+    pub decision_url: Option<String>,
+    /// Decision model id; defaults to Jev for the chosen endpoint.
+    pub decision_model: Option<String>,
+    /// A decision that takes longer is skipped.
+    pub decision_timeout_ms: u64,
+    /// Decision key from `TYPESAFE_API_KEY` or `OPENROUTER_API_KEY`; never read from the config file.
+    #[serde(skip)]
+    pub decision_api_key: Option<String>,
+    #[serde(skip)]
+    pub decision_key_source: Option<KeySource>,
     /// API key from `DEEPSEEK_API_KEY`; never read from the config file.
     #[serde(skip)]
     pub api_key: Option<String>,
@@ -50,6 +65,12 @@ impl Default for Config {
             max_retries: 3,
             stream_idle_timeout_secs: 180,
             sessions_dir: None,
+            length_routing: true,
+            decision_url: None,
+            decision_model: None,
+            decision_timeout_ms: 2500,
+            decision_api_key: None,
+            decision_key_source: None,
             api_key: None,
         }
     }
@@ -83,6 +104,11 @@ impl Config {
         if let Some(v) = var("RDSH_MODEL") {
             cfg.model = v;
         }
+        (cfg.decision_api_key, cfg.decision_key_source) = match (var("TYPESAFE_API_KEY"), var("OPENROUTER_API_KEY")) {
+            (Some(k), _) => (Some(k), Some(KeySource::TypeSafe)),
+            (None, Some(k)) => (Some(k), Some(KeySource::OpenRouter)),
+            (None, None) => (None, None),
+        };
         cfg.api_key = match var("DEEPSEEK_API_KEY") {
             Some(k) => Some(k),
             None => crate::auth::load()?,
@@ -102,7 +128,7 @@ impl Config {
         if self.max_tool_output_chars < 1000 {
             bail!("config: `max_tool_output_chars` must be at least 1000");
         }
-        if self.bash_timeout_secs == 0 || self.stream_idle_timeout_secs == 0 {
+        if self.bash_timeout_secs == 0 || self.stream_idle_timeout_secs == 0 || self.decision_timeout_ms == 0 {
             bail!("config: timeouts must be at least 1 second");
         }
         Ok(())

@@ -121,6 +121,8 @@ fn real_main() -> Result<i32> {
             if prompt.trim().is_empty() {
                 bail!("rdsh run needs a prompt");
             }
+            // Headless output usually feeds a script or another agent: no length routing.
+            cfg.length_routing = false;
             runtime()?.block_on(async {
                 let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
                 let start = args.resume.as_deref().map_or(Start::New, Start::Resume);
@@ -165,6 +167,7 @@ fn print_trace(path: &std::path::Path) -> Result<()> {
                 Message::Context { content } => {
                     println!("\n[runtime context] {}", content.lines().skip(2).collect::<Vec<_>>().join(" · "))
                 }
+                Message::Directive { content } => println!("  [directive] {content}"),
                 Message::Assistant { content, reasoning, tool_calls } => {
                     if let Some(r) = reasoning {
                         println!("\n∴ reasoning ({} chars)", r.len());

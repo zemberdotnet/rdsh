@@ -30,6 +30,11 @@ pub enum Message {
     Context {
         content: String,
     },
+    /// A harness note for the turn (the response-length pick), sent after the user's message as
+    /// a user message. It is not part of what the user typed.
+    Directive {
+        content: String,
+    },
     Assistant {
         #[serde(default)]
         content: String,
@@ -128,7 +133,9 @@ pub fn wire_messages(messages: &[Message]) -> Vec<Value> {
         .map(|(i, m)| match m {
             Message::System { content } => json!({"role": "system", "content": content}),
             Message::User { content } => json!({"role": "user", "content": content}),
-            Message::Context { content } => json!({"role": "user", "content": content}),
+            Message::Context { content } | Message::Directive { content } => {
+                json!({"role": "user", "content": content})
+            }
             Message::Assistant { content, reasoning, tool_calls } => {
                 let mut v = json!({"role": "assistant", "content": content});
                 if !tool_calls.is_empty() {
