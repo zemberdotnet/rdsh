@@ -425,3 +425,49 @@ fn user_messages_are_not_rendered_as_markdown() {
     h.sent();
     assert!(h.screen().contains("› keep **this** and `that`"));
 }
+
+#[test]
+fn sidebar_lists_sessions_with_subagents_nested() {
+    let mut h = Harness::new();
+    let dir = h._dir.path().join("sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut parent = crate::trace::Trace::create(&dir, "20260101-000000-aaaa", "m", h.app.transcript.cwd(), None)
+        .unwrap();
+    parent.record(crate::trace::TraceEvent::Message { message: Message::user("refactor the parser") }).unwrap();
+    crate::trace::Trace::create(&dir, "20260101-000000-aaaa-sub1", "m", h.app.transcript.cwd(), Some("20260101-000000-aaaa"))
+        .unwrap()
+        .record(crate::trace::TraceEvent::Message { message: Message::user("check the lexer") })
+        .unwrap();
+    h.app.sessions_dir = Some(dir);
+    h.app.sidebar_open = true;
+    h.app.refresh_sidebar();
+    h.draw();
+
+    let screen = h.screen();
+    let root = screen.lines().position(|l| l.contains("refactor the parser")).unwrap_or_else(|| panic!("root row in:\n{screen}"));
+    let sub = screen.lines().position(|l| l.contains("check the lexer")).unwrap_or_else(|| panic!("subagent row in:\n{screen}"));
+    assert!(root < sub, "subagent is nested beneath its parent");
+    // The rail takes the left column and the prompt keeps the full width.
+    let buf = h.term.backend().buffer();
+    assert_eq!(buf[(0, root as u16)].bg, super::theme::PANEL);
+    assert_eq!(buf[(super::render::SIDEBAR_WIDTH, root as u16)].bg, super::theme::BG);
+}
+
+#[test]
+fn sidebar_toggles_with_s_and_hides_on_narrow_terminals() {
+    let mut h = Harness::new();
+    h.key(KeyCode::Esc);
+    assert!(!h.app.sidebar_open);
+    h.key(KeyCode::Char('S'));
+    assert!(h.app.sidebar_open);
+    assert!(h.app.sidebar_area.is_some());
+    h.key(KeyCode::Char('S'));
+    assert!(!h.app.sidebar_open);
+    assert!(h.app.sidebar_area.is_none());
+
+    let mut narrow = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    h.app.sidebar_open = true;
+    let app = &mut h.app;
+    narrow.draw(|f| app.draw(f)).unwrap();
+    assert!(h.app.sidebar_area.is_none(), "rail yields to the chat below the width floor");
+}

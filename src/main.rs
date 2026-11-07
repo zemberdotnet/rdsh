@@ -136,7 +136,7 @@ fn real_main() -> Result<i32> {
                 let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
                 let start = args.resume.as_deref().map_or(Start::New, Start::Resume);
                 let agent = session::build(&cfg, &cwd, provider, start)?;
-                tui::run(agent, cwd).await?;
+                tui::run(agent, cwd, cfg.sessions_dir()).await?;
                 Ok(0)
             })
         }

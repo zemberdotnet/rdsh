@@ -11,6 +11,7 @@ pub mod theme;
 pub mod input;
 pub mod motion;
 pub mod render;
+pub mod sidebar;
 pub mod transcript;
 
 use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
@@ -33,10 +34,14 @@ use app::{AgentCmd, App};
 ///
 /// @param agent the session's agent; its history (when resumed) is shown first.
 /// @param cwd working directory used to resolve file links.
-pub async fn run(mut agent: Agent, cwd: PathBuf) -> Result<()> {
+/// @param sessions_dir directory of trace files, listed by the session rail.
+pub async fn run(mut agent: Agent, cwd: PathBuf, sessions_dir: PathBuf) -> Result<()> {
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCmd>();
     let mut app = App::new(cwd, agent.model().to_owned(), agent.session_id().unwrap_or("").to_owned(), cmd_tx);
+    app.sessions_dir = Some(sessions_dir);
+    app.sidebar_open = true;
+    app.refresh_sidebar();
     app.load_history(agent.history());
 
     let sink: EventSink = Arc::new(move |ev| {

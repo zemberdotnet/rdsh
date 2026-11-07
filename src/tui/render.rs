@@ -13,6 +13,7 @@ use super::{
     app::{App, Mode, View},
     motion::Pos,
     highlight::Run,
+    sidebar::{Live, Sidebar},
     theme::*,
     transcript::GUTTER,
 };
@@ -22,6 +23,10 @@ use crate::{comments::Anchor, diff::Kind as DiffKind};
 pub const FILE_GUTTER: usize = 14;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_PROMPT_ROWS: usize = 8;
+/// Fixed width of the session rail.
+pub const SIDEBAR_WIDTH: u16 = 28;
+/// Below this width for the chat, the rail is hidden and the chat keeps the full area.
+const SIDEBAR_MIN_WIDTH: u16 = 40;
 
 /// What is drawn over a row's base style, all in char offsets of the row text.
 #[derive(Clone, Copy, Default)]
@@ -133,11 +138,22 @@ impl App {
         let prompt_w = (area.width as usize).saturating_sub(2);
         let (prompt_lines, prompt_cur) = self.prompt.layout(prompt_w);
         let prompt_h = prompt_lines.len().clamp(1, MAX_PROMPT_ROWS) as u16;
-        let [main, sep, prompt, status] =
+        let [body, sep, prompt, status] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(prompt_h), Constraint::Length(1)])
                 .areas(area);
+        // The rail sits left of the chat; the prompt, separator and status keep the full width.
+        let (rail, main) = if self.sidebar_open && area.width >= SIDEBAR_WIDTH + SIDEBAR_MIN_WIDTH {
+            let [rail, main] = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)]).areas(body);
+            (Some(rail), main)
+        } else {
+            (None, body)
+        };
         self.main_area = main;
         self.prompt_area = prompt;
+        self.sidebar_area = rail;
+        if let Some(rail) = rail {
+            self.draw_sidebar(f, rail);
+        }
 
         match self.view {
             View::Chat => self.draw_chat(f, main),
@@ -195,6 +211,39 @@ impl App {
                 spans.push(Span::styled(" ".repeat(fill), Style::default().bg(bg)));
             }
             lines.push(Line::from(spans));
+        }
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Draws the session rail: one row per session, its subagents indented beneath.
+    fn draw_sidebar(&mut self, f: &mut Frame, area: Rect) {
+        let base = Style::default().bg(PANEL);
+        f.render_widget(Block::default().style(base), area);
+        let mut lines: Vec<Line> = Vec::new();
+        for row in self.sidebar.rows().iter().take(area.height as usize) {
+            let current = !self.session_id.is_empty() && row.id == self.session_id;
+            let (glyph, color) = match row.live {
+                Some(Live::Running) => ("◐", YELLOW),
+                Some(Live::Done) => ("●", GREEN),
+                Some(Live::Failed) => ("✗", RED),
+                None if row.depth == 0 => ("▸", if current { ORANGE } else { FG_DIM }),
+                None => ("·", GRAY),
+            };
+            // Always a solid `PANEL` background so the rail reads as a distinct column.
+            let mut style = Style::default().bg(PANEL).fg(if row.depth == 0 { FG } else { FG_DIM });
+            if current {
+                style = style.bg(SELECTION).fg(FG).add_modifier(Modifier::BOLD);
+            }
+            let pad = " ".repeat(1 + row.depth as usize * 2);
+            let label = Sidebar::fit(&row.title, row.depth, area.width);
+            lines.push(Line::from(vec![
+                Span::styled(pad, style),
+                Span::styled(glyph.to_owned(), style.fg(color)),
+                Span::styled(label, style),
+            ]));
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(" no sessions", dim().bg(PANEL))));
         }
         f.render_widget(Paragraph::new(lines), area);
     }
@@ -530,6 +579,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
         h("Files"),
         l("  Enter / gf / click on a path opens it: diff view (Tab toggles full file), comment on lines with v/V c"),
         l("  F lists changed files · :e path[:line] opens any file · r reloads · q or Esc goes back"),
+        l(""),
+        h("Sessions"),
+        l("  S toggles the left rail: recorded sessions, with their subagents nested beneath"),
+        l("  ◐ running · ● done · ✗ failed (live only for this process) · ▸ the session you are in"),
+        l("  The rail hides itself on narrow terminals; `rdsh sessions` and `rdsh -r` work outside it"),
         l(""),
         h("Other"),
         l("  Tab or za expands/collapses tool output · Q comment queue (e edit, dd delete, D clear)"),

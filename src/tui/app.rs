@@ -12,6 +12,7 @@ use super::{
     input::{Input, InputAction},
     motion::{self, Cursor, Lines, Motion, Pos},
     render::FILE_GUTTER,
+    sidebar::{Live, Sidebar},
     transcript::{GUTTER, Kind, ToolEntry, ToolStatus, Transcript},
 };
 use crate::{
@@ -26,6 +27,11 @@ use crate::{
 /// Requests from the UI to the agent task.
 pub enum AgentCmd {
     Turn { text: String, cancel: CancellationToken },
+}
+
+/// Subagent ids are `<parent>-sub<N>` (`tools::task`); `n` counts `task` calls this turn.
+fn subagent_id(parent: &str, n: usize) -> String {
+    format!("{parent}-sub{n}")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +92,20 @@ pub struct App {
     ctrl_c_armed: bool,
     pub(crate) main_area: Rect,
     pub(crate) prompt_area: Rect,
+    /// Where the session rail is drawn; `None` when it is hidden.
+    pub(crate) sidebar_area: Option<Rect>,
+    /// Sessions with subagents nested beneath them.
+    pub(crate) sidebar: crate::tui::sidebar::Sidebar,
+    /// Live outcome of subagents this process watched run, keyed by subagent id.
+    pub(crate) subagent_live: HashMap<String, crate::tui::sidebar::Live>,
+    /// `task` calls seen this turn; mirrors the tool's own counter to derive subagent ids.
+    pub(crate) task_count: usize,
+    /// Tool call id → subagent id, for `task` calls in flight.
+    pub(crate) subagent_calls: HashMap<String, String>,
+    /// Where traces live; the rail is rebuilt from here.
+    pub(crate) sessions_dir: Option<PathBuf>,
+    /// Whether the session rail is shown.
+    pub(crate) sidebar_open: bool,
     history: Vec<String>,
     hist_pos: Option<usize>,
     pub spinner: usize,
@@ -130,6 +150,13 @@ impl App {
             ctrl_c_armed: false,
             main_area: Rect::default(),
             prompt_area: Rect::default(),
+            sidebar_area: None,
+            sidebar: Default::default(),
+            subagent_live: HashMap::new(),
+            task_count: 0,
+            subagent_calls: HashMap::new(),
+            sessions_dir: None,
+            sidebar_open: false,
             history: Vec::new(),
             hist_pos: None,
             spinner: 0,
@@ -175,6 +202,15 @@ impl App {
             self.transcript.push(Kind::Info, format!("resumed session {}", self.session_id));
             self.mode = Mode::Insert;
         }
+    }
+
+    /// Rebuilds the session rail from the traces on disk.
+    ///
+    /// Filesystem work happens only on refresh (turn start/end, subagent lifecycle), never per frame.
+    pub fn refresh_sidebar(&mut self) {
+        let Some(dir) = &self.sessions_dir else { return };
+        let infos = crate::trace::list_sessions(dir);
+        self.sidebar = Sidebar::build(&infos, &self.subagent_live);
     }
 
     pub(crate) fn set_flash(&mut self, s: impl Into<String>) {
@@ -507,6 +543,12 @@ impl App {
             }
             (KeyCode::Char('Q'), false) => self.open_queue(),
             (KeyCode::Char('F'), false) => self.open_files(),
+            (KeyCode::Char('S'), false) => {
+                self.sidebar_open = !self.sidebar_open;
+                if self.sidebar_open {
+                    self.refresh_sidebar();
+                }
+            }
             (KeyCode::F(1), _) => self.view = View::Help,
             _ => {}
         }
@@ -862,7 +904,7 @@ impl App {
 
     fn mouse_pos(&mut self, col: u16, row: u16) -> Option<Pos> {
         let area = self.main_area;
-        if !area.contains((col, row).into()) {
+        if self.sidebar_area.is_some_and(|r| r.contains((col, row).into())) || !area.contains((col, row).into()) {
             return None;
         }
         let y = (row - area.y) as usize;
@@ -1002,6 +1044,13 @@ impl App {
             }
             AgentEvent::ToolStart { call } => {
                 self.close_streams();
+                if call.name == "task" {
+                    self.task_count += 1;
+                    let id = subagent_id(&self.session_id, self.task_count);
+                    self.subagent_calls.insert(call.id.clone(), id.clone());
+                    self.subagent_live.insert(id, Live::Running);
+                    self.refresh_sidebar();
+                }
                 let i = self.transcript.push(Kind::Tool(Box::new(tool_entry(&call.id, &call.name, &call.arguments))), "");
                 self.tool_entries.insert(call.id, i);
                 self.activity = Some(format!("running {}", call.name));
@@ -1010,8 +1059,20 @@ impl App {
                 if let Some(&i) = self.tool_entries.get(&call_id) {
                     self.finish_tool(i, output.content, output.is_error, Some(duration_ms));
                 }
+                if let Some(id) = self.subagent_calls.get(&call_id) {
+                    let state = if output.is_error { Live::Failed } else { Live::Done };
+                    self.subagent_live.insert(id.clone(), state);
+                    self.refresh_sidebar();
+                }
             }
             AgentEvent::Subagent { call_id, event } => {
+                if let AgentEvent::TurnEnd { cancelled, error } = &*event
+                    && let Some(id) = self.subagent_calls.get(&call_id).cloned()
+                {
+                    let state = if *cancelled || error.is_some() { Live::Failed } else { Live::Done };
+                    self.subagent_live.insert(id, state);
+                    self.refresh_sidebar();
+                }
                 let Some(&i) = self.tool_entries.get(&call_id) else { return };
                 let line = match *event {
                     AgentEvent::ToolStart { call } => Some(format!("↳ {} {}", call.name, summarize(&call.name, &call.arguments))),
@@ -1053,6 +1114,9 @@ impl App {
                 if cancelled {
                     self.transcript.push(Kind::Info, "interrupted");
                 }
+                self.task_count = 0;
+                self.subagent_calls.clear();
+                self.refresh_sidebar();
                 if let Some(msg) = self.queued_send.take() {
                     self.start_turn(msg);
                 }
