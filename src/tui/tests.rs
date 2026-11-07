@@ -326,7 +326,7 @@ fn ctrl_enter_sends_from_any_mode() {
 
 #[test]
 fn user_messages_have_a_full_width_background() {
-    use super::transcript::USER_BG;
+    use super::theme::USER_BG;
     let mut h = Harness::new();
     h.keys("hello there");
     h.key(KeyCode::Enter);
@@ -340,12 +340,11 @@ fn user_messages_have_a_full_width_background() {
     }
     // Assistant rows keep the terminal background.
     let a = screen.lines().position(|l| l.starts_with("● I changed")).unwrap() as u16;
-    assert_ne!(buf[(5, a)].bg, USER_BG);
+    assert_eq!(buf[(5, a)].bg, super::theme::BG, "everything else gets the theme background");
 }
 
 #[test]
 fn file_view_highlights_added_and_deleted_lines() {
-    use ratatui::style::Color;
     let mut h = Harness::new();
     let path = h.app.transcript.cwd().join("src/lib.rs");
     h.app.open_file(path, None);
@@ -356,14 +355,14 @@ fn file_view_highlights_added_and_deleted_lines() {
     // `fn` is a keyword on both sides: the added line uses the current file, the deleted line HEAD.
     for row in [added, deleted] {
         let first = fv.syntax(row).first().copied().expect("highlighted");
-        assert_eq!((first.start, first.end, first.style.fg), (0, 2, Some(Color::Magenta)));
+        assert_eq!((first.start, first.end, first.style.fg), (0, 2, Some(super::theme::RED)));
     }
     // Rendered: the keyword keeps its syntax color on the tinted background.
     let screen = h.screen();
     let y = screen.lines().position(|l| l.contains("+ fn b2() {}")).unwrap() as u16;
     let x = screen.lines().nth(y as usize).unwrap().chars().position(|c| c == 'f').unwrap() as u16;
     let cell = &h.term.backend().buffer()[(x, y)];
-    assert_eq!(cell.fg, Color::Magenta);
-    assert_eq!(cell.bg, super::render::ADD_BG);
-    assert_eq!(h.term.backend().buffer()[(79, y)].bg, super::render::ADD_BG, "tint fills the row");
+    assert_eq!(cell.fg, super::theme::RED);
+    assert_eq!(cell.bg, super::theme::ADD_BG);
+    assert_eq!(h.term.backend().buffer()[(79, y)].bg, super::theme::ADD_BG, "tint fills the row");
 }

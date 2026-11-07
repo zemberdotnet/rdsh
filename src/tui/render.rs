@@ -13,6 +13,7 @@ use super::{
     app::{App, Mode, View},
     motion::Pos,
     highlight::Run,
+    theme::*,
     transcript::GUTTER,
 };
 use crate::{comments::Anchor, diff::Kind as DiffKind};
@@ -20,9 +21,6 @@ use crate::{comments::Anchor, diff::Kind as DiffKind};
 /// Width of the file view's `old new ●+ ` gutter.
 pub const FILE_GUTTER: usize = 14;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const SEL_BG: Color = Color::Rgb(58, 68, 112);
-pub(crate) const ADD_BG: Color = Color::Rgb(24, 52, 32);
-const DEL_BG: Color = Color::Rgb(62, 28, 30);
 const MAX_PROMPT_ROWS: usize = 8;
 
 /// What is drawn over a row's base style, all in char offsets of the row text.
@@ -57,10 +55,10 @@ pub(crate) fn styled(text: &str, base: Style, marks: &Marks<'_>, hscroll: usize,
         w += cw;
         let mut st = syntax.iter().filter(|r| r.start <= i && i < r.end).fold(base, |st, r| st.patch(r.style));
         if links.iter().any(|&(s, e)| s <= i && i < e) {
-            st = st.fg(Color::LightBlue).add_modifier(Modifier::UNDERLINED);
+            st = st.fg(BLUE).add_modifier(Modifier::UNDERLINED);
         }
         if sel.is_some_and(|(s, e)| s <= i && i < e) {
-            st = st.bg(SEL_BG);
+            st = st.bg(SELECTION);
         }
         if cursor == Some(i) {
             st = st.add_modifier(Modifier::REVERSED);
@@ -85,11 +83,11 @@ pub(crate) fn styled(text: &str, base: Style, marks: &Marks<'_>, hscroll: usize,
         if cursor.is_some_and(past_end) {
             let mut st = Style::default().add_modifier(Modifier::REVERSED);
             if sel.is_some() {
-                st = st.bg(SEL_BG);
+                st = st.bg(SELECTION);
             }
             spans.push(Span::styled(" ", st));
         } else if sel.is_some_and(|(s, e)| e > len && s <= len) {
-            spans.push(Span::styled(" ", Style::default().bg(SEL_BG)));
+            spans.push(Span::styled(" ", Style::default().bg(SELECTION)));
         }
     }
     spans
@@ -123,13 +121,15 @@ fn keep_visible(scroll: &mut usize, row: usize, height: usize, total: usize) {
 }
 
 fn dim() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(GRAY)
 }
 
 impl App {
     /// Renders one frame.
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
+        // Paint the theme background everywhere; widgets drawn later inherit it.
+        f.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
         let prompt_w = (area.width as usize).saturating_sub(2);
         let (prompt_lines, prompt_cur) = self.prompt.layout(prompt_w);
         let prompt_h = prompt_lines.len().clamp(1, MAX_PROMPT_ROWS) as u16;
@@ -207,7 +207,7 @@ impl App {
         let View::File(fv) = &mut self.view else { return };
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!(" {} ", fv.title()), Style::default().add_modifier(Modifier::BOLD).bg(Color::Rgb(40, 40, 40))),
+                Span::styled(format!(" {} ", fv.title()), Style::default().add_modifier(Modifier::BOLD).bg(PANEL)),
                 Span::styled("  Tab diff/file · ]c [c hunks · v/V select · c comment · r reload · q back", dim()),
             ])),
             head,
@@ -247,10 +247,10 @@ impl App {
                 if syntax.is_empty() { s.fg(fg) } else { s }
             };
             let (style, sign, sign_style) = match l.kind {
-                DiffKind::Add => (tinted(ADD_BG, Color::Green), '+', Style::default().fg(Color::Green).bg(ADD_BG)),
-                DiffKind::Del => (tinted(DEL_BG, Color::Red), '-', Style::default().fg(Color::Red).bg(DEL_BG)),
+                DiffKind::Add => (tinted(ADD_BG, GREEN), '+', Style::default().fg(GREEN).bg(ADD_BG)),
+                DiffKind::Del => (tinted(DEL_BG, RED), '-', Style::default().fg(RED).bg(DEL_BG)),
                 DiffKind::Ctx => (Style::default(), ' ', Style::default()),
-                DiffKind::Hunk => (Style::default().fg(Color::Cyan), ' ', Style::default()),
+                DiffKind::Hunk => (Style::default().fg(AQUA), ' ', Style::default()),
                 DiffKind::Meta => (dim(), ' ', Style::default()),
             };
             let marker = if commented(num) { "●" } else { " " };
@@ -261,7 +261,7 @@ impl App {
             let cur = (matches!(mode, Mode::Normal | Mode::Visual { .. }) && r == fv.cursor.pos.row).then_some(col);
             let mut spans = vec![
                 Span::styled(gutter[..gutter.len() - marker.len() - 2].to_owned(), dim()),
-                Span::styled(marker.to_owned(), Style::default().fg(Color::Yellow)),
+                Span::styled(marker.to_owned(), Style::default().fg(YELLOW)),
                 Span::styled(format!("{sign} "), sign_style),
             ];
             spans.extend(styled(text, style, &Marks { syntax, sel, cursor: cur, ..Marks::default() }, fv.hscroll, text_w));
@@ -280,7 +280,7 @@ impl App {
         if let Some(c) = note {
             let body_line = c.body.lines().next().unwrap_or("");
             f.render_widget(
-                Paragraph::new(Span::styled(format!("● {}: {body_line}", c.label()), Style::default().fg(Color::Yellow))),
+                Paragraph::new(Span::styled(format!("● {}: {body_line}", c.label()), Style::default().fg(YELLOW))),
                 foot,
             );
         }
@@ -292,7 +292,7 @@ impl App {
             Line::from(vec![
                 Span::styled(
                     format!(" Comment queue — {} ", self.queue.len()),
-                    Style::default().add_modifier(Modifier::BOLD).bg(Color::Rgb(40, 40, 40)),
+                    Style::default().add_modifier(Modifier::BOLD).bg(PANEL),
                 ),
                 Span::styled("  sent with your next message · j/k · e edit · dd delete · D clear · q back", dim()),
             ]),
@@ -310,7 +310,7 @@ impl App {
                 sel_line = lines.len();
             }
             let head = Style::default().add_modifier(Modifier::BOLD);
-            let head = if i == sel { head.bg(SEL_BG) } else { head };
+            let head = if i == sel { head.bg(SELECTION) } else { head };
             lines.push(Line::from(Span::styled(format!("[{}] {}", i + 1, c.label()), head)));
             let excerpt: Vec<&str> = c.excerpt().lines().collect();
             for l in excerpt.iter().take(4) {
@@ -320,7 +320,7 @@ impl App {
                 lines.push(Line::from(Span::styled(format!("  > … {} more lines", excerpt.len() - 4), dim())));
             }
             for l in c.body.lines() {
-                lines.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(Color::Yellow))));
+                lines.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(YELLOW))));
             }
             lines.push(Line::from(""));
         }
@@ -333,20 +333,20 @@ impl App {
         let View::Files { items, sel } = &self.view else { return };
         let mut lines = vec![
             Line::from(vec![
-                Span::styled(" Changed files ", Style::default().add_modifier(Modifier::BOLD).bg(Color::Rgb(40, 40, 40))),
+                Span::styled(" Changed files ", Style::default().add_modifier(Modifier::BOLD).bg(PANEL)),
                 Span::styled("  Enter open · r refresh · q back", dim()),
             ]),
             Line::from(""),
         ];
         for (i, (status, path)) in items.iter().enumerate() {
             let color = match status.as_str() {
-                "??" | "A" => Color::Green,
-                "D" => Color::Red,
-                _ => Color::Yellow,
+                "??" | "A" => GREEN,
+                "D" => RED,
+                _ => YELLOW,
             };
             let mut st = Style::default();
             if i == *sel {
-                st = st.bg(SEL_BG);
+                st = st.bg(SELECTION);
             }
             lines.push(Line::from(vec![
                 Span::styled(format!(" {status:>2} "), st.fg(color)),
@@ -386,7 +386,8 @@ impl App {
         }
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(BG).fg(FG))
+            .border_style(Style::default().fg(YELLOW))
             .title(format!(" Comment on {label} "))
             .title_bottom(Span::styled(" Enter save · Ctrl-Enter save & send · Shift-Enter newline · Esc cancel ", dim()));
         f.render_widget(Clear, area);
@@ -403,11 +404,11 @@ impl App {
             let n = self.queue.len();
             left.push(Span::styled(
                 format!(" ● {n} comment{} queued — sent with your next message (Q to review) ", if n == 1 { "" } else { "s" }),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(YELLOW),
             ));
         }
         if self.queued_send.is_some() {
-            left.push(Span::styled(" ⏳ message waiting for the current turn ", Style::default().fg(Color::Magenta)));
+            left.push(Span::styled(" ⏳ message waiting for the current turn ", Style::default().fg(PURPLE)));
         }
         let right = if self.running {
             let secs = self.turn_started.elapsed().as_secs();
@@ -419,7 +420,7 @@ impl App {
         let used: usize = left.iter().map(|s| s.width()).sum::<usize>() + right.chars().count();
         let fill = (area.width as usize).saturating_sub(used);
         left.push(Span::styled("─".repeat(fill), dim()));
-        left.push(Span::styled(right, Style::default().fg(Color::Cyan)));
+        left.push(Span::styled(right, Style::default().fg(AQUA)));
         f.render_widget(Paragraph::new(Line::from(left)), area);
     }
 
@@ -441,7 +442,7 @@ impl App {
             .skip(skip)
             .take(h)
             .map(|(i, l)| {
-                let p = if i == 0 { Span::styled("› ", Style::default().fg(Color::Cyan)) } else { Span::raw("  ") };
+                let p = if i == 0 { Span::styled("› ", Style::default().fg(AQUA)) } else { Span::raw("  ") };
                 Line::from(vec![p, Span::raw(l.clone())])
             })
             .collect();
@@ -453,15 +454,15 @@ impl App {
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let (label, color) = match self.mode {
-            Mode::Normal => ("NORMAL", Color::Blue),
-            Mode::Insert => ("INSERT", Color::Green),
-            Mode::Visual { line: false, .. } => ("VISUAL", Color::Magenta),
-            Mode::Visual { line: true, .. } => ("V-LINE", Color::Magenta),
-            Mode::Comment => ("COMMENT", Color::Yellow),
-            Mode::Search { .. } => ("SEARCH", Color::Cyan),
-            Mode::Command => ("COMMAND", Color::Cyan),
+            Mode::Normal => ("NORMAL", BLUE),
+            Mode::Insert => ("INSERT", GREEN),
+            Mode::Visual { line: false, .. } => ("VISUAL", ORANGE),
+            Mode::Visual { line: true, .. } => ("V-LINE", ORANGE),
+            Mode::Comment => ("COMMENT", YELLOW),
+            Mode::Search { .. } => ("SEARCH", AQUA),
+            Mode::Command => ("COMMAND", AQUA),
         };
-        let mut spans = vec![Span::styled(format!(" {label} "), Style::default().bg(color).fg(Color::Black).add_modifier(Modifier::BOLD))];
+        let mut spans = vec![Span::styled(format!(" {label} "), Style::default().bg(color).fg(BG).add_modifier(Modifier::BOLD))];
         match self.mode {
             Mode::Search { forward } => {
                 let prefix = if forward { "/" } else { "?" };
@@ -484,7 +485,7 @@ impl App {
                 };
                 spans.push(Span::styled(format!(" {view} "), dim()));
                 if let Some(m) = &self.flash {
-                    spans.push(Span::styled(format!(" {m}"), Style::default().fg(Color::Yellow)));
+                    spans.push(Span::styled(format!(" {m}"), Style::default().fg(YELLOW)));
                 }
             }
         }

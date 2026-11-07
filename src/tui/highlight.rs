@@ -6,7 +6,7 @@
 
 use std::{path::Path, sync::OnceLock};
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 /// A styled char range `[start, end)` within one display line.
@@ -56,21 +56,23 @@ const NAMES: &[&str] = &[
 ];
 
 fn style_for(name: &str) -> Style {
+    use super::theme::*;
     let s = Style::default();
     match name {
-        "comment" => s.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        "keyword" => s.fg(Color::Magenta),
-        "string" | "string.special" | "text.literal" | "markup.raw" => s.fg(Color::Green),
-        "escape" => s.fg(Color::Cyan),
-        "number" | "boolean" | "constant" | "constant.builtin" => s.fg(Color::LightRed),
-        "function" | "function.builtin" | "function.macro" => s.fg(Color::Blue),
-        "type" | "type.builtin" | "constructor" | "module" => s.fg(Color::Yellow),
-        "property" | "tag" | "label" => s.fg(Color::LightCyan),
-        "attribute" => s.fg(Color::LightMagenta),
-        "variable.builtin" | "variable.parameter" => s.fg(Color::LightYellow),
-        "operator" | "punctuation" => s.fg(Color::Gray),
-        "text.title" | "markup.heading" => s.add_modifier(Modifier::BOLD),
-        "text.uri" | "markup.link" => s.fg(Color::LightBlue).add_modifier(Modifier::UNDERLINED),
+        "comment" => s.fg(GRAY).add_modifier(Modifier::ITALIC),
+        "keyword" => s.fg(RED),
+        "string" | "string.special" | "text.literal" | "markup.raw" => s.fg(GREEN),
+        "escape" => s.fg(ORANGE),
+        "number" | "boolean" | "constant" | "constant.builtin" => s.fg(PURPLE),
+        "function" | "function.builtin" => s.fg(GREEN).add_modifier(Modifier::BOLD),
+        "function.macro" | "attribute" | "module" | "tag" | "label" => s.fg(AQUA),
+        "type" | "type.builtin" | "constructor" => s.fg(YELLOW),
+        "property" | "variable.parameter" => s.fg(BLUE),
+        "variable.builtin" => s.fg(ORANGE),
+        "operator" => s.fg(FG),
+        "punctuation" => s.fg(FG_DIM),
+        "text.title" | "markup.heading" => s.fg(ORANGE).add_modifier(Modifier::BOLD),
+        "text.uri" | "markup.link" => s.fg(BLUE).add_modifier(Modifier::UNDERLINED),
         _ => s,
     }
 }

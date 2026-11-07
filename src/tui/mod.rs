@@ -6,6 +6,7 @@
 pub mod app;
 pub mod fileview;
 pub mod highlight;
+pub mod theme;
 pub mod input;
 pub mod motion;
 pub mod render;

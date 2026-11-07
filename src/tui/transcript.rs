@@ -3,10 +3,13 @@
 
 use std::path::PathBuf;
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthChar;
 
-use super::motion::{Lines, Pos};
+use super::{
+    motion::{Lines, Pos},
+    theme::*,
+};
 use crate::{
     links::{Link, LinkResolver},
     util::sanitize,
@@ -16,8 +19,6 @@ use crate::{
 pub const GUTTER: usize = 2;
 const COLLAPSED_OUTPUT_LINES: usize = 4;
 const COLLAPSED_REASONING_LINES: usize = 3;
-/// Background of the user's own messages; rows carrying it are filled to the full width.
-pub const USER_BG: Color = Color::Rgb(52, 54, 61);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -119,7 +120,7 @@ impl LLine {
 }
 
 fn dim() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(GRAY)
 }
 
 fn logical_lines(e: &Entry) -> Vec<LLine> {
@@ -127,8 +128,8 @@ fn logical_lines(e: &Entry) -> Vec<LLine> {
     match &e.kind {
         Kind::User => {
             for (i, l) in sanitize(&e.text).lines().enumerate() {
-                let line = LLine::new(l, Style::default().fg(Color::White).bg(USER_BG));
-                let g = Style::default().fg(Color::Cyan).bg(USER_BG).add_modifier(Modifier::BOLD);
+                let line = LLine::new(l, Style::default().fg(FG).bg(USER_BG));
+                let g = Style::default().fg(AQUA).bg(USER_BG).add_modifier(Modifier::BOLD);
                 out.push(line.gutter(if i == 0 { "› " } else { "  " }, g));
             }
         }
@@ -140,21 +141,21 @@ fn logical_lines(e: &Entry) -> Vec<LLine> {
                     in_code = !in_code;
                     dim()
                 } else if in_code {
-                    Style::default().fg(Color::LightYellow)
+                    Style::default().fg(YELLOW)
                 } else if l.starts_with('#') {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
                 let line = LLine::new(l, style);
-                out.push(if i == 0 { line.gutter("● ", Style::default().fg(Color::White)) } else { line });
+                out.push(if i == 0 { line.gutter("● ", Style::default().fg(FG)) } else { line });
             }
         }
         Kind::Reasoning => {
-            let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+            let style = Style::default().fg(GRAY).add_modifier(Modifier::ITALIC);
             let text = sanitize(&e.text);
             let lines: Vec<&str> = text.lines().collect();
-            let g = Style::default().fg(Color::DarkGray);
+            let g = Style::default().fg(GRAY);
             if e.collapsed && !e.streaming {
                 out.push(LLine::new(format!("thought for {} lines (Tab to expand)", lines.len()), style).gutter("∴ ", g).plain());
             } else {
@@ -167,9 +168,9 @@ fn logical_lines(e: &Entry) -> Vec<LLine> {
         }
         Kind::Tool(t) => {
             let (icon, color) = match t.status {
-                ToolStatus::Running => ("⋯ ", Color::Yellow),
-                ToolStatus::Ok => ("✓ ", Color::Green),
-                ToolStatus::Failed => ("✗ ", Color::Red),
+                ToolStatus::Running => ("⋯ ", YELLOW),
+                ToolStatus::Ok => ("✓ ", GREEN),
+                ToolStatus::Failed => ("✗ ", RED),
             };
             let dur = t.duration_ms.map_or(String::new(), |d| {
                 if d >= 1000 { format!("  ({:.1}s)", d as f64 / 1000.0) } else { format!("  ({d}ms)") }
@@ -184,7 +185,7 @@ fn logical_lines(e: &Entry) -> Vec<LLine> {
             let output = sanitize(&t.output);
             let lines: Vec<&str> = output.lines().collect();
             let shown = if e.collapsed { COLLAPSED_OUTPUT_LINES.min(lines.len()) } else { lines.len() };
-            let out_style = if t.status == ToolStatus::Failed { Style::default().fg(Color::LightRed) } else { Style::default().fg(Color::Gray) };
+            let out_style = if t.status == ToolStatus::Failed { Style::default().fg(RED) } else { Style::default().fg(FG_DIM) };
             for l in &lines[..shown] {
                 out.push(LLine::new(*l, out_style).gutter("│ ", dim()));
             }
@@ -199,7 +200,7 @@ fn logical_lines(e: &Entry) -> Vec<LLine> {
         }
         Kind::Error => {
             for l in sanitize(&e.text).lines() {
-                out.push(LLine::new(l, Style::default().fg(Color::Red)).gutter("✗ ", Style::default().fg(Color::Red)));
+                out.push(LLine::new(l, Style::default().fg(RED)).gutter("✗ ", Style::default().fg(RED)));
             }
         }
     }
