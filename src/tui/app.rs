@@ -168,6 +168,15 @@ pub struct App {
     pub(crate) sidebar_scroll: usize,
     /// Whether the session rail is shown.
     pub(crate) sidebar_open: bool,
+    /// Read-only views of rail rows loaded for previewing, with their trace's age when loaded.
+    previews: HashMap<String, (Option<std::time::SystemTime>, SessionView)>,
+    preview_requested: HashSet<String>,
+    /// The mouse is over the rail (previews without taking focus).
+    pub(crate) hover: bool,
+    /// Building a preview: its messages stay out of the prompt history.
+    preview_loading: bool,
+    /// Drawing a preview: no cursor.
+    pub(crate) previewing: bool,
     /// Prompt history across sessions.
     history: Vec<String>,
     hist_pos: Option<usize>,
@@ -213,6 +222,11 @@ impl App {
             sidebar_sel: 0,
             sidebar_scroll: 0,
             sidebar_open: false,
+            previews: HashMap::new(),
+            preview_requested: HashSet::new(),
+            hover: false,
+            preview_loading: false,
+            previewing: false,
             history: Vec::new(),
             hist_pos: None,
             spinner: 0,
@@ -238,6 +252,16 @@ impl App {
         match n {
             Notice::Sessions { recorded, open, running } => {
                 self.recorded = recorded;
+                // Drop previews of sessions whose trace changed since they were loaded.
+                let stale: Vec<String> = self
+                    .previews
+                    .iter()
+                    .filter(|(id, (m, _))| self.recorded_modified(id) != *m)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in stale {
+                    self.previews.remove(&id);
+                }
                 self.hub_open = open.into_iter().collect();
                 self.hub_running = running.into_iter().collect();
                 self.refresh_sidebar();
@@ -248,20 +272,28 @@ impl App {
                 self.install(snapshot, current);
             }
             Notice::Trace { session_id, history } => {
+                self.preview_requested.remove(&session_id);
                 let current = self.claims(&session_id);
                 let snapshot = Snapshot {
-                    session_id,
+                    session_id: session_id.clone(),
                     model: "trace".into(),
                     history,
                     turn: Vec::new(),
                     running: false,
                     usage: Usage::default(),
                 };
-                self.install(snapshot, current);
                 if current {
+                    self.previews.remove(&session_id);
+                    self.install(snapshot, true);
                     self.cur.read_only = true;
-                } else if let Some(v) = self.others.last_mut() {
-                    v.read_only = true;
+                } else {
+                    // Answer to a preview request: cache it, stamped with the trace's age.
+                    self.preview_loading = true;
+                    let mut view = self.build_view(snapshot);
+                    self.preview_loading = false;
+                    view.read_only = true;
+                    let modified = self.recorded_modified(&session_id);
+                    self.previews.insert(session_id, (modified, view));
                 }
             }
             Notice::Event { session_id, event } => self.on_session_event(&session_id, event),
@@ -286,17 +318,11 @@ impl App {
     }
 
     /// Replaces any view of `snapshot.session_id` with one rebuilt from the snapshot.
-    fn install(&mut self, snapshot: Snapshot, make_current: bool) {
-        let id = snapshot.session_id.clone();
-        self.others.retain(|v| v.session_id != id);
-        let mut view = SessionView::new(self.cwd.clone(), id.clone(), snapshot.model.clone());
-        // Keep the draft and queued comments of a view being refreshed.
-        if self.cur.session_id == id {
-            view.prompt = std::mem::take(&mut self.cur.prompt);
-            view.queue = std::mem::take(&mut self.cur.queue);
-        }
+    /// Builds a view from a snapshot without touching what is on screen.
+    fn build_view(&mut self, snapshot: Snapshot) -> SessionView {
+        let view = SessionView::new(self.cwd.clone(), snapshot.session_id.clone(), snapshot.model.clone());
         let previous = std::mem::replace(&mut self.cur, view);
-        let was_background = std::mem::replace(&mut self.background, !make_current);
+        let was_background = std::mem::replace(&mut self.background, true);
         self.load_history(&snapshot.history);
         for ev in snapshot.turn {
             self.on_agent(ev);
@@ -304,6 +330,64 @@ impl App {
         self.cur.running = snapshot.running;
         self.cur.usage = snapshot.usage;
         self.background = was_background;
+        std::mem::replace(&mut self.cur, previous)
+    }
+
+    fn recorded_modified(&self, id: &str) -> Option<std::time::SystemTime> {
+        self.recorded.iter().find(|s| s.id == id).map(|s| s.modified)
+    }
+
+    /// The rail row being previewed: the selection, while the rail is focused or hovered, when
+    /// it is not the session on screen.
+    pub(crate) fn preview_id(&self) -> Option<String> {
+        if !self.sidebar_open || !(self.sidebar_focus || self.hover) {
+            return None;
+        }
+        let row = self.sidebar.rows().get(self.sidebar_sel)?;
+        (row.id != self.cur.session_id).then(|| row.id.clone())
+    }
+
+    /// Asks the hub for the previewed session's trace unless a view of it is already here.
+    fn request_preview(&mut self) {
+        let Some(id) = self.preview_id() else { return };
+        let have = self.others.iter().any(|v| v.session_id == id) || self.previews.contains_key(&id);
+        if !have && self.preview_requested.insert(id.clone()) {
+            self.request(Request::ReadTrace { session_id: id });
+        }
+    }
+
+    /// Runs `f` with the view of `id` swapped in as `cur`, for drawing a preview.
+    pub(crate) fn with_view<R>(&mut self, id: &str, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let mut slot = if let Some(i) = self.others.iter().position(|v| v.session_id == id) {
+            std::mem::replace(&mut self.others[i], SessionView::new(self.cwd.clone(), String::new(), String::new()))
+        } else {
+            self.previews.remove(id)?.1
+        };
+        std::mem::swap(&mut self.cur, &mut slot);
+        let r = f(self);
+        std::mem::swap(&mut self.cur, &mut slot);
+        match self.others.iter().position(|v| v.session_id.is_empty()) {
+            Some(i) => self.others[i] = slot,
+            None => {
+                let m = self.recorded_modified(id);
+                self.previews.insert(id.to_owned(), (m, slot));
+            }
+        }
+        Some(r)
+    }
+
+    fn install(&mut self, snapshot: Snapshot, make_current: bool) {
+        let id = snapshot.session_id.clone();
+        self.others.retain(|v| v.session_id != id);
+        // Keep the draft and queued comments of a view being refreshed.
+        let carried = (self.cur.session_id == id)
+            .then(|| (std::mem::take(&mut self.cur.prompt), std::mem::take(&mut self.cur.queue)));
+        let mut fresh = self.build_view(snapshot);
+        if let Some((prompt, queue)) = carried {
+            fresh.prompt = prompt;
+            fresh.queue = queue;
+        }
+        let previous = std::mem::replace(&mut self.cur, fresh);
         let keep_previous = !previous.session_id.is_empty() && previous.session_id != id;
         if make_current {
             if keep_previous {
@@ -356,13 +440,25 @@ impl App {
             self.switch_to(i);
             return;
         }
+        // A subagent trace already loaded for the preview opens as is.
+        if row.depth > 0
+            && let Some((_, view)) = self.previews.remove(&row.id)
+        {
+            self.others.push(view);
+            let i = self.others.len() - 1;
+            self.switch_to(i);
+            return;
+        }
         self.pending_open = Some(PendingOpen::Id(row.id.clone()));
         if row.depth == 0 {
             self.set_flash(format!("opening {}…", row.id));
             self.request(Request::Open { session_id: row.id });
         } else {
             self.set_flash(format!("loading subagent trace {}…", row.id));
-            self.request(Request::ReadTrace { session_id: row.id });
+            // A preview load already in flight answers this open too.
+            if self.preview_requested.insert(row.id.clone()) {
+                self.request(Request::ReadTrace { session_id: row.id });
+            }
         }
         self.sidebar_focus = false;
         self.mode = Mode::Normal;
@@ -371,6 +467,11 @@ impl App {
     /// Sessions running in the hub other than the one on screen.
     fn others_running(&self) -> usize {
         self.hub_running.iter().filter(|id| **id != self.cur.session_id).count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_contains(&self, text: &str) -> bool {
+        self.history.iter().any(|h| h == text)
     }
 
     /// Ids of the sessions this TUI shows (current first), for the exit message.
@@ -389,7 +490,9 @@ impl App {
                 Message::System { .. } | Message::Context { .. } | Message::Directive { .. } => {}
                 Message::User { content } => {
                     self.cur.transcript.push(Kind::User, content.clone());
-                    self.history.push(content.clone());
+                    if !self.preview_loading {
+                        self.history.push(content.clone());
+                    }
                 }
                 Message::Assistant { content, reasoning, tool_calls } => {
                     if let Some(r) = reasoning {
@@ -438,6 +541,7 @@ impl App {
         }
         self.sidebar_focus = focus && self.sidebar_open;
         self.mode = Mode::Normal;
+        self.request_preview();
     }
 
     /// Keys while the rail has focus. Esc, `l`, Tab or `Ctrl-w l` return to the main view.
@@ -487,6 +591,7 @@ impl App {
             (KeyCode::Esc | KeyCode::Tab | KeyCode::Char('l' | 'q') | KeyCode::Right, _) => self.sidebar_focus = false,
             _ => {}
         }
+        self.request_preview();
     }
 
     pub(crate) fn set_flash(&mut self, s: impl Into<String>) {
@@ -1221,10 +1326,20 @@ impl App {
                 }
                 MouseEventKind::ScrollDown => self.sidebar_sel = (self.sidebar_sel + 1).min(last),
                 MouseEventKind::ScrollUp => self.sidebar_sel = self.sidebar_sel.saturating_sub(1),
+                // Hovering a row previews it without taking keyboard focus.
+                MouseEventKind::Moved if m.row > rail.y => {
+                    let i = self.sidebar_scroll + (m.row - rail.y - 1) as usize;
+                    if i <= last && !self.sidebar.rows().is_empty() {
+                        self.hover = true;
+                        self.sidebar_sel = i;
+                    }
+                }
                 _ => {}
             }
+            self.request_preview();
             return;
         }
+        self.hover = false;
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.sidebar_focus = false;
         }

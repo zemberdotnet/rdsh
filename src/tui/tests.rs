@@ -620,6 +620,7 @@ fn enter_on_a_session_switches_and_others_keep_updating() {
     h.ctrl('w');
     h.key(KeyCode::Char('h'));
     h.key(KeyCode::Char('j'));
+    assert_eq!(h.request(), Request::ReadTrace { session_id: "s0".into() }, "selecting it previews it");
     h.key(KeyCode::Enter);
     // Not open in this TUI yet: ask the hub to open (resume) it.
     assert_eq!(h.request(), Request::Open { session_id: "s0".into() });
@@ -705,4 +706,74 @@ fn focusing_the_rail_starts_on_the_session_on_screen() {
     h.ctrl('w');
     h.key(KeyCode::Char('h'));
     assert_eq!(h.rail_id(), "s1");
+}
+
+fn trace_of(id: &str, answer: &str) -> Notice {
+    Notice::Trace { session_id: id.into(), history: vec![Message::user("older work"), Message::assistant(answer, vec![])] }
+}
+
+#[test]
+fn moving_through_the_rail_previews_sessions_without_switching() {
+    let mut h = harness_with_session();
+    h.key(KeyCode::Esc);
+    h.ctrl('w');
+    h.key(KeyCode::Char('h'));
+    assert!(!h.screen().contains("PREVIEW"), "the current session needs no preview");
+    h.key(KeyCode::Char('j'));
+    assert_eq!(h.request(), Request::ReadTrace { session_id: "s0".into() });
+    assert!(h.screen().contains("loading…"));
+    h.notice(trace_of("s0", "the old answer"));
+    let screen = h.screen();
+    assert!(screen.contains("PREVIEW") && screen.contains("the old answer"), "{screen}");
+    assert_eq!(h.app.cur.session_id, "s1", "previewing does not switch");
+    assert!(!h.app.history_contains("older work"), "preview messages stay out of the prompt history");
+    // Back and forth: the preview is cached, so no second request.
+    h.key(KeyCode::Char('k'));
+    assert!(!h.screen().contains("PREVIEW"));
+    h.key(KeyCode::Char('j'));
+    assert!(h.rx.try_recv().is_err());
+    assert!(h.screen().contains("the old answer"));
+    // Leaving the rail ends the preview.
+    h.key(KeyCode::Esc);
+    assert!(!h.screen().contains("PREVIEW"));
+    // A changed trace invalidates the cached preview.
+    let dir = h._dir.path().join("sessions");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut t = crate::trace::Trace::open_append(&dir.join("s0.jsonl"), "s0").unwrap();
+    t.record(crate::trace::TraceEvent::Message { message: Message::user("more") }).unwrap();
+    h.sessions(&dir, &[]);
+    h.ctrl('w');
+    h.key(KeyCode::Char('h'));
+    // s0 changed last, so it is listed first now.
+    h.key(KeyCode::Char('k'));
+    assert_eq!(h.rail_id(), "s0");
+    assert_eq!(h.request(), Request::ReadTrace { session_id: "s0".into() });
+}
+
+#[test]
+fn hovering_previews_and_open_sessions_preview_live() {
+    let mut h = harness_with_session();
+    let screen = h.screen();
+    let y = screen.lines().position(|l| l.contains("older work")).unwrap() as u16;
+    let mv = |row: u16, col: u16| Event::Mouse(MouseEvent { kind: MouseEventKind::Moved, column: col, row, modifiers: KeyModifiers::NONE });
+    h.app.on_event(mv(y, 4));
+    h.draw();
+    assert!(!h.app.sidebar_focus, "hovering does not take focus");
+    assert_eq!(h.request(), Request::ReadTrace { session_id: "s0".into() });
+    h.notice(trace_of("s0", "hover answer"));
+    assert!(h.screen().contains("hover answer"));
+    h.app.on_event(mv(5, 60));
+    h.draw();
+    assert!(!h.screen().contains("PREVIEW"), "moving off the rail ends the preview");
+
+    // A session open in this TUI previews from its live view, including background output.
+    h.notice(Notice::Opened { snapshot: snapshot("s0") });
+    h.notice(Notice::Event { session_id: "s0".into(), event: AgentEvent::TurnStarted { text: "live job".into() } });
+    h.notice(Notice::Event { session_id: "s0".into(), event: AgentEvent::TextDelta("streaming now".into()) });
+    h.app.on_event(mv(y, 4));
+    h.draw();
+    assert!(h.rx.try_recv().is_err(), "no trace request for an open session");
+    let screen = h.screen();
+    assert!(screen.contains("streaming now"), "{screen}");
+    assert_eq!(h.app.cur.session_id, "s1");
 }

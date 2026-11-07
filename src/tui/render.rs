@@ -155,12 +155,16 @@ impl App {
             self.draw_sidebar(f, rail);
         }
 
-        match self.view {
-            View::Chat => self.draw_chat(f, main),
-            View::File(_) => self.draw_file(f, main),
-            View::Queue { .. } => self.draw_queue(f, main),
-            View::Files { .. } => self.draw_files(f, main),
-            View::Help => draw_help(f, main),
+        if let Some(id) = self.preview_id() {
+            self.draw_preview(f, main, &id);
+        } else {
+            match self.view {
+                View::Chat => self.draw_chat(f, main),
+                View::File(_) => self.draw_file(f, main),
+                View::Queue { .. } => self.draw_queue(f, main),
+                View::Files { .. } => self.draw_files(f, main),
+                View::Help => draw_help(f, main),
+            }
         }
         if self.mode == Mode::Comment {
             self.draw_comment_popup(f, main);
@@ -194,7 +198,9 @@ impl App {
         }
         self.cur.chat_cursor.clamp(&self.cur.transcript);
         keep_visible(&mut self.cur.chat_scroll, self.cur.chat_cursor.pos.row, h, total);
-        let show_cursor = matches!(self.mode, Mode::Normal | Mode::Visual { .. } | Mode::Search { .. } | Mode::Command);
+        let show_cursor = !self.previewing
+            && !self.sidebar_focus
+            && matches!(self.mode, Mode::Normal | Mode::Visual { .. } | Mode::Search { .. } | Mode::Command);
         let text_w = (area.width as usize).saturating_sub(GUTTER);
         let mut lines = Vec::with_capacity(h);
         for r in self.cur.chat_scroll..(self.cur.chat_scroll + h).min(total) {
@@ -213,6 +219,27 @@ impl App {
             lines.push(Line::from(spans));
         }
         f.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Shows the rail selection in the main area without switching to it.
+    fn draw_preview(&mut self, f: &mut Frame, area: Rect, id: &str) {
+        let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        let title = self.sidebar.rows().get(self.sidebar_sel).map_or_else(|| id.to_owned(), |r| r.title.clone());
+        let action = if self.sidebar_focus { "Enter switches · Esc back" } else { "click to focus the rail" };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" PREVIEW ", Style::default().bg(AQUA).fg(BG).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {} ", Sidebar::fit(&title, 48)), Style::default().bg(PANEL).fg(FG).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {action}"), dim()),
+            ])),
+            head,
+        );
+        self.previewing = true;
+        let shown = self.with_view(id, |app| app.draw_chat(f, body));
+        self.previewing = false;
+        if shown.is_none() {
+            f.render_widget(Paragraph::new(Span::styled(" loading…", dim())), body);
+        }
     }
 
     /// Draws the session rail: one row per session, its subagents indented beneath.
@@ -611,7 +638,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l(""),
         h("Sessions"),
         l("  S shows or hides the left rail: this directory's sessions, subagents nested beneath"),
-        l("  Ctrl-w h (or click) focuses it: j k g G Ctrl-d/u move · Enter switches to it · y copies the id"),
+        l("  Ctrl-w h (or click) focuses it: j k g G Ctrl-d/u move and preview · Enter switches · y copies the id"),
+        l("  Hovering a row with the mouse previews it too, without taking focus"),
         l("  Sessions keep running while you look at another; subagent rows open read-only · :new starts one"),
         l("  Esc, l, Tab or Ctrl-w l return to the chat · ▸ marks the current session"),
         l("  Subagents: spinner running · ● done · ✗ failed (live for this process; others show ·)"),

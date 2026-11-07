@@ -127,13 +127,12 @@ impl Agent {
             .unwrap_or_else(|| input.to_owned());
         let sink = sink.clone();
         tokio::spawn(async move {
-            match titler.title(&first).await {
-                Ok(t) => match std::fs::write(&path, format!("{t}\n")) {
+            // A failed title leaves the session unnamed; the rail falls back to its first message.
+            if let Ok(t) = titler.title(&first).await {
+                match std::fs::write(&path, format!("{t}\n")) {
                     Ok(()) => sink(AgentEvent::Titled { title: t }),
                     Err(e) => sink(AgentEvent::Warning(format!("could not save the session title: {e}"))),
-                },
-                // An unnamed session is fine; the rail falls back to its first message.
-                Err(_) => {}
+                }
             }
         });
     }
