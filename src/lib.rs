@@ -8,6 +8,7 @@ pub mod decision;
 pub mod deepseek;
 pub mod diff;
 pub mod headless;
+pub mod hub;
 pub mod length;
 pub mod links;
 pub mod llm;

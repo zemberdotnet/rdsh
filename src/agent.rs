@@ -15,8 +15,11 @@ use crate::{
 };
 
 /// Observable progress of a turn. Delivered in order through an `EventSink`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// A turn began with this user message (always the first event of a turn).
+    TurnStarted { text: String },
     TextDelta(String),
     ReasoningDelta(String),
     /// The model started emitting a call to `name` (arguments still streaming).
@@ -160,6 +163,7 @@ impl Agent {
     /// @param cancel interrupts the model request or running tools.
     /// @returns the final assistant text and how the turn ended.
     pub async fn run_turn(&mut self, input: String, sink: EventSink, cancel: CancellationToken) -> TurnOutcome {
+        sink(AgentEvent::TurnStarted { text: input.clone() });
         let context = prompt::runtime_context(&self.opts.cwd);
         let latest = self.history.iter().rev().find_map(|m| match m {
             Message::Context { content } => Some(content),

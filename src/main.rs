@@ -134,11 +134,29 @@ fn real_main() -> Result<i32> {
             if let Some(p) = args.positional.first() {
                 bail!("unexpected argument {p:?} (did you mean `rdsh run`?)");
             }
+            let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
+            // Fail before the TUI starts when the session to resume does not exist.
+            let first = match args.resume.as_deref() {
+                Some(q) => {
+                    let path = trace::find_session(&cfg.sessions_dir(), q)?;
+                    let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    rdsh::hub::Request::Open { session_id: id }
+                }
+                None => rdsh::hub::Request::New,
+            };
+            let sessions_dir = cfg.sessions_dir();
+            let factory_cwd = cwd.clone();
+            let factory: rdsh::hub::Factory = Arc::new(move |kind| {
+                let start = match &kind {
+                    rdsh::hub::OpenKind::New => Start::New,
+                    rdsh::hub::OpenKind::Resume(id) => Start::Resume(id),
+                };
+                session::build(&cfg, &factory_cwd, provider.clone(), start)
+            });
             runtime()?.block_on(async {
-                let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
-                let start = args.resume.as_deref().map_or(Start::New, Start::Resume);
-                let agent = session::build(&cfg, &cwd, provider, start)?;
-                tui::run(agent, cwd, cfg.sessions_dir()).await?;
+                let hub = rdsh::hub::Hub::new(factory, Some(sessions_dir));
+                let (req_tx, notices) = hub.connect();
+                tui::run(req_tx, notices, cwd, first).await?;
                 Ok(0)
             })
         }

@@ -1,11 +1,17 @@
-//! TUI state: modes, views, key and mouse handling, and folding agent events into the transcript.
+//! TUI state: modes, views, key and mouse handling, and folding hub events into transcripts.
+//!
+//! The TUI never runs agents. It sends [`Request`]s to the hub and renders the [`Notice`]s it
+//! gets back; every open session has a [`SessionView`] that keeps updating in the background.
 
-use std::{collections::HashMap, path::PathBuf, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Instant,
+};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio_util::sync::CancellationToken;
 
 use super::{
     fileview::FileView,
@@ -17,18 +23,15 @@ use super::{
 };
 use crate::{
     agent::AgentEvent,
-    length::Routing,
     comments::{Anchor, Comment, compose_message},
     diff,
+    hub::{Notice, Request, Snapshot},
+    length::Routing,
     llm::{Message, Usage},
     tools::{resolve_path, summarize},
+    trace::SessionInfo,
     util::base64,
 };
-
-/// Requests from the UI to the agent task.
-pub enum AgentCmd {
-    Turn { text: String, cancel: CancellationToken },
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -57,35 +60,96 @@ struct Active<'a> {
     blocks: &'a [usize],
 }
 
-pub struct App {
+/// What the TUI shows for one session. The agent itself runs in the hub; this is only the
+/// view, kept up to date from the hub's events whether or not it is on screen.
+pub struct SessionView {
+    pub(crate) session_id: String,
+    pub(crate) model: String,
     pub(crate) transcript: Transcript,
     pub(crate) chat_cursor: Cursor,
     pub(crate) chat_scroll: usize,
     /// Keep the cursor pinned to the newest row while output streams.
     pub(crate) follow: bool,
+    /// Draft in the prompt for this session.
+    pub(crate) prompt: Input,
+    /// Review comments queued for this session's next message.
+    pub(crate) queue: Vec<Comment>,
+    pub(crate) running: bool,
+    /// Messages sent while a turn was running that have not started yet.
+    pub(crate) waiting: usize,
+    pub(crate) usage: Usage,
+    /// The last turn's response-length pick, shown in the status line.
+    pub(crate) length: Option<String>,
+    pub(crate) activity: Option<String>,
+    pub(crate) turn_started: Instant,
+    streaming_text: Option<usize>,
+    streaming_reasoning: Option<usize>,
+    tool_entries: HashMap<String, usize>,
+    /// Tool call id → subagent session id, for `task` calls in flight (from `SubagentStarted`).
+    pub(crate) subagent_calls: HashMap<String, String>,
+    /// A recorded trace shown without an agent (subagents, sessions owned elsewhere).
+    pub(crate) read_only: bool,
+}
+
+impl SessionView {
+    pub fn new(cwd: PathBuf, session_id: String, model: String) -> Self {
+        Self {
+            session_id,
+            model,
+            transcript: Transcript::new(cwd),
+            chat_cursor: Cursor::default(),
+            chat_scroll: 0,
+            follow: true,
+            prompt: Input::default(),
+            queue: Vec::new(),
+            running: false,
+            waiting: 0,
+            usage: Usage::default(),
+            length: None,
+            activity: None,
+            turn_started: Instant::now(),
+            streaming_text: None,
+            streaming_reasoning: None,
+            tool_entries: HashMap::new(),
+            subagent_calls: HashMap::new(),
+            read_only: false,
+        }
+    }
+}
+
+/// A session the user asked to see; the next matching `Opened` or `Trace` becomes current.
+#[derive(Clone, Debug, PartialEq)]
+enum PendingOpen {
+    /// Whatever opens next (startup, `:new`).
+    Any,
+    Id(String),
+}
+
+pub struct App {
+    /// The session on screen.
+    pub(crate) cur: SessionView,
+    /// Other sessions this TUI has open; they keep receiving events.
+    pub(crate) others: Vec<SessionView>,
+    cwd: PathBuf,
+    req_tx: UnboundedSender<Request>,
+    pending_open: Option<PendingOpen>,
+    /// Set while applying a background session's event, so view-level side effects stay off.
+    background: bool,
+    /// From the hub's last `Sessions` notice.
+    pub(crate) recorded: Vec<SessionInfo>,
+    pub(crate) hub_open: HashSet<String>,
+    pub(crate) hub_running: HashSet<String>,
     pub(crate) view: View,
     pub(crate) mode: Mode,
     mode_before_search: Mode,
-    pub(crate) prompt: Input,
     pub(crate) comment: Input,
     pub(crate) minibuf: Input,
     pub(crate) comment_target: Option<Anchor>,
     pub(crate) editing: Option<usize>,
-    pub(crate) queue: Vec<Comment>,
     count: Option<usize>,
     pending: Option<char>,
     last_search: Option<(String, bool)>,
-    pub(crate) running: bool,
-    cancel: Option<CancellationToken>,
-    cmd_tx: UnboundedSender<AgentCmd>,
-    pub(crate) queued_send: Option<String>,
-    pub(crate) usage: Usage,
-    pub(crate) model: String,
-    pub(crate) session_id: String,
     pub(crate) flash: Option<String>,
-    /// The last turn's response-length pick, shown in the status line.
-    pub(crate) length: Option<String>,
-    pub(crate) activity: Option<String>,
     pub quit: bool,
     ctrl_c_armed: bool,
     pub(crate) main_area: Rect,
@@ -94,61 +158,50 @@ pub struct App {
     pub(crate) sidebar_area: Option<Rect>,
     /// Sessions with subagents nested beneath them.
     pub(crate) sidebar: Sidebar,
-    /// Subagents this process saw start, keyed by their session id.
+    /// Subagents seen starting in any open session, keyed by their session id.
     pub(crate) subagent_live: HashMap<String, LiveSub>,
-    /// Tool call id → subagent session id, for `task` calls in flight (from `SubagentStarted`).
-    pub(crate) subagent_calls: HashMap<String, String>,
     /// Keys go to the rail instead of the main view.
     pub(crate) sidebar_focus: bool,
     /// Selected rail row.
     pub(crate) sidebar_sel: usize,
     /// First visible rail row.
     pub(crate) sidebar_scroll: usize,
-    /// Where traces live; the rail is rebuilt from here.
-    pub(crate) sessions_dir: Option<PathBuf>,
     /// Whether the session rail is shown.
     pub(crate) sidebar_open: bool,
+    /// Prompt history across sessions.
     history: Vec<String>,
     hist_pos: Option<usize>,
     pub spinner: usize,
     drag_anchor: Option<Pos>,
-    streaming_text: Option<usize>,
-    streaming_reasoning: Option<usize>,
-    tool_entries: HashMap<String, usize>,
-    pub(crate) turn_started: Instant,
     /// Text written to the terminal outside ratatui (OSC 52 clipboard) on the next draw.
     pub(crate) osc_out: Option<String>,
 }
 
 impl App {
-    pub fn new(cwd: PathBuf, model: String, session_id: String, cmd_tx: UnboundedSender<AgentCmd>) -> Self {
+    /// Creates a TUI talking to the hub through `req_tx`. No session is shown until the hub
+    /// answers an `Open`/`New` request with `Opened` (see `expect_open`).
+    pub fn new(cwd: PathBuf, req_tx: UnboundedSender<Request>) -> Self {
         Self {
-            transcript: Transcript::new(cwd),
-            chat_cursor: Cursor::default(),
-            chat_scroll: 0,
-            follow: true,
+            cur: SessionView::new(cwd.clone(), String::new(), String::new()),
+            others: Vec::new(),
+            cwd,
+            req_tx,
+            pending_open: None,
+            background: false,
+            recorded: Vec::new(),
+            hub_open: HashSet::new(),
+            hub_running: HashSet::new(),
             view: View::Chat,
             mode: Mode::Insert,
             mode_before_search: Mode::Normal,
-            prompt: Input::default(),
             comment: Input::default(),
             minibuf: Input::default(),
             comment_target: None,
             editing: None,
-            queue: Vec::new(),
             count: None,
             pending: None,
             last_search: None,
-            running: false,
-            cancel: None,
-            cmd_tx,
-            queued_send: None,
-            usage: Usage::default(),
-            model,
-            session_id,
             flash: None,
-            length: None,
-            activity: None,
             quit: false,
             ctrl_c_armed: false,
             main_area: Rect::default(),
@@ -156,22 +209,177 @@ impl App {
             sidebar_area: None,
             sidebar: Default::default(),
             subagent_live: HashMap::new(),
-            subagent_calls: HashMap::new(),
             sidebar_focus: false,
             sidebar_sel: 0,
             sidebar_scroll: 0,
-            sessions_dir: None,
             sidebar_open: false,
             history: Vec::new(),
             hist_pos: None,
             spinner: 0,
             drag_anchor: None,
-            streaming_text: None,
-            streaming_reasoning: None,
-            tool_entries: HashMap::new(),
-            turn_started: Instant::now(),
             osc_out: None,
         }
+    }
+
+    /// The next `Opened` (or `Trace`) notice becomes the session on screen.
+    pub fn expect_open(&mut self) {
+        self.pending_open = Some(PendingOpen::Any);
+    }
+
+    /// Sends a request to the hub; a closed hub is reported once in the transcript.
+    fn request(&mut self, req: Request) {
+        if self.req_tx.send(req).is_err() {
+            self.set_flash("the session hub has stopped; restart rdsh");
+        }
+    }
+
+    /// Applies one hub notice.
+    pub fn on_notice(&mut self, n: Notice) {
+        match n {
+            Notice::Sessions { recorded, open, running } => {
+                self.recorded = recorded;
+                self.hub_open = open.into_iter().collect();
+                self.hub_running = running.into_iter().collect();
+                self.refresh_sidebar();
+            }
+            Notice::Opened { snapshot } => {
+                let id = snapshot.session_id.clone();
+                let current = self.claims(&id);
+                self.install(snapshot, current);
+            }
+            Notice::Trace { session_id, history } => {
+                let current = self.claims(&session_id);
+                let snapshot = Snapshot {
+                    session_id,
+                    model: "trace".into(),
+                    history,
+                    turn: Vec::new(),
+                    running: false,
+                    usage: Usage::default(),
+                };
+                self.install(snapshot, current);
+                if current {
+                    self.cur.read_only = true;
+                } else if let Some(v) = self.others.last_mut() {
+                    v.read_only = true;
+                }
+            }
+            Notice::Event { session_id, event } => self.on_session_event(&session_id, event),
+            Notice::Error { message, .. } => {
+                self.pending_open = None;
+                self.set_flash(message);
+            }
+        }
+    }
+
+    /// Whether an arriving session answers the user's pending open (and so goes on screen).
+    fn claims(&mut self, id: &str) -> bool {
+        let hit = match &self.pending_open {
+            Some(PendingOpen::Any) => true,
+            Some(PendingOpen::Id(want)) => id.starts_with(want.as_str()) || want == "last",
+            None => false,
+        };
+        if hit {
+            self.pending_open = None;
+        }
+        hit
+    }
+
+    /// Replaces any view of `snapshot.session_id` with one rebuilt from the snapshot.
+    fn install(&mut self, snapshot: Snapshot, make_current: bool) {
+        let id = snapshot.session_id.clone();
+        self.others.retain(|v| v.session_id != id);
+        let mut view = SessionView::new(self.cwd.clone(), id.clone(), snapshot.model.clone());
+        // Keep the draft and queued comments of a view being refreshed.
+        if self.cur.session_id == id {
+            view.prompt = std::mem::take(&mut self.cur.prompt);
+            view.queue = std::mem::take(&mut self.cur.queue);
+        }
+        let previous = std::mem::replace(&mut self.cur, view);
+        let was_background = std::mem::replace(&mut self.background, !make_current);
+        self.load_history(&snapshot.history);
+        for ev in snapshot.turn {
+            self.on_agent(ev);
+        }
+        self.cur.running = snapshot.running;
+        self.cur.usage = snapshot.usage;
+        self.background = was_background;
+        let keep_previous = !previous.session_id.is_empty() && previous.session_id != id;
+        if make_current {
+            if keep_previous {
+                self.others.push(previous);
+            }
+            self.view = View::Chat;
+        } else {
+            let fresh = std::mem::replace(&mut self.cur, previous);
+            self.others.push(fresh);
+        }
+        self.refresh_sidebar();
+        if make_current {
+            self.sidebar_sel = self.sidebar.index_of(&id).unwrap_or(self.sidebar_sel);
+        }
+    }
+
+    /// Routes a session event to its view, on screen or not.
+    fn on_session_event(&mut self, id: &str, ev: AgentEvent) {
+        if self.cur.session_id == id {
+            self.on_agent(ev);
+            return;
+        }
+        let Some(i) = self.others.iter().position(|v| v.session_id == id) else { return };
+        std::mem::swap(&mut self.cur, &mut self.others[i]);
+        let was = std::mem::replace(&mut self.background, true);
+        self.on_agent(ev);
+        self.background = was;
+        std::mem::swap(&mut self.cur, &mut self.others[i]);
+    }
+
+    /// Puts an already-open view on screen.
+    fn switch_to(&mut self, i: usize) {
+        std::mem::swap(&mut self.cur, &mut self.others[i]);
+        self.view = View::Chat;
+        self.mode = Mode::Normal;
+        self.sidebar_focus = false;
+        self.refresh_sidebar();
+        self.sidebar_sel = self.sidebar.index_of(&self.cur.session_id).unwrap_or(self.sidebar_sel);
+    }
+
+    /// Enter on a rail row: show that session, resuming it in the hub if needed. Subagent
+    /// rows open their trace read-only.
+    fn open_selected(&mut self) {
+        let Some(row) = self.sidebar.rows().get(self.sidebar_sel).cloned() else { return };
+        if row.id == self.cur.session_id {
+            self.sidebar_focus = false;
+            return;
+        }
+        if let Some(i) = self.others.iter().position(|v| v.session_id == row.id) {
+            self.switch_to(i);
+            return;
+        }
+        self.pending_open = Some(PendingOpen::Id(row.id.clone()));
+        if row.depth == 0 {
+            self.set_flash(format!("opening {}…", row.id));
+            self.request(Request::Open { session_id: row.id });
+        } else {
+            self.set_flash(format!("loading subagent trace {}…", row.id));
+            self.request(Request::ReadTrace { session_id: row.id });
+        }
+        self.sidebar_focus = false;
+        self.mode = Mode::Normal;
+    }
+
+    /// Sessions running in the hub other than the one on screen.
+    fn others_running(&self) -> usize {
+        self.hub_running.iter().filter(|id| **id != self.cur.session_id).count()
+    }
+
+    /// Ids of the sessions this TUI shows (current first), for the exit message.
+    pub fn open_sessions(&self) -> Vec<String> {
+        std::iter::once(&self.cur)
+            .chain(&self.others)
+            .filter(|v| !v.session_id.is_empty() && !v.read_only)
+            .map(|v| v.session_id.clone())
+            .collect()
     }
 
     /// Rebuilds the transcript from a resumed session's history.
@@ -180,23 +388,23 @@ impl App {
             match m {
                 Message::System { .. } | Message::Context { .. } | Message::Directive { .. } => {}
                 Message::User { content } => {
-                    self.transcript.push(Kind::User, content.clone());
+                    self.cur.transcript.push(Kind::User, content.clone());
                     self.history.push(content.clone());
                 }
                 Message::Assistant { content, reasoning, tool_calls } => {
                     if let Some(r) = reasoning {
-                        self.transcript.push(Kind::Reasoning, r.clone());
+                        self.cur.transcript.push(Kind::Reasoning, r.clone());
                     }
                     if !content.is_empty() {
-                        self.transcript.push(Kind::Assistant, content.clone());
+                        self.cur.transcript.push(Kind::Assistant, content.clone());
                     }
                     for c in tool_calls {
-                        let i = self.transcript.push(Kind::Tool(Box::new(tool_entry(&c.id, &c.name, &c.arguments))), "");
-                        self.tool_entries.insert(c.id.clone(), i);
+                        let i = self.cur.transcript.push(Kind::Tool(Box::new(tool_entry(&c.id, &c.name, &c.arguments))), "");
+                        self.cur.tool_entries.insert(c.id.clone(), i);
                     }
                 }
                 Message::Tool { call_id, content, .. } => {
-                    if let Some(&i) = self.tool_entries.get(call_id) {
+                    if let Some(&i) = self.cur.tool_entries.get(call_id) {
                         let failed = content.starts_with("Error:");
                         self.finish_tool(i, content.clone(), failed, None);
                     }
@@ -204,22 +412,18 @@ impl App {
             }
         }
         if history.iter().any(|m| matches!(m, Message::User { .. })) {
-            self.transcript.push(Kind::Info, format!("resumed session {}", self.session_id));
-            self.mode = Mode::Insert;
+            self.cur.transcript.push(Kind::Info, format!("session {}", self.cur.session_id));
         }
     }
 
-    /// Rebuilds the session rail from the traces on disk.
-    ///
-    /// Filesystem work happens only on refresh (turn start/end, subagent lifecycle), never per frame.
+    /// Rebuilds the session rail from the hub's last session list and the live subagents seen.
+    /// Cheap: no filesystem work happens here.
     pub fn refresh_sidebar(&mut self) {
-        let Some(dir) = &self.sessions_dir else { return };
-        let infos = crate::trace::list_sessions(dir);
         let selected = self.sidebar.rows().get(self.sidebar_sel).map(|r| r.id.clone());
-        let cwd = self.transcript.cwd().display().to_string();
-        self.sidebar = Sidebar::build(&infos, &cwd, &self.subagent_live);
+        let cwd = self.cwd.display().to_string();
+        self.sidebar = Sidebar::build(&self.recorded, &cwd, &self.subagent_live, &self.hub_running);
         // Keep the selection on the same session when rows shift.
-        let fallback = self.sidebar.index_of(&self.session_id).unwrap_or(0);
+        let fallback = self.sidebar.index_of(&self.cur.session_id).unwrap_or(0);
         self.sidebar_sel = selected.and_then(|id| self.sidebar.index_of(&id)).unwrap_or(fallback);
     }
 
@@ -227,6 +431,10 @@ impl App {
         if focus && !self.sidebar_open {
             self.sidebar_open = true;
             self.refresh_sidebar();
+        }
+        if focus && !self.sidebar_focus {
+            // Start from the session on screen.
+            self.sidebar_sel = self.sidebar.index_of(&self.cur.session_id).unwrap_or(self.sidebar_sel);
         }
         self.sidebar_focus = focus && self.sidebar_open;
         self.mode = Mode::Normal;
@@ -252,7 +460,7 @@ impl App {
             (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => self.sidebar_sel = (self.sidebar_sel + half).min(last),
             (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => self.sidebar_sel = self.sidebar_sel.saturating_sub(half),
             (KeyCode::Char('w'), true) => self.pending = Some('W'),
-            (KeyCode::Enter, _) => self.preview_session(),
+            (KeyCode::Enter, _) => self.open_selected(),
             (KeyCode::Char('y'), false) => {
                 if let Some(r) = self.sidebar.rows().get(self.sidebar_sel) {
                     let id = r.id.clone();
@@ -281,20 +489,6 @@ impl App {
         }
     }
 
-    /// Enter on a rail row: says what the row is and how to open it. Switching sessions in
-    /// place is not supported yet; resuming happens from the command line.
-    fn preview_session(&mut self) {
-        let Some(row) = self.sidebar.rows().get(self.sidebar_sel).cloned() else { return };
-        let msg = if row.id == self.session_id {
-            "this is the current session".to_owned()
-        } else if row.depth == 0 {
-            format!("resume: rdsh --resume {} · y copies the id", row.id)
-        } else {
-            format!("subagent trace: rdsh trace {} · y copies the id", row.id)
-        };
-        self.set_flash(msg);
-    }
-
     pub(crate) fn set_flash(&mut self, s: impl Into<String>) {
         self.flash = Some(s.into());
     }
@@ -310,7 +504,7 @@ impl App {
                 Mode::Search { .. } | Mode::Command => self.minibuf.insert_str(&s.replace('\n', " ")),
                 _ => {
                     self.mode = Mode::Insert;
-                    self.prompt.insert_str(&s);
+                    self.cur.prompt.insert_str(&s);
                 }
             },
             _ => {}
@@ -345,16 +539,15 @@ impl App {
     }
 
     fn ctrl_c(&mut self) {
-        if self.running {
-            if let Some(c) = &self.cancel {
-                c.cancel();
-            }
+        if self.cur.running {
+            let session_id = self.cur.session_id.clone();
+            self.request(Request::Cancel { session_id });
             self.set_flash("interrupting…");
             return;
         }
         let cleared = match self.mode {
-            Mode::Insert if !self.prompt.text.is_empty() => {
-                self.prompt.take();
+            Mode::Insert if !self.cur.prompt.text.is_empty() => {
+                self.cur.prompt.take();
                 true
             }
             Mode::Comment | Mode::Search { .. } | Mode::Command | Mode::Visual { .. } => {
@@ -370,27 +563,32 @@ impl App {
             self.quit = true;
         } else {
             self.ctrl_c_armed = true;
-            self.set_flash("press Ctrl-C again to quit");
+            let n = self.others_running();
+            self.set_flash(if n == 0 {
+                "press Ctrl-C again to quit".to_owned()
+            } else {
+                format!("press Ctrl-C again to quit — stops {n} running session{}", if n == 1 { "" } else { "s" })
+            });
         }
     }
 
     fn insert_key(&mut self, k: KeyEvent) {
-        match self.prompt.handle(k) {
+        match self.cur.prompt.handle(k) {
             InputAction::Submit => self.submit(),
             InputAction::Cancel => self.mode = Mode::Normal,
             InputAction::HistoryPrev if !self.history.is_empty() => {
                 let i = self.hist_pos.map_or(self.history.len() - 1, |i| i.saturating_sub(1));
                 self.hist_pos = Some(i);
-                self.prompt.set(self.history[i].clone());
+                self.cur.prompt.set(self.history[i].clone());
             }
             InputAction::HistoryNext => {
                 if let Some(i) = self.hist_pos {
                     if i + 1 < self.history.len() {
                         self.hist_pos = Some(i + 1);
-                        self.prompt.set(self.history[i + 1].clone());
+                        self.cur.prompt.set(self.history[i + 1].clone());
                     } else {
                         self.hist_pos = None;
-                        self.prompt.take();
+                        self.cur.prompt.take();
                     }
                 }
             }
@@ -408,7 +606,7 @@ impl App {
             Mode::Visual { .. } | Mode::Search { .. } | Mode::Command => self.mode = Mode::Normal,
             Mode::Normal | Mode::Insert => {}
         }
-        if self.queue.is_empty() && self.prompt.is_blank() {
+        if self.cur.queue.is_empty() && self.cur.prompt.is_blank() {
             self.set_flash("nothing to send — comment with c or type with i");
             return;
         }
@@ -417,40 +615,29 @@ impl App {
 
     /// Sends the prompt plus all queued comments as the next user message.
     pub(crate) fn submit(&mut self) {
-        let text = self.prompt.text.trim().to_owned();
-        if text.is_empty() && self.queue.is_empty() {
+        let text = self.cur.prompt.text.trim().to_owned();
+        if text.is_empty() && self.cur.queue.is_empty() {
             return;
         }
-        self.prompt.take();
+        if self.cur.read_only || self.cur.session_id.is_empty() {
+            self.set_flash(if self.cur.read_only { "read-only trace — open a session to send" } else { "no session yet" });
+            return;
+        }
+        self.cur.prompt.take();
         if !text.is_empty() {
             self.history.push(text.clone());
         }
         self.hist_pos = None;
-        let msg = compose_message(&self.queue, &text);
-        self.queue.clear();
-        if self.running {
-            self.queued_send = Some(match self.queued_send.take() {
-                Some(prev) => format!("{prev}\n\n{msg}"),
-                None => msg,
-            });
+        let msg = compose_message(&self.cur.queue, &text);
+        self.cur.queue.clear();
+        // The hub queues turns; the user entry appears when the turn starts (`TurnStarted`),
+        // the same way for every client viewing this session.
+        if self.cur.running {
+            self.cur.waiting += 1;
             self.set_flash("queued — sends when the current turn finishes");
-        } else {
-            self.start_turn(msg);
         }
-    }
-
-    fn start_turn(&mut self, msg: String) {
-        self.transcript.push(Kind::User, msg.clone());
-        let cancel = CancellationToken::new();
-        if self.cmd_tx.send(AgentCmd::Turn { text: msg, cancel: cancel.clone() }).is_err() {
-            self.transcript.push(Kind::Error, "the agent task has stopped; restart rdsh");
-            return;
-        }
-        self.cancel = Some(cancel);
-        self.running = true;
-        self.follow = true;
-        self.turn_started = Instant::now();
-        self.activity = Some("waiting for model".into());
+        let session_id = self.cur.session_id.clone();
+        self.request(Request::Send { session_id, text: msg });
         self.view = View::Chat;
     }
 
@@ -459,10 +646,10 @@ impl App {
     fn active(&mut self) -> Option<Active<'_>> {
         match &mut self.view {
             View::Chat => Some(Active {
-                lines: &self.transcript,
-                cursor: &mut self.chat_cursor,
-                scroll: &mut self.chat_scroll,
-                blocks: self.transcript.entry_starts(),
+                lines: &self.cur.transcript,
+                cursor: &mut self.cur.chat_cursor,
+                scroll: &mut self.cur.chat_scroll,
+                blocks: self.cur.transcript.entry_starts(),
             }),
             View::File(fv) => {
                 let fv = &mut **fv;
@@ -491,7 +678,7 @@ impl App {
 
     fn update_follow(&mut self) {
         if matches!(self.view, View::Chat) {
-            self.follow = self.chat_cursor.pos.row + 1 >= self.transcript.total();
+            self.cur.follow = self.cur.chat_cursor.pos.row + 1 >= self.cur.transcript.total();
         }
     }
 
@@ -613,7 +800,7 @@ impl App {
             (KeyCode::Esc, _) if visual => self.mode = Mode::Normal,
             (KeyCode::Esc | KeyCode::Char('q'), _) if in_file => self.close_view(),
             (KeyCode::Char('r'), false) if in_file => {
-                let cwd = self.transcript.cwd().to_owned();
+                let cwd = self.cur.transcript.cwd().to_owned();
                 if let View::File(fv) = &mut self.view {
                     fv.reload(&cwd);
                 }
@@ -668,7 +855,7 @@ impl App {
                         _ => row.saturating_sub(page.saturating_sub(1)),
                     };
                 }
-                self.follow = false;
+                self.cur.follow = false;
             }
             _ => {}
         }
@@ -695,7 +882,7 @@ impl App {
     pub(crate) fn begin_comment(&mut self) {
         let (a, b, line) = self.selection();
         let anchor = match &self.view {
-            View::Chat => match self.transcript.quote(a, b, line) {
+            View::Chat => match self.cur.transcript.quote(a, b, line) {
                 Some((source, quote)) => Anchor::Chat { source, quote },
                 None => {
                     self.set_flash("nothing to comment on here — select text with v or V");
@@ -717,12 +904,12 @@ impl App {
         if body.trim().is_empty() {
             self.set_flash("empty comment discarded");
         } else if let Some(i) = self.editing.take() {
-            if let Some(c) = self.queue.get_mut(i) {
+            if let Some(c) = self.cur.queue.get_mut(i) {
                 c.body = body;
             }
         } else if let Some(anchor) = self.comment_target.take() {
-            self.queue.push(Comment { anchor, body });
-            let n = self.queue.len();
+            self.cur.queue.push(Comment { anchor, body });
+            let n = self.cur.queue.len();
             self.set_flash(format!("comment queued ({n}) — sent with your next message"));
         }
         self.comment_target = None;
@@ -744,7 +931,7 @@ impl App {
     fn yank_selection(&mut self) {
         let (a, b, line) = self.selection();
         let text = match &self.view {
-            View::Chat => self.transcript.quote(a, b, line).map(|(_, q)| q),
+            View::Chat => self.cur.transcript.quote(a, b, line).map(|(_, q)| q),
             View::File(fv) if !fv.lines.is_empty() => match fv.anchor(a.row, b.row) {
                 Anchor::File { snippet, .. } => Some(snippet),
                 Anchor::Chat { quote, .. } => Some(quote),
@@ -827,13 +1014,21 @@ impl App {
         let (name, arg) = cmd.split_once(' ').map_or((cmd, ""), |(a, b)| (a, b.trim()));
         match name {
             "" => {}
-            "q" | "q!" | "quit" | "qa" => self.quit = true,
+            "q!" | "qa!" => self.quit = true,
+            "q" | "quit" | "qa" => match self.others_running() {
+                0 => self.quit = true,
+                n => self.set_flash(format!("{n} other session(s) still running — :q! quits and stops them")),
+            },
+            "new" => {
+                self.pending_open = Some(PendingOpen::Any);
+                self.request(Request::New);
+            }
             "help" | "h" => self.view = View::Help,
             "files" => self.open_files(),
             "comments" | "queue" => self.open_queue(),
             "dropcomments" => {
-                let n = self.queue.len();
-                self.queue.clear();
+                let n = self.cur.queue.len();
+                self.cur.queue.clear();
                 self.set_flash(format!("dropped {n} comments"));
             }
             "send" => self.submit(),
@@ -842,7 +1037,7 @@ impl App {
                     Some((p, l)) if l.parse::<usize>().is_ok() => (p, l.parse().ok()),
                     _ => (arg, None),
                 };
-                let path = resolve_path(self.transcript.cwd(), p);
+                let path = resolve_path(self.cur.transcript.cwd(), p);
                 if path.is_file() {
                     self.open_file(path, line);
                 } else {
@@ -873,7 +1068,7 @@ impl App {
     }
 
     fn open_files(&mut self) {
-        let items = diff::changed_files(self.transcript.cwd());
+        let items = diff::changed_files(self.cur.transcript.cwd());
         if items.is_empty() {
             self.set_flash("no uncommitted changes");
             return;
@@ -883,7 +1078,7 @@ impl App {
     }
 
     pub(crate) fn open_file(&mut self, path: PathBuf, line: Option<usize>) {
-        let file = diff::load(self.transcript.cwd(), &path);
+        let file = diff::load(self.cur.transcript.cwd(), &path);
         self.view = View::File(Box::new(FileView::new(file, line)));
         self.mode = Mode::Normal;
         self.count = None;
@@ -891,11 +1086,11 @@ impl App {
 
     /// Opens the file link under the cursor, or (when `exact` is false) the first link on the row.
     fn open_link_at_cursor(&mut self, exact: bool) -> bool {
-        if !matches!(self.view, View::Chat) || self.transcript.total() == 0 {
+        if !matches!(self.view, View::Chat) || self.cur.transcript.total() == 0 {
             return false;
         }
-        let pos = self.chat_cursor.pos;
-        let row = self.transcript.row(pos.row);
+        let pos = self.cur.chat_cursor.pos;
+        let row = self.cur.transcript.row(pos.row);
         let link = row
             .links
             .iter()
@@ -912,29 +1107,29 @@ impl App {
     }
 
     fn toggle_collapse(&mut self) -> bool {
-        if !matches!(self.view, View::Chat) || self.transcript.total() == 0 {
+        if !matches!(self.view, View::Chat) || self.cur.transcript.total() == 0 {
             return false;
         }
-        let e = self.transcript.entry_at(self.chat_cursor.pos.row);
-        if !self.transcript.entries[e].collapsible() {
+        let e = self.cur.transcript.entry_at(self.cur.chat_cursor.pos.row);
+        if !self.cur.transcript.entries[e].collapsible() {
             return false;
         }
-        let entry = self.transcript.entry_mut(e);
+        let entry = self.cur.transcript.entry_mut(e);
         entry.collapsed = !entry.collapsed;
-        self.transcript.layout(self.main_area.width as usize);
-        let start = self.transcript.entry_starts()[e];
-        motion::apply(&mut self.chat_cursor, Motion::Row(start), &self.transcript, &[], 1);
+        self.cur.transcript.layout(self.main_area.width as usize);
+        let start = self.cur.transcript.entry_starts()[e];
+        motion::apply(&mut self.cur.chat_cursor, Motion::Row(start), &self.cur.transcript, &[], 1);
         self.update_follow();
         true
     }
 
     fn queue_key(&mut self, k: KeyEvent) {
         let View::Queue { sel } = &mut self.view else { return };
-        let n = self.queue.len();
+        let n = self.cur.queue.len();
         if let Some(p) = self.pending.take() {
             if p == 'd' && k.code == KeyCode::Char('d') && *sel < n {
-                self.queue.remove(*sel);
-                *sel = (*sel).min(self.queue.len().saturating_sub(1));
+                self.cur.queue.remove(*sel);
+                *sel = (*sel).min(self.cur.queue.len().saturating_sub(1));
             }
             return;
         }
@@ -945,17 +1140,17 @@ impl App {
             KeyCode::Char('G') => *sel = n.saturating_sub(1),
             KeyCode::Char('d') => self.pending = Some('d'),
             KeyCode::Char('x') | KeyCode::Delete if *sel < n => {
-                self.queue.remove(*sel);
-                *sel = (*sel).min(self.queue.len().saturating_sub(1));
+                self.cur.queue.remove(*sel);
+                *sel = (*sel).min(self.cur.queue.len().saturating_sub(1));
             }
             KeyCode::Char('D') => {
-                self.queue.clear();
+                self.cur.queue.clear();
                 *sel = 0;
             }
             KeyCode::Char('e') | KeyCode::Enter if *sel < n => {
                 let i = *sel;
                 self.editing = Some(i);
-                self.comment = Input::with_text(self.queue[i].body.clone());
+                self.comment = Input::with_text(self.cur.queue[i].body.clone());
                 self.mode = Mode::Comment;
             }
             KeyCode::Char('i') => self.mode = Mode::Insert,
@@ -977,7 +1172,7 @@ impl App {
             KeyCode::Char('g') => *sel = 0,
             KeyCode::Char('G') => *sel = n.saturating_sub(1),
             KeyCode::Enter | KeyCode::Char('l' | 'o') if *sel < n => {
-                let path = resolve_path(self.transcript.cwd(), &items[*sel].1);
+                let path = resolve_path(self.cur.transcript.cwd(), &items[*sel].1);
                 self.open_file(path, None);
             }
             KeyCode::Char('r') => self.open_files(),
@@ -998,8 +1193,8 @@ impl App {
         let x = (col - area.x) as usize;
         match &self.view {
             View::Chat => {
-                let r = self.chat_scroll + y;
-                (r < self.transcript.total()).then(|| Pos { row: r, col: x.saturating_sub(GUTTER) })
+                let r = self.cur.chat_scroll + y;
+                (r < self.cur.transcript.total()).then(|| Pos { row: r, col: x.saturating_sub(GUTTER) })
             }
             View::File(fv) => {
                 // Row 0 of the main area is the file title.
@@ -1035,7 +1230,7 @@ impl App {
         }
         match m.kind {
             MouseEventKind::ScrollDown => match &mut self.view {
-                View::Queue { sel } => *sel = (*sel + 1).min(self.queue.len().saturating_sub(1)),
+                View::Queue { sel } => *sel = (*sel + 1).min(self.cur.queue.len().saturating_sub(1)),
                 _ => self.scroll_by(3),
             },
             MouseEventKind::ScrollUp => match &mut self.view {
@@ -1049,7 +1244,7 @@ impl App {
                 }
                 let Some(pos) = self.mouse_pos(m.column, m.row) else { return };
                 if matches!(self.view, View::Chat) {
-                    let row = self.transcript.row(pos.row);
+                    let row = self.cur.transcript.row(pos.row);
                     if let Some(l) = row.links.iter().find(|l| l.start <= pos.col && pos.col < l.end).cloned() {
                         self.open_file((*l.path).clone(), l.line);
                         return;
@@ -1092,7 +1287,7 @@ impl App {
     }
 
     fn finish_tool(&mut self, i: usize, output: String, failed: bool, duration_ms: Option<u64>) {
-        let e = self.transcript.entry_mut(i);
+        let e = self.cur.transcript.entry_mut(i);
         if let Kind::Tool(t) = &mut e.kind {
             t.status = if failed { ToolStatus::Failed } else { ToolStatus::Ok };
             t.output = output;
@@ -1102,146 +1297,152 @@ impl App {
     }
 
     fn close_streams(&mut self) {
-        for i in [self.streaming_text.take(), self.streaming_reasoning.take()].into_iter().flatten() {
-            self.transcript.entry_mut(i).streaming = false;
+        for i in [self.cur.streaming_text.take(), self.cur.streaming_reasoning.take()].into_iter().flatten() {
+            self.cur.transcript.entry_mut(i).streaming = false;
         }
     }
 
     fn stream_into(&mut self, reasoning: bool, delta: &str) {
-        let slot = if reasoning { self.streaming_reasoning } else { self.streaming_text };
+        let slot = if reasoning { self.cur.streaming_reasoning } else { self.cur.streaming_text };
         let i = match slot {
             Some(i) => i,
             None => {
                 if !reasoning {
                     // Reasoning ends when visible text starts.
-                    if let Some(r) = self.streaming_reasoning.take() {
-                        self.transcript.entry_mut(r).streaming = false;
+                    if let Some(r) = self.cur.streaming_reasoning.take() {
+                        self.cur.transcript.entry_mut(r).streaming = false;
                     }
                 }
-                let i = self.transcript.push(if reasoning { Kind::Reasoning } else { Kind::Assistant }, "");
-                self.transcript.entry_mut(i).streaming = true;
+                let i = self.cur.transcript.push(if reasoning { Kind::Reasoning } else { Kind::Assistant }, "");
+                self.cur.transcript.entry_mut(i).streaming = true;
                 if reasoning {
-                    self.streaming_reasoning = Some(i);
+                    self.cur.streaming_reasoning = Some(i);
                 } else {
-                    self.streaming_text = Some(i);
+                    self.cur.streaming_text = Some(i);
                 }
                 i
             }
         };
-        self.transcript.entry_mut(i).text.push_str(delta);
+        self.cur.transcript.entry_mut(i).text.push_str(delta);
     }
 
     pub fn on_agent(&mut self, ev: AgentEvent) {
         match ev {
+            AgentEvent::TurnStarted { text } => {
+                self.close_streams();
+                self.cur.transcript.push(Kind::User, text);
+                self.cur.running = true;
+                self.cur.waiting = self.cur.waiting.saturating_sub(1);
+                self.cur.follow = true;
+                self.cur.turn_started = Instant::now();
+                self.cur.activity = Some("waiting for model".into());
+            }
             AgentEvent::TextDelta(t) => {
-                self.activity = Some("writing".into());
+                self.cur.activity = Some("writing".into());
                 self.stream_into(false, &t);
             }
             AgentEvent::ReasoningDelta(t) => {
-                self.activity = Some("thinking".into());
+                self.cur.activity = Some("thinking".into());
                 self.stream_into(true, &t);
             }
             AgentEvent::ToolCallStreaming { name } => {
-                self.activity = Some(format!("preparing {name}"));
+                self.cur.activity = Some(format!("preparing {name}"));
             }
             AgentEvent::Assistant { message, usage } => {
                 if let Some(u) = usage {
-                    self.usage += u;
+                    self.cur.usage += u;
                 }
                 if let Message::Assistant { content, .. } = &message {
-                    match self.streaming_text {
-                        Some(i) => self.transcript.entry_mut(i).text = content.clone(),
+                    match self.cur.streaming_text {
+                        Some(i) => self.cur.transcript.entry_mut(i).text = content.clone(),
                         None if !content.is_empty() => {
-                            self.transcript.push(Kind::Assistant, content.clone());
+                            self.cur.transcript.push(Kind::Assistant, content.clone());
                         }
                         None => {}
                     }
                 }
                 self.close_streams();
-                self.activity = Some("waiting for model".into());
+                self.cur.activity = Some("waiting for model".into());
             }
             AgentEvent::ToolStart { call } => {
                 self.close_streams();
-                let i = self.transcript.push(Kind::Tool(Box::new(tool_entry(&call.id, &call.name, &call.arguments))), "");
-                self.tool_entries.insert(call.id, i);
-                self.activity = Some(format!("running {}", call.name));
+                let i = self.cur.transcript.push(Kind::Tool(Box::new(tool_entry(&call.id, &call.name, &call.arguments))), "");
+                self.cur.tool_entries.insert(call.id, i);
+                self.cur.activity = Some(format!("running {}", call.name));
             }
             AgentEvent::SubagentStarted { call_id, session_id, title } => {
-                self.subagent_calls.insert(call_id, session_id.clone());
-                let parent = self.session_id.clone();
+                self.cur.subagent_calls.insert(call_id, session_id.clone());
+                let parent = self.cur.session_id.clone();
                 self.subagent_live.insert(session_id, LiveSub { parent, title, state: Live::Running });
                 self.refresh_sidebar();
             }
             AgentEvent::ToolEnd { call_id, output, duration_ms } => {
-                if let Some(&i) = self.tool_entries.get(&call_id) {
+                if let Some(&i) = self.cur.tool_entries.get(&call_id) {
                     self.finish_tool(i, output.content, output.is_error, Some(duration_ms));
                 }
-                if let Some(id) = self.subagent_calls.remove(&call_id) {
+                if let Some(id) = self.cur.subagent_calls.remove(&call_id) {
                     self.set_sub_state(&id, if output.is_error { Live::Failed } else { Live::Done });
                 }
             }
             AgentEvent::Subagent { call_id, event } => {
                 if let AgentEvent::TurnEnd { cancelled, error } = &*event
-                    && let Some(id) = self.subagent_calls.get(&call_id).cloned()
+                    && let Some(id) = self.cur.subagent_calls.get(&call_id).cloned()
                 {
                     self.set_sub_state(&id, if *cancelled || error.is_some() { Live::Failed } else { Live::Done });
                 }
-                let Some(&i) = self.tool_entries.get(&call_id) else { return };
+                let Some(&i) = self.cur.tool_entries.get(&call_id) else { return };
                 let line = match *event {
                     AgentEvent::ToolStart { call } => Some(format!("↳ {} {}", call.name, summarize(&call.name, &call.arguments))),
                     AgentEvent::ToolEnd { output, .. } if output.is_error => {
                         Some(format!("  ✗ {}", output.content.lines().next().unwrap_or("")))
                     }
                     AgentEvent::Assistant { usage: Some(u), .. } => {
-                        self.usage += u;
+                        self.cur.usage += u;
                         None
                     }
                     _ => None,
                 };
                 if let Some(l) = line
-                    && let Kind::Tool(t) = &mut self.transcript.entry_mut(i).kind
+                    && let Kind::Tool(t) = &mut self.cur.transcript.entry_mut(i).kind
                 {
                     t.children.push(l);
                 }
             }
             AgentEvent::ResponseLength(r) => {
-                self.length = Some(match r {
+                self.cur.length = Some(match r {
                     Routing::Picked { level, confidence } => format!("{level} {confidence:.2}"),
                     Routing::Unsure { level, confidence } => format!("unsure ({level} {confidence:.2})"),
                     Routing::Unavailable { .. } => "unrouted".into(),
                 });
             }
             AgentEvent::Warning(w) => {
-                self.transcript.push(Kind::Info, w);
+                self.cur.transcript.push(Kind::Info, w);
             }
             AgentEvent::TurnEnd { cancelled, error } => {
                 self.close_streams();
-                self.running = false;
-                self.cancel = None;
-                self.activity = None;
+                self.cur.running = false;
+                self.cur.activity = None;
                 let running: Vec<usize> = self
+                    .cur
                     .tool_entries
                     .values()
                     .copied()
-                    .filter(|&i| matches!(&self.transcript.entries[i].kind, Kind::Tool(t) if t.status == ToolStatus::Running))
+                    .filter(|&i| matches!(&self.cur.transcript.entries[i].kind, Kind::Tool(t) if t.status == ToolStatus::Running))
                     .collect();
                 for i in running {
                     self.finish_tool(i, "interrupted".into(), true, None);
                 }
                 if let Some(e) = error {
-                    self.transcript.push(Kind::Error, e);
+                    self.cur.transcript.push(Kind::Error, e);
                 }
                 if cancelled {
-                    self.transcript.push(Kind::Info, "interrupted");
+                    self.cur.transcript.push(Kind::Info, "interrupted");
                 }
                 // A turn that ended with subagents still in flight was interrupted.
-                for (_, id) in std::mem::take(&mut self.subagent_calls) {
+                for (_, id) in std::mem::take(&mut self.cur.subagent_calls) {
                     self.set_sub_state(&id, Live::Failed);
                 }
                 self.refresh_sidebar();
-                if let Some(msg) = self.queued_send.take() {
-                    self.start_turn(msg);
-                }
             }
         }
     }

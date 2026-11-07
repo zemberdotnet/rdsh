@@ -1,7 +1,8 @@
 //! Interactive terminal UI.
 //!
-//! The agent runs in its own task and reports through an unbounded channel; the UI loop
-//! coalesces queued events before each redraw, so streaming cost scales with frames, not tokens.
+//! The TUI is a client of the session hub: it sends requests and renders the notices it gets
+//! back. The loop coalesces queued notices before each redraw, so streaming cost scales with
+//! frames, not tokens.
 
 pub mod app;
 pub mod fileview;
@@ -14,7 +15,7 @@ pub mod render;
 pub mod sidebar;
 pub mod transcript;
 
-use std::{io::Write, path::PathBuf, sync::Arc, time::Duration};
+use std::{io::Write, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use crossterm::{
@@ -25,38 +26,28 @@ use crossterm::{
     execute,
 };
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::agent::{Agent, AgentEvent, EventSink};
-use app::{AgentCmd, App};
+use crate::hub::{Notice, Request};
+use app::App;
 
 /// Runs the TUI until the user quits.
 ///
-/// @param agent the session's agent; its history (when resumed) is shown first.
-/// @param cwd working directory used to resolve file links.
-/// @param sessions_dir directory of trace files, listed by the session rail.
-pub async fn run(mut agent: Agent, cwd: PathBuf, sessions_dir: PathBuf) -> Result<()> {
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCmd>();
-    let mut app = App::new(cwd, agent.model().to_owned(), agent.session_id().unwrap_or("").to_owned(), cmd_tx);
-    app.sessions_dir = Some(sessions_dir);
+/// @param req_tx / notices the client end of a hub connection.
+/// @param cwd working directory used to resolve file links and filter the session rail.
+/// @param first `Request::New` or `Request::Open`, the session shown at startup.
+pub async fn run(
+    req_tx: UnboundedSender<Request>,
+    mut notices: UnboundedReceiver<Notice>,
+    cwd: PathBuf,
+    first: Request,
+) -> Result<()> {
+    let mut app = App::new(cwd, req_tx.clone());
     app.sidebar_open = true;
-    app.refresh_sidebar();
-    app.load_history(agent.history());
-
-    let sink: EventSink = Arc::new(move |ev| {
-        // The receiver only closes when the UI exits; dropping late events is fine then.
-        let _ = ev_tx.send(ev);
-    });
-    let agent_task = tokio::spawn(async move {
-        while let Some(cmd) = cmd_rx.recv().await {
-            match cmd {
-                AgentCmd::Turn { text, cancel } => {
-                    agent.run_turn(text, sink.clone(), cancel).await;
-                }
-            }
-        }
-    });
+    app.expect_open();
+    // A closed hub surfaces as a flash on the first request the user makes.
+    let _ = req_tx.send(Request::List);
+    let _ = req_tx.send(first);
 
     let mut terminal = ratatui::init();
     let mut out = std::io::stdout();
@@ -71,16 +62,15 @@ pub async fn run(mut agent: Agent, cwd: PathBuf, sessions_dir: PathBuf) -> Resul
         prev_hook(info);
     }));
 
-    let result = event_loop(&mut terminal, &mut app, &mut ev_rx).await;
+    let result = event_loop(&mut terminal, &mut app, &mut notices).await;
 
     if enhanced {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
     }
     let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
-    agent_task.abort();
-    if !app.session_id.is_empty() {
-        println!("session {} — resume with: rdsh --resume {}", app.session_id, app.session_id);
+    for id in app.open_sessions() {
+        println!("session {id} — resume with: rdsh --resume {id}");
     }
     result
 }
@@ -88,7 +78,7 @@ pub async fn run(mut agent: Agent, cwd: PathBuf, sessions_dir: PathBuf) -> Resul
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    ev_rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    notices: &mut UnboundedReceiver<Notice>,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -104,6 +94,7 @@ async fn event_loop(
         if app.quit {
             return Ok(());
         }
+        let animating = app.cur.running || !app.hub_running.is_empty();
         tokio::select! {
             ev = events.next() => match ev {
                 Some(Ok(ev)) => {
@@ -112,13 +103,13 @@ async fn event_loop(
                 Some(Err(e)) => return Err(e.into()),
                 None => return Ok(()),
             },
-            Some(ev) = ev_rx.recv() => {
-                app.on_agent(ev);
-                while let Ok(ev) = ev_rx.try_recv() {
-                    app.on_agent(ev);
+            Some(n) = notices.recv() => {
+                app.on_notice(n);
+                while let Ok(n) = notices.try_recv() {
+                    app.on_notice(n);
                 }
             }
-            _ = tick.tick(), if app.running => {
+            _ = tick.tick(), if animating => {
                 app.spinner = app.spinner.wrapping_add(1);
             }
         }

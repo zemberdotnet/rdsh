@@ -51,10 +51,11 @@ const REPLY_CHARS: usize = 500;
 const PROMPT_CHARS: usize = 4000;
 
 /// What the router decided for one turn.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Routing {
     /// A note was added for `level`.
-    Picked { level: &'static str, confidence: f64 },
+    Picked { level: String, confidence: f64 },
     /// The model answered below `MIN_CONFIDENCE`; no note.
     Unsure { level: String, confidence: f64 },
     /// No answer; no note.
@@ -83,7 +84,7 @@ impl LengthRouter {
             Err(e) => (Routing::Unavailable { reason: format!("{e:#}") }, None),
             Ok(Pick { label, confidence }) => match LEVELS.iter().find(|(l, ..)| *l == label) {
                 Some((level, _, note)) if confidence >= MIN_CONFIDENCE => {
-                    (Routing::Picked { level, confidence }, Some(directive(level, note)))
+                    (Routing::Picked { level: (*level).to_owned(), confidence }, Some(directive(level, note)))
                 }
                 _ => (Routing::Unsure { level: label, confidence }, None),
             },
@@ -153,7 +154,7 @@ mod tests {
     async fn confident_pick_yields_a_note() {
         let r = LengthRouter::new(Arc::new(ScriptedDecider::new([pick("yesno", 0.9)])));
         let (routing, note) = r.route(&[], "is the cache on?").await;
-        assert_eq!(routing, Routing::Picked { level: "yesno", confidence: 0.9 });
+        assert_eq!(routing, Routing::Picked { level: "yesno".into(), confidence: 0.9 });
         assert!(note.unwrap().starts_with("<response_length level=\"yesno\">Answer in one line"));
     }
 

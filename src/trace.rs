@@ -148,6 +148,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
 }
 
 /// Summary row for `rdsh sessions`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
     pub path: PathBuf,

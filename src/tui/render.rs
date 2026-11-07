@@ -136,7 +136,7 @@ impl App {
         // Paint the theme background everywhere; widgets drawn later inherit it.
         f.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
         let prompt_w = (area.width as usize).saturating_sub(2);
-        let (prompt_lines, prompt_cur) = self.prompt.layout(prompt_w);
+        let (prompt_lines, prompt_cur) = self.cur.prompt.layout(prompt_w);
         let prompt_h = prompt_lines.len().clamp(1, MAX_PROMPT_ROWS) as u16;
         let [body, sep, prompt, status] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(prompt_h), Constraint::Length(1)])
@@ -171,12 +171,12 @@ impl App {
     }
 
     fn draw_chat(&mut self, f: &mut Frame, area: Rect) {
-        self.transcript.layout(area.width as usize);
-        let total = self.transcript.total();
+        self.cur.transcript.layout(area.width as usize);
+        let total = self.cur.transcript.total();
         if total == 0 {
             let text = vec![
                 Line::from(Span::styled("rdsh", Style::default().add_modifier(Modifier::BOLD))),
-                Line::from(Span::styled(format!("{} · {}", self.model, self.transcript.cwd().display()), dim())),
+                Line::from(Span::styled(format!("{} · {}", self.cur.model, self.cur.transcript.cwd().display()), dim())),
                 Line::from(""),
                 Line::from("Type a message and press Enter. Esc switches to normal mode:"),
                 Line::from("  j/k w/b gg/G Ctrl-d/u  move      { }  previous/next message      / ?  search"),
@@ -188,21 +188,21 @@ impl App {
             return;
         }
         let h = area.height as usize;
-        if self.follow {
-            self.chat_cursor.pos = Pos { row: total - 1, col: 0 };
-            self.chat_scroll = total.saturating_sub(h);
+        if self.cur.follow {
+            self.cur.chat_cursor.pos = Pos { row: total - 1, col: 0 };
+            self.cur.chat_scroll = total.saturating_sub(h);
         }
-        self.chat_cursor.clamp(&self.transcript);
-        keep_visible(&mut self.chat_scroll, self.chat_cursor.pos.row, h, total);
+        self.cur.chat_cursor.clamp(&self.cur.transcript);
+        keep_visible(&mut self.cur.chat_scroll, self.cur.chat_cursor.pos.row, h, total);
         let show_cursor = matches!(self.mode, Mode::Normal | Mode::Visual { .. } | Mode::Search { .. } | Mode::Command);
         let text_w = (area.width as usize).saturating_sub(GUTTER);
         let mut lines = Vec::with_capacity(h);
-        for r in self.chat_scroll..(self.chat_scroll + h).min(total) {
-            let row = self.transcript.row(r);
+        for r in self.cur.chat_scroll..(self.cur.chat_scroll + h).min(total) {
+            let row = self.cur.transcript.row(r);
             let len = row.text.chars().count();
             let links: Vec<(usize, usize)> = row.links.iter().map(|l| (l.start, l.end)).collect();
-            let sel = sel_range(self.mode, self.chat_cursor.pos, r, len);
-            let cur = (show_cursor && r == self.chat_cursor.pos.row).then_some(self.chat_cursor.pos.col);
+            let sel = sel_range(self.mode, self.cur.chat_cursor.pos, r, len);
+            let cur = (show_cursor && r == self.cur.chat_cursor.pos.row).then_some(self.cur.chat_cursor.pos.col);
             let mut spans = vec![Span::styled(row.gutter, row.gutter_style)];
             spans.extend(styled(&row.text, row.style, &Marks { syntax: &row.runs, links: &links, sel, cursor: cur }, 0, text_w));
             if let Some(bg) = row.style.bg {
@@ -239,7 +239,7 @@ impl App {
         }
         let width = area.width as usize;
         for (i, row) in rows.iter().enumerate().skip(self.sidebar_scroll).take(visible) {
-            let current = row.depth == 0 && row.id == self.session_id;
+            let current = row.depth == 0 && row.id == self.cur.session_id;
             let selected = self.sidebar_focus && i == self.sidebar_sel;
             let mut style = base.fg(if row.depth == 0 { FG } else { FG_DIM });
             if current {
@@ -274,7 +274,7 @@ impl App {
         let [head, body, foot] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(area);
         let mode = self.mode;
-        let queue = &self.queue;
+        let queue = &self.cur.queue;
         let View::File(fv) = &mut self.view else { return };
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -362,21 +362,21 @@ impl App {
         let mut lines = vec![
             Line::from(vec![
                 Span::styled(
-                    format!(" Comment queue — {} ", self.queue.len()),
+                    format!(" Comment queue — {} ", self.cur.queue.len()),
                     Style::default().add_modifier(Modifier::BOLD).bg(PANEL),
                 ),
                 Span::styled("  sent with your next message · j/k · e edit · dd delete · D clear · q back", dim()),
             ]),
             Line::from(""),
         ];
-        if self.queue.is_empty() {
+        if self.cur.queue.is_empty() {
             lines.push(Line::from(Span::styled(
                 "No comments yet. In the chat or a file view, select with v/V and press c.",
                 dim(),
             )));
         }
         let mut sel_line = 0;
-        for (i, c) in self.queue.iter().enumerate() {
+        for (i, c) in self.cur.queue.iter().enumerate() {
             if i == sel {
                 sel_line = lines.len();
             }
@@ -430,7 +430,7 @@ impl App {
     }
 
     fn draw_comment_popup(&self, f: &mut Frame, main: Rect) {
-        let (label, excerpt) = match (&self.comment_target, self.editing.and_then(|i| self.queue.get(i))) {
+        let (label, excerpt) = match (&self.comment_target, self.editing.and_then(|i| self.cur.queue.get(i))) {
             (Some(a), _) => {
                 let c = crate::comments::Comment { anchor: a.clone(), body: String::new() };
                 (c.label(), c.excerpt().to_owned())
@@ -471,19 +471,19 @@ impl App {
 
     fn draw_separator(&self, f: &mut Frame, area: Rect) {
         let mut left: Vec<Span> = Vec::new();
-        if !self.queue.is_empty() {
-            let n = self.queue.len();
+        if !self.cur.queue.is_empty() {
+            let n = self.cur.queue.len();
             left.push(Span::styled(
                 format!(" ● {n} comment{} queued — sent with your next message (Q to review) ", if n == 1 { "" } else { "s" }),
                 Style::default().fg(YELLOW),
             ));
         }
-        if self.queued_send.is_some() {
+        if self.cur.waiting > 0 {
             left.push(Span::styled(" ⏳ message waiting for the current turn ", Style::default().fg(PURPLE)));
         }
-        let right = if self.running {
-            let secs = self.turn_started.elapsed().as_secs();
-            let act = self.activity.as_deref().unwrap_or("working");
+        let right = if self.cur.running {
+            let secs = self.cur.turn_started.elapsed().as_secs();
+            let act = self.cur.activity.as_deref().unwrap_or("working");
             format!(" {} {act} · {secs}s · Ctrl-C interrupts ", SPINNER[self.spinner % SPINNER.len()])
         } else {
             String::new()
@@ -496,8 +496,8 @@ impl App {
     }
 
     fn draw_prompt(&self, f: &mut Frame, area: Rect, lines: &[String], cur: (u16, u16)) {
-        if self.prompt.text.is_empty() && self.mode != Mode::Insert {
-            let hint = if self.queue.is_empty() {
+        if self.cur.prompt.text.is_empty() && self.mode != Mode::Insert {
+            let hint = if self.cur.queue.is_empty() {
                 "  press i to type · Enter sends · Ctrl-Enter sends from any mode"
             } else {
                 "  Ctrl-Enter sends the queued comments · i adds a message"
@@ -561,12 +561,12 @@ impl App {
                 }
             }
         }
-        let u = self.usage;
-        let short: String = self.session_id.chars().take(15).collect();
-        let length = self.length.as_deref().map_or(String::new(), |l| format!("len {l} · "));
+        let u = self.cur.usage;
+        let short: String = self.cur.session_id.chars().take(15).collect();
+        let length = self.cur.length.as_deref().map_or(String::new(), |l| format!("len {l} · "));
         let right = format!(
             "{length}{} · ↑{} ↓{} · {short} ",
-            self.model,
+            self.cur.model,
             compact(u.prompt_tokens),
             compact(u.completion_tokens)
         );
@@ -611,7 +611,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l(""),
         h("Sessions"),
         l("  S shows or hides the left rail: this directory's sessions, subagents nested beneath"),
-        l("  Ctrl-w h (or click) focuses it: j k g G Ctrl-d/u move · Enter shows how to open · y copies the id"),
+        l("  Ctrl-w h (or click) focuses it: j k g G Ctrl-d/u move · Enter switches to it · y copies the id"),
+        l("  Sessions keep running while you look at another; subagent rows open read-only · :new starts one"),
         l("  Esc, l, Tab or Ctrl-w l return to the chat · ▸ marks the current session"),
         l("  Subagents: spinner running · ● done · ✗ failed (live for this process; others show ·)"),
         l(""),

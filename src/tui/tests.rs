@@ -4,17 +4,23 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, Mous
 use ratatui::{Terminal, backend::TestBackend};
 use tokio::sync::mpsc;
 
-use super::app::{AgentCmd, App, Mode, View};
+use super::app::{App, Mode, View};
 use crate::{
     agent::AgentEvent,
+    hub::{Notice, Request, Snapshot},
+    llm::Usage,
     llm::{Message, ToolCall},
     tools::ToolOutput,
 };
 
+fn snapshot(id: &str) -> Snapshot {
+    Snapshot { session_id: id.into(), model: "test-model".into(), history: Vec::new(), turn: Vec::new(), running: false, usage: Usage::default() }
+}
+
 struct Harness {
     app: App,
     term: Terminal<TestBackend>,
-    rx: mpsc::UnboundedReceiver<AgentCmd>,
+    rx: mpsc::UnboundedReceiver<Request>,
     _dir: tempfile::TempDir,
 }
 
@@ -34,7 +40,9 @@ impl Harness {
         git(&["commit", "-qm", "init"]);
         std::fs::write(root.join("src/lib.rs"), "fn a() {}\nfn b2() {}\nfn c() {}\nfn d() {}\n").unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
-        let app = App::new(root.to_path_buf(), "test-model".into(), "s1".into(), tx);
+        let mut app = App::new(root.to_path_buf(), tx);
+        app.expect_open();
+        app.on_notice(Notice::Opened { snapshot: snapshot("s1") });
         let term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut h = Self { app, term, rx, _dir: dir };
         h.draw();
@@ -74,11 +82,31 @@ impl Harness {
         s
     }
 
+    /// The next `Send` request; acts as the hub by starting that turn right away.
     fn sent(&mut self) -> String {
-        match self.rx.try_recv() {
-            Ok(AgentCmd::Turn { text, .. }) => text,
-            Err(e) => panic!("no turn sent: {e}"),
+        loop {
+            match self.rx.try_recv() {
+                Ok(Request::Send { session_id, text }) => {
+                    self.notice(Notice::Event { session_id, event: AgentEvent::TurnStarted { text: text.clone() } });
+                    return text;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("no turn sent: {e}"),
+            }
         }
+    }
+
+    fn notice(&mut self, n: Notice) {
+        self.app.on_notice(n);
+        self.draw();
+    }
+
+    /// Feeds the rail the sessions recorded in `dir`, as the hub would.
+    fn sessions(&mut self, dir: &std::path::Path, running: &[&str]) {
+        let recorded = crate::trace::list_sessions(dir);
+        let open = recorded.iter().map(|s| s.id.clone()).collect();
+        let running = running.iter().map(|s| s.to_string()).collect();
+        self.notice(Notice::Sessions { recorded, open, running });
     }
 
     /// Simulates a finished turn whose answer mentions a file and ran one tool.
@@ -110,9 +138,9 @@ fn sending_a_message_starts_a_turn_and_streams_the_answer() {
     h.keys("hello");
     h.key(KeyCode::Enter);
     assert_eq!(h.sent(), "hello");
-    assert!(h.app.running);
+    assert!(h.app.cur.running);
     h.complete_turn();
-    assert!(!h.app.running);
+    assert!(!h.app.cur.running);
     let screen = h.screen();
     assert!(screen.contains("› hello"), "{screen}");
     assert!(screen.contains("● I changed src/lib.rs:2"), "{screen}");
@@ -139,14 +167,14 @@ fn visual_selection_comments_are_queued_and_sent_with_quotes() {
     assert!(h.screen().contains("Comment on your response"));
     h.keys("why rename?");
     h.key(KeyCode::Enter);
-    assert_eq!(h.app.queue.len(), 1);
+    assert_eq!(h.app.cur.queue.len(), 1);
     assert!(h.screen().contains("1 comment queued"));
     // Linewise comment on the second line.
     h.keys("jV");
     h.key(KeyCode::Char('c'));
     h.keys("drop this");
     h.key(KeyCode::Enter);
-    assert_eq!(h.app.queue.len(), 2);
+    assert_eq!(h.app.cur.queue.len(), 2);
     // Send: i, text, Enter.
     h.keys("i");
     h.keys("and run tests");
@@ -155,7 +183,7 @@ fn visual_selection_comments_are_queued_and_sent_with_quotes() {
     assert!(sent.contains("[1] On your response:\n> renamed b to b2\nComment: why rename?"), "{sent}");
     assert!(sent.contains("[2] On your response:\n> Second line here.\nComment: drop this"), "{sent}");
     assert!(sent.ends_with("</review_comments>\n\nand run tests"));
-    assert!(h.app.queue.is_empty());
+    assert!(h.app.cur.queue.is_empty());
 }
 
 #[test]
@@ -238,10 +266,10 @@ fn queue_view_edits_and_deletes() {
     h.app.on_event(Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)));
     h.keys("TWO");
     h.key(KeyCode::Enter);
-    assert_eq!(h.app.queue[1].body, "TWO");
+    assert_eq!(h.app.cur.queue[1].body, "TWO");
     h.keys("ggdd");
-    assert_eq!(h.app.queue.len(), 1);
-    assert_eq!(h.app.queue[0].body, "TWO");
+    assert_eq!(h.app.cur.queue.len(), 1);
+    assert_eq!(h.app.cur.queue[0].body, "TWO");
 }
 
 #[test]
@@ -250,12 +278,15 @@ fn messages_typed_during_a_turn_wait_for_it() {
     h.keys("first");
     h.key(KeyCode::Enter);
     h.sent();
+    // The hub queues turns, so the second message goes out right away and waits there.
     h.keys("second");
     h.key(KeyCode::Enter);
-    assert!(h.rx.try_recv().is_err());
     assert!(h.screen().contains("message waiting"));
     h.agent(AgentEvent::TurnEnd { cancelled: false, error: None });
+    assert!(h.screen().contains("message waiting"), "still waiting until the hub starts it");
     assert_eq!(h.sent(), "second");
+    assert!(!h.screen().contains("message waiting"));
+    assert!(h.screen().contains("› second"));
 }
 
 #[test]
@@ -268,12 +299,12 @@ fn search_and_message_jumps() {
     h.key(KeyCode::Esc);
     h.keys("gg/second");
     h.key(KeyCode::Enter);
-    let row = h.app.chat_cursor.pos.row;
-    assert_eq!(h.app.transcript.row(row).text, "Second line here.");
+    let row = h.app.cur.chat_cursor.pos.row;
+    assert_eq!(h.app.cur.transcript.row(row).text, "Second line here.");
     h.keys("{");
-    assert_eq!(h.app.transcript.entry_at(h.app.chat_cursor.pos.row), 1);
+    assert_eq!(h.app.cur.transcript.entry_at(h.app.cur.chat_cursor.pos.row), 1);
     h.keys("G");
-    assert!(h.app.follow);
+    assert!(h.app.cur.follow);
 }
 
 #[test]
@@ -292,7 +323,7 @@ fn shift_enter_adds_a_newline_in_comments() {
     assert!(h.screen().contains("Shift-Enter newline"));
     h.keys("second");
     h.key(KeyCode::Enter);
-    assert_eq!(h.app.queue[0].body, "first\nsecond");
+    assert_eq!(h.app.cur.queue[0].body, "first\nsecond");
 }
 
 #[test]
@@ -321,7 +352,7 @@ fn ctrl_enter_sends_from_any_mode() {
     h.keys("two");
     h.app.on_event(ctrl_enter());
     assert!(h.sent().contains("Comment: two"));
-    assert!(h.app.queue.is_empty());
+    assert!(h.app.cur.queue.is_empty());
 }
 
 #[test]
@@ -346,7 +377,7 @@ fn user_messages_have_a_full_width_background() {
 #[test]
 fn file_view_highlights_added_and_deleted_lines() {
     let mut h = Harness::new();
-    let path = h.app.transcript.cwd().join("src/lib.rs");
+    let path = h.app.cur.transcript.cwd().join("src/lib.rs");
     h.app.open_file(path, None);
     h.draw();
     let View::File(fv) = &h.app.view else { panic!() };
@@ -395,7 +426,7 @@ fn assistant_markdown_renders_and_quotes_keep_the_source() {
     h.key(KeyCode::Char('c'));
     h.keys("ok");
     h.key(KeyCode::Enter);
-    match &h.app.queue[0].anchor {
+    match &h.app.cur.queue[0].anchor {
         crate::comments::Anchor::Chat { quote, .. } => {
             assert_eq!(quote, "**What it does:** loads `src/lib.rs:2` config")
         }
@@ -411,7 +442,7 @@ fn assistant_markdown_renders_and_quotes_keep_the_source() {
     h.key(KeyCode::Char('c'));
     h.keys("path?");
     h.key(KeyCode::Enter);
-    match &h.app.queue[1].anchor {
+    match &h.app.cur.queue[1].anchor {
         crate::comments::Anchor::Chat { quote, .. } => assert_eq!(quote, "`src/lib.rs:2`"),
         a => panic!("{a:?}"),
     }
@@ -431,16 +462,15 @@ fn sidebar_lists_sessions_with_subagents_nested() {
     let mut h = Harness::new();
     let dir = h._dir.path().join("sessions");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut parent = crate::trace::Trace::create(&dir, "20260101-000000-aaaa", "m", h.app.transcript.cwd(), None)
+    let mut parent = crate::trace::Trace::create(&dir, "20260101-000000-aaaa", "m", h.app.cur.transcript.cwd(), None)
         .unwrap();
     parent.record(crate::trace::TraceEvent::Message { message: Message::user("refactor the parser") }).unwrap();
-    crate::trace::Trace::create(&dir, "20260101-000000-aaaa-sub1", "m", h.app.transcript.cwd(), Some("20260101-000000-aaaa"))
+    crate::trace::Trace::create(&dir, "20260101-000000-aaaa-sub1", "m", h.app.cur.transcript.cwd(), Some("20260101-000000-aaaa"))
         .unwrap()
         .record(crate::trace::TraceEvent::Message { message: Message::user("check the lexer") })
         .unwrap();
-    h.app.sessions_dir = Some(dir);
     h.app.sidebar_open = true;
-    h.app.refresh_sidebar();
+    h.sessions(&dir, &[]);
     h.draw();
 
     let screen = h.screen();
@@ -476,7 +506,7 @@ fn sidebar_toggles_with_s_and_hides_on_narrow_terminals() {
 fn harness_with_session() -> Harness {
     let mut h = Harness::new();
     let dir = h._dir.path().join("sessions");
-    let cwd = h.app.transcript.cwd().to_path_buf();
+    let cwd = h.app.cur.transcript.cwd().to_path_buf();
     crate::trace::Trace::create(&dir, "s0", "m", &cwd, None)
         .unwrap()
         .record(crate::trace::TraceEvent::Message { message: Message::user("older work") })
@@ -486,9 +516,8 @@ fn harness_with_session() -> Harness {
         .unwrap()
         .record(crate::trace::TraceEvent::Message { message: Message::user("current work") })
         .unwrap();
-    h.app.sessions_dir = Some(dir);
     h.app.sidebar_open = true;
-    h.app.refresh_sidebar();
+    h.sessions(&dir, &[]);
     h.draw();
     h
 }
@@ -529,25 +558,45 @@ fn running_subagents_appear_immediately_and_settle() {
     assert!(screen.lines().any(|l| l.contains("● scan lexer")), "{screen}");
 }
 
+impl Harness {
+    /// Next request other than `List`, without acting on it.
+    fn request(&mut self) -> Request {
+        loop {
+            match self.rx.try_recv() {
+                Ok(Request::List) => continue,
+                Ok(r) => return r,
+                Err(e) => panic!("no request: {e}"),
+            }
+        }
+    }
+
+    fn ctrl(&mut self, c: char) {
+        self.app.on_event(Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)));
+        self.draw();
+    }
+
+    fn rail_id(&self) -> &str {
+        &self.app.sidebar.rows()[self.app.sidebar_sel].id
+    }
+}
+
 #[test]
 fn rail_focus_selection_and_mouse() {
     let mut h = harness_with_session();
     h.key(KeyCode::Esc);
-    h.app.on_event(Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+    h.ctrl('w');
     h.key(KeyCode::Char('h'));
     assert!(h.app.sidebar_focus);
     assert!(h.screen().contains(" sessions "), "status shows the focused view");
     // The selection starts on the current session; j moves to the older one.
-    assert_eq!(h.app.sidebar.rows()[h.app.sidebar_sel].id, "s1");
+    assert_eq!(h.rail_id(), "s1");
     h.key(KeyCode::Char('j'));
-    assert_eq!(h.app.sidebar.rows()[h.app.sidebar_sel].id, "s0");
-    h.key(KeyCode::Enter);
-    assert!(h.screen().contains("resume: rdsh --resume s0"), "{}", h.screen());
+    assert_eq!(h.rail_id(), "s0");
     h.key(KeyCode::Char('y'));
     assert!(h.app.osc_out.as_deref().is_some_and(|s| s.starts_with("\x1b]52;c;")));
     // Navigation keys no longer reach the chat while the rail has focus.
     h.key(KeyCode::Char('k'));
-    assert_eq!(h.app.sidebar.rows()[h.app.sidebar_sel].id, "s1");
+    assert_eq!(h.rail_id(), "s1");
     h.key(KeyCode::Esc);
     assert!(!h.app.sidebar_focus);
     // Clicking a row focuses the rail and selects it; clicking the chat returns focus.
@@ -558,7 +607,102 @@ fn rail_focus_selection_and_mouse() {
     };
     h.app.on_event(click(y, 3));
     assert!(h.app.sidebar_focus);
-    assert_eq!(h.app.sidebar.rows()[h.app.sidebar_sel].id, "s0");
+    assert_eq!(h.rail_id(), "s0");
     h.app.on_event(click(1, 50));
     assert!(!h.app.sidebar_focus);
+}
+
+#[test]
+fn enter_on_a_session_switches_and_others_keep_updating() {
+    let mut h = harness_with_session();
+    h.keys("draft for s1");
+    h.key(KeyCode::Esc);
+    h.ctrl('w');
+    h.key(KeyCode::Char('h'));
+    h.key(KeyCode::Char('j'));
+    h.key(KeyCode::Enter);
+    // Not open in this TUI yet: ask the hub to open (resume) it.
+    assert_eq!(h.request(), Request::Open { session_id: "s0".into() });
+    assert!(h.screen().contains("opening s0"));
+    let mut s0 = snapshot("s0");
+    s0.history = vec![Message::user("older work"), Message::assistant("old answer", vec![])];
+    h.notice(Notice::Opened { snapshot: s0 });
+    assert_eq!(h.app.cur.session_id, "s0");
+    assert!(h.screen().contains("old answer"));
+    assert!(h.screen().contains("▸ older work"), "rail marks the session on screen");
+
+    // s1 runs in the background while s0 is on screen.
+    let ev = |e| Notice::Event { session_id: "s1".into(), event: e };
+    h.notice(ev(AgentEvent::TurnStarted { text: "background job".into() }));
+    h.notice(ev(AgentEvent::TextDelta("finished in the background".into())));
+    assert!(!h.screen().contains("finished in the background"));
+    h.notice(Notice::Sessions { recorded: crate::trace::list_sessions(&h._dir.path().join("sessions")), open: vec!["s0".into(), "s1".into()], running: vec!["s1".into()] });
+    // :q refuses while another session is running.
+    h.keys(":q");
+    h.key(KeyCode::Enter);
+    assert!(!h.app.quit);
+    assert!(h.screen().contains("still running"));
+
+    // Back to s1: already open here, so no request; its draft and background output are there.
+    h.ctrl('w');
+    h.key(KeyCode::Char('h'));
+    h.key(KeyCode::Char('g'));
+    assert_eq!(h.rail_id(), "s1");
+    h.key(KeyCode::Enter);
+    assert!(h.rx.try_recv().is_err());
+    assert_eq!(h.app.cur.session_id, "s1");
+    assert_eq!(h.app.cur.prompt.text, "draft for s1");
+    assert!(h.screen().contains("› background job"));
+    assert!(h.screen().contains("finished in the background"));
+    assert!(h.app.cur.running);
+}
+
+#[test]
+fn subagent_rows_open_read_only_traces_and_new_starts_a_session() {
+    let mut h = harness_with_session();
+    h.notice(Notice::Event {
+        session_id: "s1".into(),
+        event: AgentEvent::SubagentStarted { call_id: "t1".into(), session_id: "s1-sub1".into(), title: "scan lexer".into() },
+    });
+    h.key(KeyCode::Esc);
+    h.ctrl('w');
+    h.key(KeyCode::Char('h'));
+    h.key(KeyCode::Char('j'));
+    assert_eq!(h.rail_id(), "s1-sub1");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.request(), Request::ReadTrace { session_id: "s1-sub1".into() });
+    h.notice(Notice::Trace {
+        session_id: "s1-sub1".into(),
+        history: vec![Message::user("scan the lexer"), Message::assistant("lexer is fine", vec![])],
+    });
+    assert_eq!(h.app.cur.session_id, "s1-sub1");
+    assert!(h.app.cur.read_only);
+    assert!(h.screen().contains("lexer is fine"));
+    h.keys("ihello");
+    h.key(KeyCode::Enter);
+    assert!(h.screen().contains("read-only"), "{}", h.screen());
+    assert!(h.rx.try_recv().is_err(), "nothing is sent from a read-only view");
+
+    h.key(KeyCode::Esc);
+    h.keys(":new");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.request(), Request::New);
+    h.notice(Notice::Opened { snapshot: snapshot("s2") });
+    assert_eq!(h.app.cur.session_id, "s2");
+    assert_eq!(h.app.open_sessions(), vec!["s2", "s1"], "read-only traces are not listed as resumable");
+}
+
+#[test]
+fn focusing_the_rail_starts_on_the_session_on_screen() {
+    let mut h = harness_with_session();
+    h.key(KeyCode::Esc);
+    h.ctrl('w');
+    h.key(KeyCode::Char('h'));
+    h.key(KeyCode::Char('j'));
+    assert_eq!(h.rail_id(), "s0");
+    h.key(KeyCode::Esc);
+    // Leave the selection elsewhere, then come back: it starts on the current session again.
+    h.ctrl('w');
+    h.key(KeyCode::Char('h'));
+    assert_eq!(h.rail_id(), "s1");
 }

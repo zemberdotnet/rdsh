@@ -20,7 +20,7 @@ use crate::{
 };
 
 /// Result of one tool call. `content` is exactly what the model sees.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,

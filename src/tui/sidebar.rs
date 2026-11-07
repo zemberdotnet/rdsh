@@ -4,7 +4,7 @@
 //! start (`AgentEvent::SubagentStarted`), so a subagent appears as soon as it starts even
 //! before its trace has a title on disk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use unicode_width::UnicodeWidthChar;
 
@@ -34,7 +34,7 @@ pub struct Row {
     /// Indent level: 0 for a session, 1 for its subagents.
     pub depth: u8,
     pub title: String,
-    /// `None` for sessions and for subagents whose outcome this process did not see.
+    /// `Running` for a session mid-turn in the hub; for subagents, the outcome seen, if any.
     pub live: Option<Live>,
 }
 
@@ -55,8 +55,9 @@ impl Sidebar {
     ///
     /// @param infos sessions from `trace::list_sessions` (newest first).
     /// @param cwd only sessions recorded in this working directory are listed.
-    /// @param live subagents this process saw start, keyed by session id.
-    pub fn build(infos: &[SessionInfo], cwd: &str, live: &HashMap<String, LiveSub>) -> Self {
+    /// @param live subagents seen starting, keyed by session id.
+    /// @param running sessions whose agent is mid-turn in the hub.
+    pub fn build(infos: &[SessionInfo], cwd: &str, live: &HashMap<String, LiveSub>, running: &HashSet<String>) -> Self {
         let mut subs: HashMap<&str, Vec<Row>> = HashMap::new();
         for s in infos {
             if let Some(p) = &s.parent {
@@ -80,7 +81,8 @@ impl Sidebar {
         }
         let mut rows = Vec::new();
         for s in infos.iter().filter(|s| s.parent.is_none() && s.cwd == cwd) {
-            rows.push(Row { id: s.id.clone(), depth: 0, title: s.title.clone(), live: None });
+            let live = running.contains(&s.id).then_some(Live::Running);
+            rows.push(Row { id: s.id.clone(), depth: 0, title: s.title.clone(), live });
             if let Some(mut children) = subs.remove(s.id.as_str()) {
                 children.sort_by_key(|r| sub_number(&r.id));
                 rows.extend(children);
@@ -152,7 +154,7 @@ mod tests {
             info("other", "elsewhere", None, "/q"),
             info("a", "fix the bug", None, "/p"),
         ];
-        let sb = Sidebar::build(&infos, "/p", &HashMap::new());
+        let sb = Sidebar::build(&infos, "/p", &HashMap::new(), &HashSet::new());
         assert_eq!(ids(&sb), [("b", 0), ("b-sub2", 1), ("b-sub10", 1), ("a", 0)]);
         assert_eq!(sb.index_of("a"), Some(3));
         assert_eq!(sb.index_of("other"), None);
@@ -164,7 +166,7 @@ mod tests {
         let mut live = HashMap::new();
         live.insert("b-sub1".into(), LiveSub { parent: "b".into(), title: "scan lexer".into(), state: Live::Done });
         live.insert("b-sub2".into(), LiveSub { parent: "b".into(), title: "check docs".into(), state: Live::Running });
-        let sb = Sidebar::build(&infos, "/p", &live);
+        let sb = Sidebar::build(&infos, "/p", &live, &HashSet::new());
         let rows = sb.rows();
         assert_eq!(ids(&sb), [("b", 0), ("b-sub1", 1), ("b-sub2", 1)]);
         assert_eq!((rows[1].title.as_str(), rows[1].live), ("scan lexer", Some(Live::Done)));
@@ -176,8 +178,8 @@ mod tests {
         let infos = vec![info("b-sub1", "read Cargo.toml and report", Some("b"), "/p"), info("b", "root", None, "/p")];
         let mut live = HashMap::new();
         live.insert("b-sub1".into(), LiveSub { parent: "b".into(), title: "inspect manifest".into(), state: Live::Done });
-        assert_eq!(Sidebar::build(&infos, "/p", &live).rows()[1].title, "inspect manifest");
-        assert_eq!(Sidebar::build(&infos, "/p", &HashMap::new()).rows()[1].title, "read Cargo.toml and report");
+        assert_eq!(Sidebar::build(&infos, "/p", &live, &HashSet::new()).rows()[1].title, "inspect manifest");
+        assert_eq!(Sidebar::build(&infos, "/p", &HashMap::new(), &HashSet::new()).rows()[1].title, "read Cargo.toml and report");
     }
 
     #[test]

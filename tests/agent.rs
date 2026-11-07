@@ -323,7 +323,7 @@ async fn length_note_follows_the_user_message_but_not_subagent_tasks() {
     assert!(decider.states()[0].ends_with("is it there?"));
     assert!(events.lock().unwrap().iter().any(|e| matches!(
         e,
-        AgentEvent::ResponseLength(Routing::Picked { level: "yesno", .. })
+        AgentEvent::ResponseLength(Routing::Picked { level, .. }) if level == "yesno"
     )));
 
     // An unavailable decision adds no note and warns once.
