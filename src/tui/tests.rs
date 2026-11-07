@@ -323,3 +323,22 @@ fn ctrl_enter_sends_from_any_mode() {
     assert!(h.sent().contains("Comment: two"));
     assert!(h.app.queue.is_empty());
 }
+
+#[test]
+fn user_messages_have_a_full_width_background() {
+    use super::transcript::USER_BG;
+    let mut h = Harness::new();
+    h.keys("hello there");
+    h.key(KeyCode::Enter);
+    h.sent();
+    h.complete_turn();
+    let screen = h.screen();
+    let y = screen.lines().position(|l| l.starts_with("› hello there")).unwrap() as u16;
+    let buf = h.term.backend().buffer();
+    for x in [0, 5, 79] {
+        assert_eq!(buf[(x, y)].bg, USER_BG, "cell {x},{y}");
+    }
+    // Assistant rows keep the terminal background.
+    let a = screen.lines().position(|l| l.starts_with("● I changed")).unwrap() as u16;
+    assert_ne!(buf[(5, a)].bg, USER_BG);
+}

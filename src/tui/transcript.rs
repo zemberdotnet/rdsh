@@ -16,6 +16,8 @@ use crate::{
 pub const GUTTER: usize = 2;
 const COLLAPSED_OUTPUT_LINES: usize = 4;
 const COLLAPSED_REASONING_LINES: usize = 3;
+/// Background of the user's own messages; rows carrying it are filled to the full width.
+pub const USER_BG: Color = Color::Rgb(52, 54, 61);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -125,8 +127,9 @@ fn logical_lines(e: &Entry) -> Vec<LLine> {
     match &e.kind {
         Kind::User => {
             for (i, l) in sanitize(&e.text).lines().enumerate() {
-                let line = LLine::new(l, Style::default().fg(Color::Cyan));
-                out.push(if i == 0 { line.gutter("› ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)) } else { line });
+                let line = LLine::new(l, Style::default().fg(Color::White).bg(USER_BG));
+                let g = Style::default().fg(Color::Cyan).bg(USER_BG).add_modifier(Modifier::BOLD);
+                out.push(line.gutter(if i == 0 { "› " } else { "  " }, g));
             }
         }
         Kind::Assistant => {

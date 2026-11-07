@@ -182,6 +182,11 @@ impl App {
             let cur = (show_cursor && r == self.chat_cursor.pos.row).then_some(self.chat_cursor.pos.col);
             let mut spans = vec![Span::styled(row.gutter, row.gutter_style)];
             spans.extend(styled(&row.text, row.style, &links, sel, cur, 0, text_w));
+            if let Some(bg) = row.style.bg {
+                let used: usize = spans.iter().map(|s| s.width()).sum();
+                let fill = (area.width as usize).saturating_sub(used);
+                spans.push(Span::styled(" ".repeat(fill), Style::default().bg(bg)));
+            }
             lines.push(Line::from(spans));
         }
         f.render_widget(Paragraph::new(lines), area);
