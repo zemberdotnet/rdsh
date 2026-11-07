@@ -1,7 +1,7 @@
 //! `glob` and `grep`, gitignore-aware via the `ignore` walker.
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     time::SystemTime,
 };
 
@@ -127,7 +127,7 @@ impl Tool for Grep {
     }
 }
 
-fn grep(cwd: &Path, root: &PathBuf, pattern: &str, filter: Option<&str>, ci: bool) -> Result<String, String> {
+fn grep(cwd: &Path, root: &Path, pattern: &str, filter: Option<&str>, ci: bool) -> Result<String, String> {
     let re = regex::RegexBuilder::new(pattern).case_insensitive(ci).build().map_err(|e| e.to_string())?;
     let filter = filter
         .map(|g| globset::Glob::new(g).map(|g| g.compile_matcher()))

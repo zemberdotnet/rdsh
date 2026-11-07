@@ -182,7 +182,7 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionInfo> {
             Some(SessionInfo { id, path, modified, parent, title })
         })
         .collect();
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
     out
 }
 
