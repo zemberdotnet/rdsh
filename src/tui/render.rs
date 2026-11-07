@@ -365,7 +365,7 @@ impl App {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
             .title(format!(" Comment on {label} "))
-            .title_bottom(Span::styled(" Enter save · Alt-Enter newline · Esc cancel ", dim()));
+            .title_bottom(Span::styled(" Enter save · Shift-Enter newline · Esc cancel ", dim()));
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(lines).block(block), area);
         let y = area.y + 1 + input_start as u16 + cur.1 - skip as u16;
@@ -491,7 +491,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         h("rdsh keys (any key closes)"),
         l(""),
         h("Prompt (INSERT)"),
-        l("  Enter send · Alt/Shift-Enter or Ctrl-J newline · Up/Down history · Esc normal mode"),
+        l("  Enter send · Shift-Enter newline (also Alt-Enter, Ctrl-J) · Up/Down history · Esc normal mode"),
         l(""),
         h("Navigation (NORMAL, chat and file views)"),
         l("  h j k l · w b e · 0 ^ $ · gg G · 42G · Ctrl-d/u half page · Ctrl-f/b page · Ctrl-e/y scroll"),

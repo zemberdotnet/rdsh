@@ -275,3 +275,22 @@ fn search_and_message_jumps() {
     h.keys("G");
     assert!(h.app.follow);
 }
+
+#[test]
+fn shift_enter_adds_a_newline_in_comments() {
+    let mut h = Harness::new();
+    h.keys("start");
+    h.key(KeyCode::Enter);
+    h.sent();
+    h.complete_turn();
+    h.key(KeyCode::Esc);
+    h.keys("gg}c");
+    h.keys("first");
+    h.app.on_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)));
+    h.draw();
+    assert_eq!(h.app.mode, Mode::Comment);
+    assert!(h.screen().contains("Shift-Enter newline"));
+    h.keys("second");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.queue[0].body, "first\nsecond");
+}

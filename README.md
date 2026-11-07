@@ -30,7 +30,7 @@ Optional `~/.config/rdsh/config.json` (all keys optional):
 
 ## Keys
 
-The app starts in INSERT mode: type, then press Enter to send (Alt-Enter or Ctrl-J inserts a newline). Esc switches to NORMAL mode.
+The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inserts a newline, in the prompt and in comments; Alt-Enter and Ctrl-J also work in terminals without the kitty keyboard protocol). Esc switches to NORMAL mode.
 
 | Keys | Action |
 | --- | --- |
