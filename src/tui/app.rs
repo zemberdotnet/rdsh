@@ -27,7 +27,7 @@ use crate::{
     diff,
     hub::{Notice, Request, Snapshot},
     length::Routing,
-    llm::{Message, Usage},
+    llm::{Effort, Message, Usage},
     tools::{resolve_path, summarize},
     trace::SessionInfo,
     util::base64,
@@ -50,6 +50,8 @@ pub enum View {
     Queue { sel: usize },
     /// Changed files under `cwd` on `host`.
     Files { items: Vec<(String, String)>, sel: usize, host: usize, cwd: PathBuf },
+    /// `:model`: the configured models; Enter picks one for the session on screen.
+    Models { sel: usize },
     Help,
 }
 
@@ -223,6 +225,10 @@ pub struct App {
     drag_anchor: Option<Pos>,
     /// Text written to the terminal outside ratatui (OSC 52 clipboard) on the next draw.
     pub(crate) osc_out: Option<String>,
+    /// Thinking effort sent with each turn; Shift-Tab cycles it.
+    pub effort: Effort,
+    /// Model ids `:model` lists.
+    pub models: Vec<String>,
 }
 
 impl App {
@@ -268,6 +274,8 @@ impl App {
             spinner: 0,
             drag_anchor: None,
             osc_out: None,
+            effort: Effort::default(),
+            models: crate::config::Config::default().models,
         }
     }
 
@@ -766,6 +774,12 @@ impl App {
             self.send_now();
             return;
         }
+        if k.code == KeyCode::BackTab || (k.code == KeyCode::Tab && k.modifiers.contains(KeyModifiers::SHIFT)) {
+            self.effort = self.effort.next();
+            self.ctrl_c_armed = false;
+            self.set_flash(format!("thinking {}", self.effort.name()));
+            return;
+        }
         self.ctrl_c_armed = false;
         self.flash = None;
         match self.mode {
@@ -778,6 +792,7 @@ impl App {
                 View::Chat | View::File(_) => self.buffer_key(k),
                 View::Queue { .. } => self.queue_key(k),
                 View::Files { .. } => self.files_key(k),
+                View::Models { .. } => self.models_key(k),
                 View::Help => self.view = View::Chat,
             },
         }
@@ -882,7 +897,7 @@ impl App {
             self.set_flash("queued — sends when the current turn finishes");
         }
         let session_id = self.cur.session_id.clone();
-        self.request(self.cur.host, Request::Send { session_id, text: msg });
+        self.request(self.cur.host, Request::Send { session_id, text: msg, effort: self.effort, model: Some(self.cur.model.clone()).filter(|m| !m.is_empty()) });
         self.view = View::Chat;
     }
 
@@ -1276,6 +1291,8 @@ impl App {
             }
             "help" | "h" => self.view = View::Help,
             "files" => self.open_files(),
+            "model" | "models" if arg.is_empty() => self.open_models(),
+            "model" => self.set_model(arg.to_owned()),
             "comments" | "queue" => self.open_queue(),
             "dropcomments" => {
                 let n = self.cur.queue.len();
@@ -1331,6 +1348,21 @@ impl App {
         }
         self.view = View::Files { items, sel: 0, host, cwd };
         self.mode = Mode::Normal;
+    }
+
+    fn open_models(&mut self) {
+        if self.models.is_empty() {
+            return self.set_flash("no models configured — :model <id> picks one");
+        }
+        let sel = self.models.iter().position(|m| *m == self.cur.model).unwrap_or(0);
+        self.view = View::Models { sel };
+        self.mode = Mode::Normal;
+    }
+
+    /// The session on screen sends its next turns with `model`.
+    fn set_model(&mut self, model: String) {
+        self.set_flash(format!("{model} from the next turn"));
+        self.cur.model = model;
     }
 
     fn host_is_local(&self, host: usize) -> bool {
@@ -1448,6 +1480,25 @@ impl App {
                 self.open_file_on(host, cwd, path, None);
             }
             KeyCode::Char('r') => self.open_files(),
+            KeyCode::Char('i') => self.mode = Mode::Insert,
+            KeyCode::Esc | KeyCode::Char('q') => self.close_view(),
+            _ => {}
+        }
+    }
+
+    fn models_key(&mut self, k: KeyEvent) {
+        let View::Models { sel } = &mut self.view else { return };
+        let n = self.models.len();
+        match k.code {
+            KeyCode::Char('j') | KeyCode::Down => *sel = (*sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('k') | KeyCode::Up => *sel = sel.saturating_sub(1),
+            KeyCode::Char('g') => *sel = 0,
+            KeyCode::Char('G') => *sel = n.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Char('l' | 'o') if *sel < n => {
+                let model = self.models[*sel].clone();
+                self.close_view();
+                self.set_model(model);
+            }
             KeyCode::Char('i') => self.mode = Mode::Insert,
             KeyCode::Esc | KeyCode::Char('q') => self.close_view(),
             _ => {}

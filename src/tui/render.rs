@@ -17,7 +17,7 @@ use super::{
     theme::*,
     transcript::GUTTER,
 };
-use crate::{comments::Anchor, diff::Kind as DiffKind};
+use crate::{comments::Anchor, diff::Kind as DiffKind, llm::Effort};
 
 /// Width of the file view's `old new ●+ ` gutter.
 pub const FILE_GUTTER: usize = 14;
@@ -163,6 +163,7 @@ impl App {
                 View::File(_) => self.draw_file(f, main),
                 View::Queue { .. } => self.draw_queue(f, main),
                 View::Files { .. } => self.draw_files(f, main),
+                View::Models { .. } => self.draw_models(f, main),
                 View::Help => draw_help(f, main),
             }
         }
@@ -187,6 +188,7 @@ impl App {
                 Line::from("  v V  select text, then c to comment — comments are sent with your next message"),
                 Line::from("  Enter or gf on a file path (or click it) opens its diff, where v/V/c comment on lines"),
                 Line::from("  Q comment queue    F changed files    Tab expand output    :help    Ctrl-C twice quits"),
+                Line::from("  Shift-Tab thinking (the model name's color)    :model pick a model"),
             ];
             f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
             return;
@@ -439,6 +441,26 @@ impl App {
         f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
     }
 
+    fn draw_models(&self, f: &mut Frame, area: Rect) {
+        let View::Models { sel } = &self.view else { return };
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(" Model ", Style::default().add_modifier(Modifier::BOLD).bg(PANEL)),
+                Span::styled("  Enter use for this session's next turns · q back · :model <id> for any other", dim()),
+            ]),
+            Line::from(""),
+        ];
+        for (i, m) in self.models.iter().enumerate() {
+            let st = if i == *sel { Style::default().bg(SELECTION) } else { Style::default() };
+            let mark = if *m == self.cur.model { "●" } else { " " };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {mark} "), st.fg(effort_color(self.effort))),
+                Span::styled(m.clone(), st),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
     fn draw_files(&self, f: &mut Frame, area: Rect) {
         let View::Files { items, sel, .. } = &self.view else { return };
         let mut lines = vec![
@@ -592,6 +614,7 @@ impl App {
                     View::File(_) => "file",
                     View::Queue { .. } => "comments",
                     View::Files { .. } => "changes",
+                    View::Models { .. } => "models",
                     View::Help => "help",
                 };
                 spans.push(Span::styled(format!(" {view} "), dim()));
@@ -608,17 +631,25 @@ impl App {
             short = format!("{} @ {short}", h.name);
         }
         let length = self.cur.length.as_deref().map_or(String::new(), |l| format!("len {l} · "));
-        let right = format!(
-            "{length}{} · ↑{} ↓{} · {short} ",
-            self.cur.model,
-            compact(u.prompt_tokens),
-            compact(u.completion_tokens)
-        );
-        let used: usize = spans.iter().map(|s| s.width()).sum();
-        let pad = (area.width as usize).saturating_sub(used + right.chars().count());
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(right, dim()));
+        // The model name's color is the thinking effort.
+        let right = [
+            Span::styled(length, dim()),
+            Span::styled(self.cur.model.clone(), Style::default().fg(effort_color(self.effort))),
+            Span::styled(format!(" · ↑{} ↓{} · {short} ", compact(u.prompt_tokens), compact(u.completion_tokens)), dim()),
+        ];
+        let used: usize = spans.iter().chain(&right).map(|s| s.width()).sum();
+        spans.push(Span::raw(" ".repeat((area.width as usize).saturating_sub(used))));
+        spans.extend(right);
         f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+}
+
+fn effort_color(e: Effort) -> Color {
+    match e {
+        Effort::Off => GRAY,
+        Effort::Low => THINK_LOW,
+        Effort::High => THINK_HIGH,
+        Effort::Max => THINK_MAX,
     }
 }
 
@@ -664,6 +695,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         h("Other"),
         l("  Tab or za expands/collapses tool output · Q comment queue (e edit, dd delete, D clear)"),
         l("  Ctrl-Enter (any mode) sends queued comments + prompt text; in a comment it saves, then sends"),
+        l("  Shift-Tab (any mode) cycles thinking: off, low, high, max; the model name turns gray, light blue, blue, purple"),
+        l("  :model lists models (Enter picks one for this session's next turns) · :model <id> names any other"),
         l("  :send · :dropcomments · :q quit · Ctrl-C interrupts / clears / quits (twice)"),
     ];
     f.render_widget(Paragraph::new(text), area);

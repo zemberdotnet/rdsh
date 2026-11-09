@@ -101,10 +101,43 @@ pub struct Completion {
     pub finish_reason: Option<String>,
 }
 
+/// How hard the model thinks before answering. DeepSeek takes `Off` as `thinking: disabled`
+/// and the others as `reasoning_effort`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Off,
+    Low,
+    #[default]
+    High,
+    Max,
+}
+
+impl Effort {
+    pub const ALL: [Effort; 4] = [Effort::Off, Effort::Low, Effort::High, Effort::Max];
+
+    /// The next level, wrapping from `Max` back to `Off`.
+    pub fn next(self) -> Self {
+        Self::ALL[(self as usize + 1) % Self::ALL.len()]
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Effort::Off => "off",
+            Effort::Low => "low",
+            Effort::High => "high",
+            Effort::Max => "max",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Request<'a> {
     pub messages: &'a [Message],
     pub tools: &'a [ToolSpec],
+    pub effort: Effort,
+    /// Model id for this request; `None` uses the provider's own.
+    pub model: Option<&'a str>,
 }
 
 pub type DeltaSink<'a> = &'a (dyn Fn(Delta) + Send + Sync);
@@ -124,7 +157,9 @@ pub trait Provider: Send + Sync {
 /// Converts messages to OpenAI chat-completions JSON.
 ///
 /// Reasoning is echoed back only for assistant messages after the latest user message:
-/// DeepSeek thinking mode requires it during a tool loop and ignores older reasoning.
+/// DeepSeek thinking mode requires it during a tool loop and ignores older reasoning. Those
+/// messages always carry the field, empty when the model skipped thinking, since a tool call
+/// without it in the current turn is rejected.
 pub fn wire_messages(messages: &[Message]) -> Vec<Value> {
     let last_user = messages.iter().rposition(|m| matches!(m, Message::User { .. }));
     messages
@@ -147,10 +182,8 @@ pub fn wire_messages(messages: &[Message]) -> Vec<Value> {
                         })
                         .collect();
                 }
-                if let Some(r) = reasoning
-                    && last_user.is_some_and(|u| i > u)
-                {
-                    v["reasoning_content"] = json!(r);
+                if last_user.is_some_and(|u| i > u) {
+                    v["reasoning_content"] = json!(reasoning.as_deref().unwrap_or(""));
                 }
                 v
             }
@@ -177,6 +210,8 @@ pub fn wire_tools(tools: &[ToolSpec]) -> Vec<Value> {
 pub struct ScriptedProvider {
     responses: Mutex<VecDeque<Message>>,
     requests: Mutex<Vec<Vec<Message>>>,
+    efforts: Mutex<Vec<Effort>>,
+    models: Mutex<Vec<Option<String>>>,
     delay: Option<Duration>,
 }
 
@@ -199,6 +234,16 @@ impl ScriptedProvider {
     pub fn requests(&self) -> Vec<Vec<Message>> {
         self.requests.lock().unwrap().clone()
     }
+
+    /// Thinking effort of every request so far.
+    pub fn efforts(&self) -> Vec<Effort> {
+        self.efforts.lock().unwrap().clone()
+    }
+
+    /// Model override of every request so far.
+    pub fn models(&self) -> Vec<Option<String>> {
+        self.models.lock().unwrap().clone()
+    }
 }
 
 impl Provider for ScriptedProvider {
@@ -209,6 +254,8 @@ impl Provider for ScriptedProvider {
     fn complete<'a>(&'a self, req: Request<'a>, on_delta: DeltaSink<'a>) -> BoxFuture<'a, Result<Completion>> {
         Box::pin(async move {
             self.requests.lock().unwrap().push(req.messages.to_vec());
+            self.efforts.lock().unwrap().push(req.effort);
+            self.models.lock().unwrap().push(req.model.map(str::to_owned));
             if let Some(d) = self.delay {
                 tokio::time::sleep(d).await;
             }
@@ -257,6 +304,22 @@ mod tests {
         assert_eq!(w[3]["reasoning_content"], "r1");
         assert_eq!(w[3]["tool_calls"][0]["function"]["name"], "bash");
         assert_eq!(w[4]["tool_call_id"], "c1");
+    }
+
+    #[test]
+    fn current_turn_messages_always_carry_reasoning() {
+        let msgs = vec![
+            Message::user("u"),
+            Message::assistant("", vec![ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() }]),
+        ];
+        assert_eq!(wire_messages(&msgs)[1]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn effort_cycles_through_every_level() {
+        let seen: Vec<Effort> = std::iter::successors(Some(Effort::Off), |e| Some(e.next())).take(5).collect();
+        assert_eq!(seen, [Effort::Off, Effort::Low, Effort::High, Effort::Max, Effort::Off]);
+        assert_eq!(Effort::default(), Effort::High);
     }
 
     #[test]

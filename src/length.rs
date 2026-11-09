@@ -24,13 +24,13 @@ const QUESTION: &str = "How long should the assistant's reply to the latest user
 const LEVELS: [(&str, &str, &str); 4] = [
     (
         "yesno",
-        "A yes/no question or a request for one fact: does X exist, is Y enabled, what is the value of Z.",
-        "Answer in one line: yes or no, or the single fact asked for, with at most one short sentence of reason.",
+        "A question answered by yes or no alone: does X exist, is Y enabled, do the tests pass.",
+        "Reply with exactly one word, Yes or No, and nothing else.",
     ),
     (
         "brief",
-        "A simple question, or a small clear task whose outcome needs only a short report.",
-        "Reply in a few sentences. No headings, no preamble, no recap.",
+        "A request for one fact (what is the value of Z, which file does Y), a simple question, or a small clear task whose outcome needs only a short report.",
+        "Reply in one to a few sentences. No headings, no preamble, no recap.",
     ),
     (
         "standard",
@@ -155,7 +155,7 @@ mod tests {
         let r = LengthRouter::new(Arc::new(ScriptedDecider::new([pick("yesno", 0.9)])));
         let (routing, note) = r.route(&[], "is the cache on?").await;
         assert_eq!(routing, Routing::Picked { level: "yesno".into(), confidence: 0.9 });
-        assert!(note.unwrap().starts_with("<response_length level=\"yesno\">Answer in one line"));
+        assert!(note.unwrap().starts_with("<response_length level=\"yesno\">Reply with exactly one word, Yes or No"));
     }
 
     #[tokio::test]

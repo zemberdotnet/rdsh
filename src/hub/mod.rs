@@ -22,7 +22,7 @@ pub use proto::{Notice, Request, Snapshot};
 
 use crate::{
     agent::{Agent, AgentEvent, EventSink},
-    llm::{Message, Usage},
+    llm::{Effort, Message, Usage},
     trace,
 };
 
@@ -61,9 +61,16 @@ struct Client {
     subscribed: HashSet<String>,
 }
 
+/// A queued user turn.
+struct Turn {
+    text: String,
+    effort: Effort,
+    model: Option<String>,
+}
+
 /// Hub-side record of one running agent.
 struct Slot {
-    cmd_tx: UnboundedSender<String>,
+    cmd_tx: UnboundedSender<Turn>,
     cancel: Option<CancellationToken>,
     model: String,
     cwd: String,
@@ -183,8 +190,8 @@ impl Hub {
                 }
                 self.subscribe(client, &id);
             }
-            Request::Send { session_id, text } => {
-                let sent = self.state().sessions.get(&session_id).map(|s| s.cmd_tx.send(text).is_ok());
+            Request::Send { session_id, text, effort, model } => {
+                let sent = self.state().sessions.get(&session_id).map(|s| s.cmd_tx.send(Turn { text, effort, model }).is_ok());
                 match sent {
                     Some(true) => {}
                     Some(false) => self.error(client, Some(session_id), "the session's agent has stopped".into()),
@@ -288,7 +295,7 @@ impl Hub {
     /// @returns the session id.
     fn spawn(&self, mut agent: Agent) -> String {
         let id = agent.session_id().unwrap_or("unsaved").to_owned();
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Turn>();
         self.state().sessions.insert(
             id.clone(),
             Slot {
@@ -305,7 +312,11 @@ impl Hub {
         let hub = self.clone();
         let sid = id.clone();
         tokio::spawn(async move {
-            while let Some(text) = cmd_rx.recv().await {
+            while let Some(Turn { text, effort, model }) = cmd_rx.recv().await {
+                agent.effort = effort;
+                if model.is_some() {
+                    agent.model = model;
+                }
                 let cancel = CancellationToken::new();
                 hub.turn_boundary(&sid, &agent, Some(cancel.clone()));
                 let (h, s) = (hub.clone(), sid.clone());
@@ -327,6 +338,7 @@ impl Hub {
                 slot.running = cancel.is_some();
                 slot.cancel = cancel;
                 slot.usage = agent.usage;
+                slot.model = agent.model().to_owned();
             }
         }
         self.broadcast_sessions();

@@ -18,12 +18,12 @@ cargo build --release
 ./target/release/rdsh trace last # readable trace (subagent traces are <id>-subN)
 ```
 
-Without direnv, use `nix develop`. `DEEPSEEK_API_KEY` (environment or `.env`) overrides the stored login; `rdsh logout` removes it. Options: `-m/--model` (default `deepseek-chat`, env `RDSH_MODEL`), `-C/--cwd`, `-r/--resume`. `DEEPSEEK_BASE_URL` points at any OpenAI-compatible endpoint. rdsh also reads `.env` in its working directory.
+Without direnv, use `nix develop`. `DEEPSEEK_API_KEY` (environment or `.env`) overrides the stored login; `rdsh logout` removes it. Options: `-m/--model` (default `deepseek-flash`, env `RDSH_MODEL`), `-C/--cwd`, `-r/--resume`. `DEEPSEEK_BASE_URL` points at any OpenAI-compatible endpoint. rdsh also reads `.env` in its working directory.
 
 Optional `~/.config/rdsh/config.json` (all keys optional):
 
 ```json
-{ "model": "deepseek-chat", "max_steps": 100, "subagent_max_steps": 50,
+{ "model": "deepseek-flash", "models": ["deepseek-flash", "deepseek-v4-pro"], "effort": "high", "max_steps": 200, "subagent_max_steps": 50,
   "max_tool_output_chars": 30000, "bash_timeout_secs": 120, "max_retries": 3,
   "stream_idle_timeout_secs": 180, "sessions_dir": "/path/to/sessions",
   "length_routing": true, "decision_url": null, "decision_model": null, "decision_timeout_ms": 2500 }
@@ -49,12 +49,14 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | `v` / `V` | charwise / linewise select; `o` swaps ends, `y` yanks via OSC 52 |
 | `c` (or Enter in visual) | comment on the selection (or the current line) |
 | Ctrl-Enter (any mode) | send queued comments plus any prompt text; inside a comment, save it then send |
+| Shift-Tab (any mode) | cycle thinking effort: off, low, high, max. The model name in the status line shows it: gray, light blue, blue, deep purple |
 | Enter / `gf` / mouse click on a path | open the file's diff view |
 | Tab / `za` | expand or collapse tool output and reasoning |
 | `Q` | comment queue (`e` edit, `dd` delete, `D` clear) |
 | `F` | list changed files (`git status`) |
 | `S`, `Ctrl-w h` / `Ctrl-w l` | show or hide the session rail; move focus into it and back (`j k g G`, Enter switches to the session, resuming it if needed; subagent rows open read-only; `y` copies the id) |
 | `:new`, `:q`, `:q!` | start another session; quit (refuses while other sessions run), quit and stop them |
+| `:model`, `:model <id>` | pick this session's model from a list (`models` in the config; Enter picks, `q` backs out), or name any id; it applies from the next turn and a resumed session keeps it |
 | `:e path[:line]`, `:send`, `:help`, `:q` | commands |
 | Ctrl-C | interrupt the turn, clear input, or quit (press twice) |
 

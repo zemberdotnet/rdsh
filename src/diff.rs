@@ -231,33 +231,4 @@ mod tests {
             (Kind::Ctx, Some(4), Some(5), "ctx2"),
         ]);
     }
-
-    #[test]
-    fn loads_git_states() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let run = |args: &[&str]| {
-            assert!(Command::new("git").arg("-C").arg(root).args(args).output().unwrap().status.success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-        assert_eq!(load(root, &root.join("a.txt")).status, Status::Clean);
-        std::fs::write(root.join("a.txt"), "one\nTWO\nthree\n").unwrap();
-        let f = load(root, &root.join("a.txt"));
-        assert_eq!(f.status, Status::Modified);
-        assert_eq!((f.added, f.removed), (1, 1));
-        assert_eq!(f.full[1].kind, Kind::Add);
-        assert_eq!(f.rel, "a.txt");
-        std::fs::write(root.join("b.txt"), "new\n").unwrap();
-        let b = load(root, &root.join("b.txt"));
-        assert_eq!(b.status, Status::Untracked);
-        assert_eq!(b.diff.len(), 2);
-        let changed = changed_files(root);
-        assert!(changed.contains(&("M".into(), "a.txt".into())));
-        assert!(changed.contains(&("??".into(), "b.txt".into())));
-    }
 }

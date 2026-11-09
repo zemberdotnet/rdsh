@@ -35,3 +35,8 @@ pub const BLUE: Color = hex(0x83a598);
 pub const PURPLE: Color = hex(0xd3869b);
 pub const AQUA: Color = hex(0x8ec07c);
 pub const ORANGE: Color = hex(0xfe8019);
+
+/// The model name's color per thinking effort: gray (off) through blue to deep purple (max).
+pub const THINK_LOW: Color = hex(0x8fc1e3);
+pub const THINK_HIGH: Color = hex(0x4f86d9);
+pub const THINK_MAX: Color = hex(0x8c5ad8);

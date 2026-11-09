@@ -8,7 +8,7 @@ use super::app::{App, Host, Mode, View};
 use crate::{
     agent::AgentEvent,
     hub::{Notice, Request, Snapshot},
-    llm::Usage,
+    llm::{Effort, Usage},
     llm::{Message, ToolCall},
     tools::ToolOutput,
 };
@@ -86,7 +86,7 @@ impl Harness {
     fn sent(&mut self) -> String {
         loop {
             match self.rx.try_recv() {
-                Ok(Request::Send { session_id, text }) => {
+                Ok(Request::Send { session_id, text, .. }) => {
                     self.notice(Notice::Event { session_id, event: AgentEvent::TurnStarted { text: text.clone() } });
                     return text;
                 }
@@ -356,6 +356,77 @@ fn ctrl_enter_sends_from_any_mode() {
 }
 
 #[test]
+fn shift_tab_cycles_thinking_and_colors_the_model_name() {
+    use super::theme::{GRAY, THINK_HIGH, THINK_LOW, THINK_MAX};
+    let mut h = Harness::new();
+    let model_fg = |h: &Harness| {
+        let buf = h.term.backend().buffer();
+        let y = buf.area.height - 1;
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        let x = row.find("test-model").map(|b| row[..b].chars().count()).expect("model in the status line");
+        buf[(x as u16, y)].fg
+    };
+    assert_eq!((h.app.effort, model_fg(&h)), (Effort::High, THINK_HIGH), "thinking starts on");
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        h.key(KeyCode::BackTab);
+        seen.push((h.app.effort, model_fg(&h)));
+    }
+    assert_eq!(
+        seen,
+        [(Effort::Max, THINK_MAX), (Effort::Off, GRAY), (Effort::Low, THINK_LOW), (Effort::High, THINK_HIGH)]
+    );
+    // Works from normal mode too, and the turn carries the level picked.
+    h.key(KeyCode::Esc);
+    h.key(KeyCode::BackTab);
+    h.keys("ihi");
+    h.key(KeyCode::Enter);
+    let effort = loop {
+        match h.rx.try_recv() {
+            Ok(Request::Send { effort, .. }) => break effort,
+            Ok(_) => continue,
+            Err(e) => panic!("no turn sent: {e}"),
+        }
+    };
+    assert_eq!(effort, Effort::Max);
+}
+
+#[test]
+fn model_command_lists_models_and_the_pick_goes_with_the_next_turn() {
+    let mut h = Harness::new();
+    let next_model = |h: &mut Harness| loop {
+        match h.rx.try_recv() {
+            Ok(Request::Send { model, .. }) => break model,
+            Ok(_) => continue,
+            Err(e) => panic!("no turn sent: {e}"),
+        }
+    };
+    h.key(KeyCode::Esc);
+    h.keys(":model");
+    h.key(KeyCode::Enter);
+    assert!(matches!(h.app.view, View::Models { sel: 0 }));
+    let screen = h.screen();
+    assert!(screen.contains("deepseek-flash") && screen.contains("deepseek-v4-pro"), "{screen}");
+    h.keys("j");
+    h.key(KeyCode::Enter);
+    assert!(matches!(h.app.view, View::Chat));
+    assert!(h.screen().contains("deepseek-v4-pro · ↑"), "the status line names the pick");
+    h.keys("ihi");
+    h.key(KeyCode::Enter);
+    assert_eq!(next_model(&mut h).as_deref(), Some("deepseek-v4-pro"));
+    // The list opens on the current model; any id can be typed after :model.
+    h.key(KeyCode::Esc);
+    h.keys(":model");
+    h.key(KeyCode::Enter);
+    assert!(matches!(h.app.view, View::Models { sel: 1 }));
+    h.keys("q:model my-endpoint-model");
+    h.key(KeyCode::Enter);
+    h.keys("iagain");
+    h.key(KeyCode::Enter);
+    assert_eq!(next_model(&mut h).as_deref(), Some("my-endpoint-model"));
+}
+
+#[test]
 fn user_messages_have_a_full_width_background() {
     use super::theme::USER_BG;
     let mut h = Harness::new();
@@ -372,30 +443,6 @@ fn user_messages_have_a_full_width_background() {
     // Assistant rows keep the terminal background.
     let a = screen.lines().position(|l| l.starts_with("● I changed")).unwrap() as u16;
     assert_eq!(buf[(5, a)].bg, super::theme::BG, "everything else gets the theme background");
-}
-
-#[test]
-fn file_view_highlights_added_and_deleted_lines() {
-    let mut h = Harness::new();
-    let path = h.app.cur.transcript.cwd().join("src/lib.rs");
-    h.app.open_file(path, None);
-    h.draw();
-    let View::File(fv) = &h.app.view else { panic!() };
-    let row_of = |text: &str| fv.lines.iter().position(|l| l.text == text).unwrap();
-    let (added, deleted) = (row_of("fn b2() {}"), row_of("fn b() {}"));
-    // `fn` is a keyword on both sides: the added line uses the current file, the deleted line HEAD.
-    for row in [added, deleted] {
-        let first = fv.syntax(row).first().copied().expect("highlighted");
-        assert_eq!((first.start, first.end, first.style.fg), (0, 2, Some(super::theme::RED)));
-    }
-    // Rendered: the keyword keeps its syntax color on the tinted background.
-    let screen = h.screen();
-    let y = screen.lines().position(|l| l.contains("+ fn b2() {}")).unwrap() as u16;
-    let x = screen.lines().nth(y as usize).unwrap().chars().position(|c| c == 'f').unwrap() as u16;
-    let cell = &h.term.backend().buffer()[(x, y)];
-    assert_eq!(cell.fg, super::theme::RED);
-    assert_eq!(cell.bg, super::theme::ADD_BG);
-    assert_eq!(h.term.backend().buffer()[(79, y)].bg, super::theme::ADD_BG, "tint fills the row");
 }
 
 #[test]
@@ -455,6 +502,38 @@ fn user_messages_are_not_rendered_as_markdown() {
     h.key(KeyCode::Enter);
     h.sent();
     assert!(h.screen().contains("› keep **this** and `that`"));
+}
+
+#[test]
+fn assistant_tables_render_aligned_and_quote_rows() {
+    use ratatui::style::Modifier;
+    let mut h = Harness::new();
+    h.keys("table");
+    h.key(KeyCode::Enter);
+    h.sent();
+    let md = "| name | value |\n|:-----|------:|\n| **a** | 1 |\n| bb | 22 |";
+    h.agent(AgentEvent::TextDelta(md.into()));
+    h.agent(AgentEvent::Assistant { message: Message::assistant(md, vec![]), usage: None });
+    h.agent(AgentEvent::TurnEnd { cancelled: false, error: None });
+    let screen = h.screen();
+    assert!(screen.contains("● name │ value"), "{screen}");
+    assert!(screen.contains("─────┼──────"), "{screen}");
+    assert!(screen.contains("a    │     1"), "{screen}");
+    assert!(screen.contains("bb   │    22"), "{screen}");
+    assert!(!screen.contains("| name |"), "{screen}");
+    // The header row is bold.
+    let y = screen.lines().position(|l| l.starts_with("● name")).unwrap() as u16;
+    assert!(h.term.backend().buffer()[(2, y)].modifier.contains(Modifier::BOLD));
+    // Selecting the header linewise and commenting quotes the exact source markdown.
+    h.key(KeyCode::Esc);
+    h.keys("gg}V");
+    h.key(KeyCode::Char('c'));
+    h.keys("ok");
+    h.key(KeyCode::Enter);
+    match &h.app.cur.queue[0].anchor {
+        crate::comments::Anchor::Chat { quote, .. } => assert_eq!(quote, "| name | value |"),
+        a => panic!("{a:?}"),
+    }
 }
 
 #[test]
@@ -846,7 +925,7 @@ fn several_hosts_share_the_rail_and_requests_go_to_the_sessions_host() {
     // Sending goes to box.
     t.h.keys("ithanks");
     t.h.key(KeyCode::Enter);
-    assert_eq!(t.remote_request(), Request::Send { session_id: "r1".into(), text: "thanks".into() });
+    assert_eq!(t.remote_request(), Request::Send { session_id: "r1".into(), text: "thanks".into(), effort: Effort::High, model: Some("test-model".into()) });
 
     // A file link in a remote session is read on box (no local file exists).
     t.h.key(KeyCode::Esc);

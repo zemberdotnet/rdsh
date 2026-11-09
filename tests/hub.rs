@@ -10,7 +10,7 @@ use std::{
 use rdsh::{
     agent::{Agent, AgentEvent, AgentOptions},
     hub::{Factory, Hub, Notice, OpenKind, Request},
-    llm::{Message, Provider, ScriptedProvider},
+    llm::{Effort, Message, Provider, ScriptedProvider},
     tools, trace,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -92,7 +92,7 @@ async fn two_clients_see_the_same_session_and_a_late_joiner_misses_nothing() {
             .with_delay(Duration::from_millis(200)),
     );
     let builds = Arc::new(AtomicUsize::new(0));
-    let hub = hub(provider, dir.path().to_path_buf(), builds.clone());
+    let hub = hub(provider.clone(), dir.path().to_path_buf(), builds.clone());
     let (a_tx, mut a_rx) = hub.connect();
     let (b_tx, mut b_rx) = hub.connect();
 
@@ -102,7 +102,7 @@ async fn two_clients_see_the_same_session_and_a_late_joiner_misses_nothing() {
     assert_eq!(id, "s1");
 
     // A starts a turn; B joins while the model is still thinking.
-    a_tx.send(Request::Send { session_id: id.clone(), text: "hello".into() }).unwrap();
+    a_tx.send(Request::Send { session_id: id.clone(), text: "hello".into(), effort: Effort::Low, model: None }).unwrap();
     let Notice::Event { event: AgentEvent::TurnStarted { .. }, .. } = next_non_list(&mut a_rx).await else { panic!() };
     b_tx.send(Request::Open { session_id: id.clone() }).unwrap();
     let Notice::Opened { snapshot: late } = next_non_list(&mut b_rx).await else { panic!() };
@@ -120,12 +120,14 @@ async fn two_clients_see_the_same_session_and_a_late_joiner_misses_nothing() {
     assert!(b_all.iter().any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "first answer")));
 
     // Either client can drive the session; both see the turn.
-    b_tx.send(Request::Send { session_id: id.clone(), text: "again".into() }).unwrap();
+    b_tx.send(Request::Send { session_id: id.clone(), text: "again".into(), effort: Effort::Off, model: None }).unwrap();
     let a2 = turn_events(&mut a_rx).await;
     let b2 = turn_events(&mut b_rx).await;
     assert_eq!(kinds(&a2), kinds(&b2));
     assert!(matches!(&a2[0], AgentEvent::TurnStarted { text } if text == "again"));
     assert_eq!(builds.load(Ordering::SeqCst), 1, "joining does not build a second agent");
+    assert_eq!(provider.efforts(), [Effort::Low, Effort::Off], "each turn thinks as its sender asked");
+    assert_eq!(provider.models(), [None, None]);
 }
 
 #[tokio::test]
@@ -143,7 +145,7 @@ async fn sessions_keep_running_without_viewers_and_resume_on_open() {
     let id = snapshot.session_id;
     // Stop watching, then send: the turn still runs.
     tx.send(Request::Close { session_id: id.clone() }).unwrap();
-    tx.send(Request::Send { session_id: id.clone(), text: "work".into() }).unwrap();
+    tx.send(Request::Send { session_id: id.clone(), text: "work".into(), effort: Effort::High, model: None }).unwrap();
     // Wait until the hub reports the session idle again.
     let mut saw_running = false;
     loop {
@@ -167,10 +169,52 @@ async fn sessions_keep_running_without_viewers_and_resume_on_open() {
     let Notice::Opened { snapshot } = next_non_list(&mut rx2).await else { panic!() };
     assert_eq!(snapshot.session_id, id);
     assert!(!snapshot.history.is_empty());
-    tx2.send(Request::Send { session_id: id.clone(), text: "continue".into() }).unwrap();
+    tx2.send(Request::Send { session_id: id.clone(), text: "continue".into(), effort: Effort::High, model: None }).unwrap();
     let evs = turn_events(&mut rx2).await;
     assert!(evs.iter().any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "resumed answer")));
     assert_eq!(builds.load(Ordering::SeqCst), 2, "one New, one Resume");
+}
+
+#[tokio::test]
+async fn a_model_picked_for_a_turn_sticks_and_is_traced() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        Message::assistant("one", vec![]),
+        Message::assistant("two", vec![]),
+        Message::assistant("three", vec![]),
+    ]));
+    let hub = hub(provider.clone(), dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0)));
+    let (tx, mut rx) = hub.connect();
+    tx.send(Request::New { cwd: None }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
+    let id = snapshot.session_id;
+    assert_eq!(snapshot.model, "scripted");
+    let send = |text: &str, model: Option<&str>| {
+        let model = model.map(str::to_owned);
+        tx.send(Request::Send { session_id: id.clone(), text: text.into(), effort: Effort::High, model }).unwrap();
+    };
+    send("a", None);
+    turn_events(&mut rx).await;
+    send("b", Some("pro"));
+    turn_events(&mut rx).await;
+    // A turn that names no model keeps the one picked last.
+    send("c", None);
+    turn_events(&mut rx).await;
+    assert_eq!(provider.models(), [None, Some("pro".into()), Some("pro".into())]);
+    tx.send(Request::Open { session_id: id.clone() }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
+    assert_eq!(snapshot.model, "pro");
+    let loaded = trace::load(&dir.path().join(format!("{id}.jsonl"))).unwrap();
+    let turns: Vec<String> = loaded
+        .records
+        .iter()
+        .filter_map(|r| match &r.event {
+            trace::TraceEvent::Turn { model, .. } => Some(model.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(turns, ["scripted", "pro", "pro"]);
+    assert_eq!(loaded.turn_model.as_deref(), Some("pro"));
 }
 
 #[tokio::test]
@@ -182,7 +226,7 @@ async fn cancel_read_trace_and_errors() {
     tx.send(Request::New { cwd: None }).unwrap();
     let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
     let id = snapshot.session_id;
-    tx.send(Request::Send { session_id: id.clone(), text: "x".into() }).unwrap();
+    tx.send(Request::Send { session_id: id.clone(), text: "x".into(), effort: Effort::High, model: None }).unwrap();
     let Notice::Event { event: AgentEvent::TurnStarted { .. }, .. } = next_non_list(&mut rx).await else { panic!() };
     tx.send(Request::Cancel { session_id: id.clone() }).unwrap();
     let evs = turn_events(&mut rx).await;
@@ -194,7 +238,7 @@ async fn cancel_read_trace_and_errors() {
 
     tx.send(Request::Open { session_id: "nope".into() }).unwrap();
     assert!(matches!(next_non_list(&mut rx).await, Notice::Error { .. }));
-    tx.send(Request::Send { session_id: "nope".into(), text: "x".into() }).unwrap();
+    tx.send(Request::Send { session_id: "nope".into(), text: "x".into(), effort: Effort::High, model: None }).unwrap();
     assert!(matches!(next_non_list(&mut rx).await, Notice::Error { .. }));
 }
 
@@ -214,7 +258,10 @@ fn protocol_messages_roundtrip_as_json() {
     let text = serde_json::to_string(&n).unwrap();
     let back: Notice = serde_json::from_str(&text).unwrap();
     assert_eq!(serde_json::to_string(&back).unwrap(), text);
-    let r = Request::Send { session_id: "s1".into(), text: "hi".into() };
+    let r = Request::Send { session_id: "s1".into(), text: "hi".into(), effort: Effort::High, model: None };
     assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&r).unwrap()).unwrap(), r);
+    // Clients from before thinking effort existed get the default.
+    let old: Request = serde_json::from_str(r#"{"type":"send","session_id":"s1","text":"hi"}"#).unwrap();
+    assert_eq!(old, Request::Send { session_id: "s1".into(), text: "hi".into(), effort: Effort::High, model: None });
     assert!(text.contains(r#""type":"event""#));
 }

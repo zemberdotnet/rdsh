@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::Config,
-    llm::{BoxFuture, Completion, Delta, DeltaSink, Message, Provider, Request, ToolCall, Usage, wire_messages, wire_tools},
+    llm::{BoxFuture, Completion, Delta, DeltaSink, Effort, Message, Provider, Request, ToolCall, Usage, wire_messages, wire_tools},
 };
 
 pub struct DeepSeek {
@@ -73,7 +73,7 @@ impl Provider for DeepSeek {
     fn complete<'a>(&'a self, req: Request<'a>, on_delta: DeltaSink<'a>) -> BoxFuture<'a, Result<Completion>> {
         Box::pin(async move {
             let mut body = json!({
-                "model": self.model,
+                "model": req.model.unwrap_or(&self.model),
                 "messages": wire_messages(req.messages),
                 "stream": true,
                 "stream_options": {"include_usage": true},
@@ -81,6 +81,7 @@ impl Provider for DeepSeek {
             if !req.tools.is_empty() {
                 body["tools"] = Value::Array(wire_tools(req.tools));
             }
+            apply_effort(&mut body, req.effort);
             let resp = self.send(&body).await?;
             let mut stream = resp.bytes_stream();
             let mut acc = SseAccumulator::default();
@@ -98,6 +99,16 @@ impl Provider for DeepSeek {
             }
             acc.finish()
         })
+    }
+}
+
+/// Sets DeepSeek's thinking switch and, when thinking, its effort.
+fn apply_effort(body: &mut Value, effort: Effort) {
+    if effort == Effort::Off {
+        body["thinking"] = json!({"type": "disabled"});
+    } else {
+        body["thinking"] = json!({"type": "enabled"});
+        body["reasoning_effort"] = json!(effort.name());
     }
 }
 
@@ -231,6 +242,17 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn effort_sets_the_thinking_switch() {
+        let body = |e| {
+            let mut b = json!({});
+            apply_effort(&mut b, e);
+            b
+        };
+        assert_eq!(body(Effort::Off), json!({"thinking": {"type": "disabled"}}));
+        assert_eq!(body(Effort::Max), json!({"thinking": {"type": "enabled"}, "reasoning_effort": "max"}));
+    }
 
     #[test]
     fn accumulates_text_reasoning_tool_calls_and_usage() {

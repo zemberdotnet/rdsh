@@ -12,13 +12,17 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::decision::KeySource;
+use crate::{decision::KeySource, llm::Effort};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Model id sent to the API (`RDSH_MODEL` overrides).
     pub model: String,
+    /// Models offered by `:model`; any other id can still be typed after it.
+    pub models: Vec<String>,
+    /// Thinking effort new turns start with (`off`, `low`, `high`, `max`); Shift-Tab cycles it.
+    pub effort: Effort,
     /// OpenAI-compatible base URL (`DEEPSEEK_BASE_URL` overrides).
     pub base_url: String,
     /// Maximum model requests per user turn in the main agent.
@@ -94,9 +98,11 @@ impl HostConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: "deepseek-chat".into(),
+            model: "deepseek-flash".into(),
+            models: vec!["deepseek-flash".into(), "deepseek-v4-pro".into()],
+            effort: Effort::High,
             base_url: "https://api.deepseek.com".into(),
-            max_steps: 100,
+            max_steps: 200,
             subagent_max_steps: 50,
             max_tool_output_chars: 30_000,
             bash_timeout_secs: 120,

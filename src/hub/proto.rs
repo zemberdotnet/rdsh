@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agent::AgentEvent,
     diff::FileDiff,
-    llm::{Message, Usage},
+    llm::{Effort, Message, Usage},
     trace::SessionInfo,
 };
 
@@ -27,8 +27,16 @@ pub enum Request {
     /// Attach to a session (id, unique prefix, or `last`), resuming it from its trace when no
     /// agent runs it yet; answered with `Opened`.
     Open { session_id: String },
-    /// Queue a user turn. Turns run one at a time in arrival order.
-    Send { session_id: String, text: String },
+    /// Queue a user turn. Turns run one at a time in arrival order, each with its own thinking
+    /// effort (`high` from clients that do not send one) and model (`None` keeps the session's).
+    Send {
+        session_id: String,
+        text: String,
+        #[serde(default)]
+        effort: Effort,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
     /// Interrupt the running turn.
     Cancel { session_id: String },
     /// Stop receiving events for a session. Its agent keeps running.

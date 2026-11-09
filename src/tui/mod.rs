@@ -28,7 +28,10 @@ use crossterm::{
 use futures_util::StreamExt;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::hub::{Notice, Request};
+use crate::{
+    hub::{Notice, Request},
+    llm::Effort,
+};
 use app::{App, Host};
 
 /// One hub connection for the TUI.
@@ -47,7 +50,9 @@ pub struct HostLink {
 /// @param links hub connections; the first one shows the startup session.
 /// @param cwd working directory used for local file links and to filter the local rail.
 /// @param first `Request::New` or `Request::Open` for the first host.
-pub async fn run(links: Vec<HostLink>, cwd: PathBuf, first: Request) -> Result<()> {
+/// @param effort thinking effort turns start with.
+/// @param models ids `:model` lists.
+pub async fn run(links: Vec<HostLink>, cwd: PathBuf, first: Request, effort: Effort, models: Vec<String>) -> Result<()> {
     // One stream for all hosts; `None` marks a host whose connection ended.
     let (merged_tx, mut notices) = mpsc::unbounded_channel::<(usize, Option<Notice>)>();
     let mut hosts = Vec::new();
@@ -70,6 +75,8 @@ pub async fn run(links: Vec<HostLink>, cwd: PathBuf, first: Request) -> Result<(
         hosts.push(Host::new(link.name, link.local, link.dir, link.req_tx));
     }
     let mut app = App::new(cwd, hosts);
+    app.effort = effort;
+    app.models = models;
     app.sidebar_open = true;
     app.expect_open(0);
 

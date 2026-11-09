@@ -13,7 +13,7 @@ use std::{
 use rdsh::{
     agent::{Agent, AgentEvent, AgentOptions},
     hub::{Factory, Hub, Notice, OpenKind, Request, net},
-    llm::{Message, Provider, ScriptedProvider},
+    llm::{Effort, Message, Provider, ScriptedProvider},
     tools, trace,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -66,7 +66,7 @@ async fn wait_for_socket(socket: &Path) {
 }
 
 async fn run_turn(tx: &tokio::sync::mpsc::UnboundedSender<Request>, rx: &mut UnboundedReceiver<Notice>, id: &str, text: &str) -> Vec<AgentEvent> {
-    tx.send(Request::Send { session_id: id.into(), text: text.into() }).unwrap();
+    tx.send(Request::Send { session_id: id.into(), text: text.into(), effort: Effort::High, model: None }).unwrap();
     let mut out = Vec::new();
     loop {
         if let Notice::Event { event, .. } = next(rx).await {
@@ -203,7 +203,7 @@ async fn rdsh_starts_its_hub_on_demand_and_it_stops_when_idle() {
     let (tx, mut rx) = net::connect_socket(&socket).await.unwrap();
     tx.send(Request::New { cwd: Some(dir.path().display().to_string()) }).unwrap();
     let Notice::Opened { snapshot } = next(&mut rx).await else { panic!() };
-    assert_eq!(snapshot.model, "deepseek-chat");
+    assert_eq!(snapshot.model, "deepseek-flash");
     // Already running: a second call does not start another.
     net::ensure_server(&socket, &exe).await.unwrap();
     drop(tx);

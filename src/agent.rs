@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     length::{LengthRouter, Routing},
     title::{self, Titler},
-    llm::{Delta, Message, Provider, Request, ToolCall, ToolSpec, Usage},
+    llm::{Delta, Effort, Message, Provider, Request, ToolCall, ToolSpec, Usage},
     prompt,
     tools::{Registry, ToolCtx, ToolOutput},
     trace::{Trace, TraceEvent},
@@ -73,6 +73,10 @@ pub struct Agent {
     specs: Vec<ToolSpec>,
     history: Vec<Message>,
     pub usage: Usage,
+    /// Thinking effort for the next turn's requests; subagents it starts inherit it.
+    pub effort: Effort,
+    /// Model for the next turn's requests instead of the provider's; subagents inherit it.
+    pub model: Option<String>,
     trace_failed: Option<String>,
 }
 
@@ -139,7 +143,7 @@ impl Agent {
 
     fn bare(opts: AgentOptions, history: Vec<Message>) -> Self {
         let specs = opts.tools.specs();
-        Self { opts, specs, history, usage: Usage::default(), trace_failed: None }
+        Self { opts, specs, history, usage: Usage::default(), effort: Effort::default(), model: None, trace_failed: None }
     }
 
     pub fn history(&self) -> &[Message] {
@@ -156,7 +160,7 @@ impl Agent {
     }
 
     pub fn model(&self) -> &str {
-        self.opts.provider.model()
+        self.model.as_deref().unwrap_or_else(|| self.opts.provider.model())
     }
 
     fn log(&mut self, event: TraceEvent) {
@@ -203,6 +207,7 @@ impl Agent {
     /// @returns the final assistant text and how the turn ended.
     pub async fn run_turn(&mut self, input: String, sink: EventSink, cancel: CancellationToken) -> TurnOutcome {
         sink(AgentEvent::TurnStarted { text: input.clone() });
+        self.log(TraceEvent::Turn { model: self.model().to_owned(), effort: self.effort });
         self.name_session(&input, &sink);
         let context = prompt::runtime_context(&self.opts.cwd);
         let latest = self.history.iter().rev().find_map(|m| match m {
@@ -246,7 +251,7 @@ impl Agent {
                     Delta::ToolCall { name } => AgentEvent::ToolCallStreaming { name },
                 })
             };
-            let req = Request { messages: &self.history, tools: &self.specs };
+            let req = Request { messages: &self.history, tools: &self.specs, effort: self.effort, model: self.model.as_deref() };
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => None,
@@ -321,6 +326,8 @@ impl Agent {
                         sink: sink.clone(),
                         call_id: call.id.clone(),
                         bash_timeout: self.opts.bash_timeout,
+                        effort: self.effort,
+                        model: self.model.clone(),
                     };
                     tokio::select! {
                         biased;

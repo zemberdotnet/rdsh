@@ -33,17 +33,20 @@ pub enum Start<'a> {
 /// @returns the agent; its history already holds any resumed messages.
 pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start<'_>) -> Result<Agent> {
     let dir = cfg.sessions_dir();
-    let (session_id, trace, history) = match start {
+    let (session_id, trace, history, turn_model) = match start {
         Start::New => {
             let id = new_session_id();
             let t = Trace::create(&dir, &id, provider.model(), cwd, None)?;
-            (id, t, None)
+            (id, t, None, None)
         }
         Start::Resume(query) => {
             let path = trace::find_session(&dir, query)?;
             let loaded = trace::load(&path).with_context(|| format!("loading session {}", path.display()))?;
             let t = Trace::open_append(&path, &loaded.session_id)?;
-            (loaded.session_id, t, Some(loaded.messages))
+            // Only a model switched to mid-session (`:model`) outlives the run; otherwise the
+            // session follows the configured model.
+            let switched = loaded.turn_model.filter(|m| *m != loaded.model);
+            (loaded.session_id, t, Some(loaded.messages), switched)
         }
     };
     let bash_timeout = Duration::from_secs(cfg.bash_timeout_secs);
@@ -76,8 +79,10 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
         length,
         titler: cfg.session_titles.then(|| Arc::new(Titler::new(provider_for_titles.clone()))),
     };
-    Ok(match history {
+    let mut agent = match history {
         Some(h) => Agent::resume(opts, h),
         None => Agent::new(opts),
-    })
+    };
+    agent.model = turn_model;
+    Ok(agent)
 }

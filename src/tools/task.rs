@@ -98,12 +98,13 @@ impl Tool for Task {
             let title = opt_str(&args, "description").unwrap_or_else(|| "subagent".into());
             let next_id = || format!("{}-sub{}", self.parent_session, self.counter.fetch_add(1, Ordering::Relaxed) + 1);
             let mut child_id = next_id();
+            let model = ctx.model.as_deref().unwrap_or(self.provider.model());
             let trace = match &self.trace_dir {
                 Some(dir) => {
                     // Another process (or an older run) may already own the next id; skip past it.
                     let mut attempt = 0;
                     loop {
-                        match Trace::create(dir, &child_id, self.provider.model(), &ctx.cwd, Some(&self.parent_session)) {
+                        match Trace::create(dir, &child_id, model, &ctx.cwd, Some(&self.parent_session)) {
                             Ok(t) => break Some(t),
                             Err(_) if attempt < 100 && dir.join(format!("{child_id}.jsonl")).exists() => {
                                 attempt += 1;
@@ -128,6 +129,8 @@ impl Tool for Task {
                 length: None,
                 titler: None,
             });
+            agent.effort = ctx.effort;
+            agent.model = ctx.model.clone();
             let parent = ctx.sink.clone();
             let call_id = ctx.call_id.clone();
             let sink: EventSink = Arc::new(move |event| {

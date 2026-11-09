@@ -15,12 +15,12 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    llm::{Message, Usage},
+    llm::{Effort, Message, Usage},
     util::now_ms,
 };
 
 /// Trace format version written in `session_start`.
-pub const TRACE_FORMAT: u32 = 1;
+pub const TRACE_FORMAT: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -40,6 +40,11 @@ pub enum TraceEvent {
         call_id: String,
         is_error: bool,
         duration_ms: u64,
+    },
+    /// A user turn began with this model and thinking effort (format 2).
+    Turn {
+        model: String,
+        effort: Effort,
     },
     Usage {
         usage: Usage,
@@ -106,6 +111,8 @@ impl Trace {
 pub struct Loaded {
     pub session_id: String,
     pub model: String,
+    /// Model of the latest turn, when the trace records turns (format 2).
+    pub turn_model: Option<String>,
     pub cwd: String,
     pub parent: Option<String>,
     pub messages: Vec<Message>,
@@ -144,7 +151,11 @@ pub fn load(path: &Path) -> Result<Loaded> {
             _ => None,
         })
         .collect();
-    Ok(Loaded { session_id, model, cwd, parent, messages, records })
+    let turn_model = records.iter().rev().find_map(|r| match &r.event {
+        TraceEvent::Turn { model, .. } => Some(model.clone()),
+        _ => None,
+    });
+    Ok(Loaded { session_id, model, turn_model, cwd, parent, messages, records })
 }
 
 /// Summary row for `rdsh sessions`.
@@ -223,6 +234,18 @@ pub fn find_session(dir: &Path, query: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_latest_turn_names_the_model_to_resume_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = Trace::create(dir.path(), "s1", "m", Path::new("/w"), None).unwrap();
+        assert_eq!(load(&t.path).unwrap().turn_model, None);
+        for m in ["m", "pro"] {
+            t.record(TraceEvent::Turn { model: m.into(), effort: Effort::High }).unwrap();
+        }
+        let l = load(&t.path).unwrap();
+        assert_eq!((l.model.as_str(), l.turn_model.as_deref()), ("m", Some("pro")));
+    }
 
     #[test]
     fn roundtrip_and_torn_tail() {

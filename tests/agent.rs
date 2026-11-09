@@ -5,7 +5,7 @@ use std::{
 
 use rdsh::{
     agent::{Agent, AgentEvent, AgentOptions, EventSink},
-    llm::{Message, Provider, ScriptedProvider, ToolCall},
+    llm::{Effort, Message, Provider, ScriptedProvider, ToolCall},
     tools::{self, task::Task},
     trace,
 };
@@ -264,10 +264,12 @@ async fn subagent_ids_continue_after_existing_traces_and_are_reported() {
         Message::assistant("sub done", vec![]),
         Message::assistant("all done", vec![]),
     ]));
-    let mut agent = agent_with(provider, dir.path(), Some(traces.path()));
+    let mut agent = agent_with(provider.clone(), dir.path(), Some(traces.path()));
+    agent.effort = Effort::Max;
     let (sink, events) = collecting_sink();
     let out = agent.run_turn("x".into(), sink, CancellationToken::new()).await;
     assert_eq!(out.text, "all done");
+    assert_eq!(provider.efforts(), [Effort::Max; 3], "the subagent thinks as hard as its parent");
     assert!(traces.path().join("parent-sub3.jsonl").exists());
     let evs = events.lock().unwrap();
     let started = evs.iter().find_map(|e| match e {

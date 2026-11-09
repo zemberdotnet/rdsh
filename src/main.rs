@@ -25,7 +25,7 @@ USAGE:
     rdsh trace [ID|last]           print a session trace as readable text
 
 OPTIONS:
-    -m, --model <MODEL>    model id (default: deepseek-chat, env RDSH_MODEL)
+    -m, --model <MODEL>    model id (default: deepseek-flash, env RDSH_MODEL)
     -r, --resume <ID>      resume a session by id, prefix, or `last`
     -C, --cwd <DIR>        working directory (default: current)
         --host <DEST[:DIR]>  also attach to the hub on an SSH host (repeatable; or a config host name)
@@ -148,7 +148,12 @@ fn real_main() -> Result<i32> {
             runtime()?.block_on(async {
                 let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
                 let start = args.resume.as_deref().map_or(Start::New, Start::Resume);
-                let agent = session::build(&cfg, &cwd, provider, start)?;
+                let mut agent = session::build(&cfg, &cwd, provider, start)?;
+                agent.effort = cfg.effort;
+                if args.model.is_some() {
+                    // An explicit `-m` wins over a model the resumed session was switched to.
+                    agent.model = None;
+                }
                 Ok(headless::run(agent, prompt).await)
             })
         }
@@ -196,6 +201,8 @@ fn real_main() -> Result<i32> {
             }
             let ssh_program = cfg.ssh_program.clone();
             let remote_command = cfg.remote_command.clone();
+            let effort = cfg.effort;
+            let models = cfg.models.clone();
             let socket = args.socket.clone().unwrap_or_else(net::default_socket);
             let no_daemon = args.no_daemon;
             runtime()?.block_on(async {
@@ -219,7 +226,7 @@ fn real_main() -> Result<i32> {
                     let (req_tx, notices) = net::connect_command(&ssh_program, &ssh_args)?;
                     links.push(tui::HostLink { name: h.name, local: false, dir: h.dir.map(PathBuf::from), req_tx, notices });
                 }
-                tui::run(links, cwd, first).await?;
+                tui::run(links, cwd, first, effort, models).await?;
                 Ok(0)
             })
         }
@@ -292,6 +299,7 @@ fn print_trace(path: &std::path::Path) -> Result<()> {
             }
             trace::TraceEvent::Error { message } => println!("\n✗ error: {message}"),
             trace::TraceEvent::Cancelled => println!("\n⨯ interrupted"),
+            trace::TraceEvent::Turn { model, effort } => println!("\n── turn: {model}, thinking {}", effort.name()),
             _ => {}
         }
     }

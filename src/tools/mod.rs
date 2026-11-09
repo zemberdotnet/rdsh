@@ -50,6 +50,10 @@ pub struct ToolCtx {
     pub sink: EventSink,
     pub call_id: String,
     pub bash_timeout: Duration,
+    /// Thinking effort of the calling agent's turn.
+    pub effort: crate::llm::Effort,
+    /// Model override of the calling agent's turn.
+    pub model: Option<String>,
 }
 
 pub trait Tool: Send + Sync {

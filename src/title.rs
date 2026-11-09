@@ -8,7 +8,7 @@ use std::{path::Path, sync::Arc};
 
 use anyhow::{Result, bail};
 
-use crate::llm::{Delta, Message, Provider, Request};
+use crate::llm::{Delta, Effort, Message, Provider, Request};
 
 const MAX_WORDS: usize = 6;
 const MAX_CHARS: usize = 48;
@@ -35,7 +35,7 @@ impl Titler {
         let input: String = first_message.chars().take(MAX_INPUT_CHARS).collect();
         let messages = [Message::System { content: INSTRUCTIONS.into() }, Message::user(input)];
         let ignore = |_: Delta| {};
-        let done = self.provider.complete(Request { messages: &messages, tools: &[] }, &ignore).await?;
+        let done = self.provider.complete(Request { messages: &messages, tools: &[], effort: Effort::Off, model: None }, &ignore).await?;
         let Message::Assistant { content, .. } = done.message else { bail!("no title in the reply") };
         let t = clean(&content);
         if t.is_empty() {
