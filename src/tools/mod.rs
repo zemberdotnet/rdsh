@@ -2,8 +2,10 @@
 
 pub mod bash;
 pub mod fs;
+pub mod jobs;
 pub mod search;
 pub mod task;
+pub mod web;
 
 use std::{
     path::{Path, PathBuf},
@@ -54,6 +56,8 @@ pub struct ToolCtx {
     pub effort: crate::llm::Effort,
     /// Model override of the calling agent's turn.
     pub model: Option<String>,
+    /// Background jobs of the calling agent; `None` for subagents.
+    pub jobs: Option<Arc<jobs::Jobs>>,
 }
 
 pub trait Tool: Send + Sync {
@@ -104,13 +108,13 @@ impl Registry {
     }
 }
 
-/// File, shell and search tools (everything except `task`).
+/// File, shell and search tools (everything except `task` and background jobs).
 pub fn builtin() -> Registry {
     let mut r = Registry::default();
     r.add(Arc::new(fs::ReadFile));
     r.add(Arc::new(fs::WriteFile));
     r.add(Arc::new(fs::EditFile));
-    r.add(Arc::new(bash::Bash));
+    r.add(Arc::new(bash::Bash { background: false }));
     r.add(Arc::new(search::Glob));
     r.add(Arc::new(search::Grep));
     r
@@ -168,6 +172,9 @@ pub fn summarize(name: &str, arguments: &str) -> String {
             if path.is_empty() { get("pattern") } else { format!("{}  in {path}", get("pattern")) }
         }
         "task" => get("description"),
+        "web_search" => get("query"),
+        "web_fetch" => args.get("urls").and_then(Value::as_array).map_or_else(|| get("url"), |a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")),
+        "job_output" | "job_kill" => args.get("id").map(|id| format!("job {id}")).unwrap_or_default(),
         _ => arguments.to_owned(),
     };
     let first = s.lines().next().unwrap_or("");

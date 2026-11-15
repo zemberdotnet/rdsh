@@ -37,6 +37,7 @@ OPTIONS:
 ENVIRONMENT:
     DEEPSEEK_API_KEY       API key; overrides `rdsh login` (also read from ./.env)
     DEEPSEEK_BASE_URL      API base URL (default https://api.deepseek.com)
+    KAGI_API_KEY           enables the web_search and web_fetch tools (also read from ./.env)
 
 Config file: ~/.config/rdsh/config.json (see README).";
 
@@ -126,7 +127,7 @@ fn real_main() -> Result<i32> {
         }
         Some("sessions") => {
             for s in trace::list_sessions(&cfg.sessions_dir()) {
-                if s.parent.is_some() && !args.all {
+                if !s.has_input || (s.parent.is_some() && !args.all) {
                     continue;
                 }
                 println!("{}  {}", s.id, s.title);
@@ -226,7 +227,7 @@ fn real_main() -> Result<i32> {
                     let (req_tx, notices) = net::connect_command(&ssh_program, &ssh_args)?;
                     links.push(tui::HostLink { name: h.name, local: false, dir: h.dir.map(PathBuf::from), req_tx, notices });
                 }
-                tui::run(links, cwd, first, effort, models).await?;
+                tui::run(links, cwd, first, effort, models, ssh_program, remote_command).await?;
                 Ok(0)
             })
         }

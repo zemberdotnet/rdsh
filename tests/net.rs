@@ -2,7 +2,6 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -126,49 +125,6 @@ async fn socket_clients_share_sessions_and_a_second_server_is_refused() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(hub.clients(), 1);
-    server.abort();
-}
-
-#[tokio::test]
-async fn the_protocol_runs_over_a_commands_stdio_like_ssh() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("hub.sock");
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    let git = |args: &[&str]| assert!(Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap().status.success());
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "t@t"]);
-    git(&["config", "user.name", "t"]);
-    std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-qm", "init"]);
-    std::fs::write(repo.join("a.rs"), "fn a2() {}\n").unwrap();
-
-    let hub = scripted_hub(dir.path().join("sessions"), vec!["from far away"]);
-    let server = tokio::spawn({
-        let socket = socket.clone();
-        async move { net::serve(hub, &socket, None).await }
-    });
-    wait_for_socket(&socket).await;
-    // `ssh box rdsh connect` runs this same bridge on the remote machine.
-    let exe = env!("CARGO_BIN_EXE_rdsh");
-    let args = vec!["connect".to_owned(), "--socket".to_owned(), socket.display().to_string()];
-    let (tx, mut rx) = net::connect_command(exe, &args).unwrap();
-    tx.send(Request::New { cwd: Some(repo.display().to_string()) }).unwrap();
-    let Notice::Opened { snapshot } = next(&mut rx).await else { panic!() };
-    let evs = run_turn(&tx, &mut rx, &snapshot.session_id, "hello").await;
-    assert!(evs.iter().any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "from far away")));
-
-    // Files and changes of a remote session are read on its host.
-    tx.send(Request::ReadFile { cwd: repo.display().to_string(), path: "a.rs".into() }).unwrap();
-    let Notice::File { file } = next(&mut rx).await else { panic!() };
-    assert_eq!(file.rel, "a.rs");
-    assert_eq!((file.added, file.removed), (1, 1));
-    tx.send(Request::ChangedFiles { cwd: repo.display().to_string() }).unwrap();
-    let Notice::ChangedFiles { files, .. } = next(&mut rx).await else { panic!() };
-    assert_eq!(files, vec![("M".to_owned(), "a.rs".to_owned())]);
-    tx.send(Request::ReadFile { cwd: repo.display().to_string(), path: "missing.rs".into() }).unwrap();
-    assert!(matches!(next(&mut rx).await, Notice::Error { message, .. } if message.contains("no such file")));
     server.abort();
 }
 

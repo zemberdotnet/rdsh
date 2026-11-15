@@ -131,6 +131,60 @@ async fn two_clients_see_the_same_session_and_a_late_joiner_misses_nothing() {
 }
 
 #[tokio::test]
+async fn untouched_sessions_stay_out_of_the_rail_until_the_first_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([Message::assistant("ok", vec![])]));
+    let hub = hub(provider, dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0)));
+    let (tx, mut rx) = hub.connect();
+
+    tx.send(Request::New { cwd: None }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
+    let id = snapshot.session_id;
+    // The `Sessions` notice that follows `New` leaves the untouched session out of the rail.
+    let Notice::Sessions { recorded, open, .. } = next(&mut rx).await else { panic!() };
+    assert!(open.contains(&id));
+    assert!(!recorded.iter().any(|s| s.id == id), "an empty session is not listed");
+    assert!(dir.path().join(format!("{id}.jsonl")).exists(), "its trace is kept until the hub exits");
+
+    // Sending the first message makes it a rail row immediately, titled from the text while
+    // the trace still only has its `session_start` record.
+    let send = Request::Send { session_id: id.clone(), text: "hello".into(), effort: Effort::High, model: None };
+    tx.send(send).unwrap();
+    let mut row = None;
+    for _ in 0..10 {
+        if let Notice::Sessions { recorded, .. } = next(&mut rx).await
+            && let Some(s) = recorded.into_iter().find(|s| s.id == id)
+        {
+            row = Some(s);
+            break;
+        }
+    }
+    let row = row.expect("the session appears once the user types");
+    assert_eq!(row.title, "hello");
+}
+
+#[test]
+fn a_hub_shutdown_prunes_sessions_that_were_never_typed_into() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([]));
+    let builds = Arc::new(AtomicUsize::new(0));
+    let d = dir.path().to_path_buf();
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+    let path = rt.block_on(async {
+        let (tx, mut rx) = hub(provider, d.clone(), builds).connect();
+        tx.send(Request::New { cwd: None }).unwrap();
+        let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
+        let path = d.join(format!("{}.jsonl", snapshot.session_id));
+        assert!(path.exists());
+        drop(tx);
+        path
+    });
+    // Dropping the runtime drops the hub's agent tasks; the last `Hub` clone then sweeps empty traces.
+    drop(rt);
+    assert!(!path.exists(), "an untouched session's trace is deleted when the hub shuts down");
+}
+
+#[tokio::test]
 async fn sessions_keep_running_without_viewers_and_resume_on_open() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(ScriptedProvider::new([
@@ -264,4 +318,45 @@ fn protocol_messages_roundtrip_as_json() {
     let old: Request = serde_json::from_str(r#"{"type":"send","session_id":"s1","text":"hi"}"#).unwrap();
     assert_eq!(old, Request::Send { session_id: "s1".into(), text: "hi".into(), effort: Effort::High, model: None });
     assert!(text.contains(r#""type":"event""#));
+}
+
+#[tokio::test]
+async fn a_job_finishing_while_idle_starts_a_turn_and_keeps_the_hub_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        Message::assistant(
+            "",
+            vec![rdsh::llm::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 0.5; echo built", "run_in_background": true}).to_string(),
+            }],
+        ),
+        Message::assistant("started the build", vec![]),
+        Message::assistant("the build is done", vec![]),
+    ]));
+    let d = dir.path().to_path_buf();
+    let p: Arc<dyn Provider> = provider.clone();
+    let factory: Factory = Arc::new(move |_| {
+        let mut opts = options(p.clone(), &d, trace::Trace::create(&d, "s1", "scripted", &d, None)?);
+        let mut reg = tools::builtin();
+        reg.add(Arc::new(tools::bash::Bash { background: true }));
+        opts.tools = Arc::new(reg);
+        let mut agent = Agent::new(opts);
+        agent.enable_jobs(tools::jobs::Jobs::new(d.join("jobs")));
+        Ok(agent)
+    });
+    let hub = Hub::new(factory, Some(dir.path().to_path_buf()));
+    let (tx, mut rx) = hub.connect();
+    tx.send(Request::New { cwd: None }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
+    tx.send(Request::Send { session_id: snapshot.session_id, text: "build".into(), effort: Effort::Low, model: None }).unwrap();
+    turn_events(&mut rx).await;
+    // The turn is over but the job runs: the hub must not shut down as idle.
+    assert!(hub.busy());
+    let evs = turn_events(&mut rx).await;
+    let Some(AgentEvent::TurnStarted { text }) = evs.first() else { panic!("{evs:?}") };
+    assert!(text.starts_with("<background_jobs>") && text.contains("finished: exit 0") && text.contains("built"), "{text}");
+    assert!(evs.iter().any(|e| matches!(e, AgentEvent::Assistant { message: Message::Assistant { content, .. }, .. } if content == "the build is done")));
+    assert!(!hub.busy());
 }

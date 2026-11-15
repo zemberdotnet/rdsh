@@ -12,7 +12,11 @@ use crate::{
     title::Titler,
     llm::Provider,
     prompt,
-    tools::{self, task::Task},
+    tools::{
+        self,
+        task::Task,
+        web::{Kagi, WebFetch, WebSearch},
+    },
     trace::{self, Trace},
     util::new_session_id,
 };
@@ -50,7 +54,13 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
         }
     };
     let bash_timeout = Duration::from_secs(cfg.bash_timeout_secs);
-    let base = Arc::new(tools::builtin());
+    let mut base = tools::builtin();
+    if let Some(key) = &cfg.kagi_api_key {
+        let kagi = Kagi::new(key.clone(), cfg.kagi_base_url.clone().unwrap_or_else(|| tools::web::DEFAULT_BASE_URL.into()))?;
+        base.add(Arc::new(WebSearch(kagi.clone())));
+        base.add(Arc::new(WebFetch(kagi)));
+    }
+    let base = Arc::new(base);
     let mut registry = (*base).clone();
     registry.add(Arc::new(Task::new(
         provider.clone(),
@@ -59,8 +69,11 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
         bash_timeout,
         cfg.max_tool_output_chars,
         Some(dir),
-        session_id,
+        session_id.clone(),
     )));
+    registry.add(Arc::new(tools::bash::Bash { background: true }));
+    registry.add(Arc::new(tools::jobs::JobOutput));
+    registry.add(Arc::new(tools::jobs::JobKill));
     let system_prompt = prompt::main(provider.model(), &registry);
     let provider_for_titles = provider.clone();
     let length = match cfg.length_routing {
@@ -84,5 +97,6 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
         None => Agent::new(opts),
     };
     agent.model = turn_model;
+    agent.enable_jobs(tools::jobs::Jobs::new(std::env::temp_dir().join("rdsh-jobs").join(session_id)));
     Ok(agent)
 }

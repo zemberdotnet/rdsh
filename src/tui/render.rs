@@ -540,7 +540,7 @@ impl App {
             ));
         }
         if self.cur.waiting > 0 {
-            left.push(Span::styled(" ⏳ message waiting for the current turn ", Style::default().fg(PURPLE)));
+            left.push(Span::styled(" ⏳ message waiting for the current turn (Ctrl-Enter sends it now) ", Style::default().fg(PURPLE)));
         }
         let right = if self.cur.running {
             let secs = self.cur.turn_started.elapsed().as_secs();
@@ -689,14 +689,16 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l("  Ctrl-w h (or click) focuses it: j k g G Ctrl-d/u move and preview · Enter switches · y copies the id"),
         l("  Hovering a row with the mouse previews it too, without taking focus"),
         l("  Sessions keep running while you look at another; subagent rows open read-only · :new starts one"),
+        l("  :host user@box[:/dir] adds a remote machine, starts its rdsh hub over SSH, and starts a session there"),
         l("  Esc, l, Tab or Ctrl-w l return to the chat · ▸ marks the current session"),
         l("  Subagents: spinner running · ● done · ✗ failed (live for this process; others show ·)"),
         l(""),
         h("Other"),
         l("  Tab or za expands/collapses tool output · Q comment queue (e edit, dd delete, D clear)"),
-        l("  Ctrl-Enter (any mode) sends queued comments + prompt text; in a comment it saves, then sends"),
+        l("  Ctrl-Enter (any mode) sends queued comments + prompt text right away; in a comment it saves, then sends"),
         l("  Shift-Tab (any mode) cycles thinking: off, low, high, max; the model name turns gray, light blue, blue, purple"),
         l("  :model lists models (Enter picks one for this session's next turns) · :model <id> names any other"),
+        l("  Ctrl-Enter or :now during a turn interrupts it so your message starts at once"),
         l("  :send · :dropcomments · :q quit · Ctrl-C interrupts / clears / quits (twice)"),
     ];
     f.render_widget(Paragraph::new(text), area);

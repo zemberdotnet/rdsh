@@ -36,6 +36,10 @@ judging from your last few prompts, the start of the last reply and the new prom
 A pick below 0.5 confidence, a timeout or an error adds no note. Subagents and `rdsh run` are never
 routed. `decision_url` points at another System One endpoint; a localhost one needs no key.
 
+**Web search.** With `KAGI_API_KEY` set (environment or `.env`; keys at https://kagi.com/api/keys), the agent and its subagents get `web_search` (Kagi Search API: query, optional `limit`, `recency` of day/week/month, and `sites`) and `web_fetch` (Kagi Extract API: up to 10 pages as markdown). Without a key the tools are not offered. Both are billed to your Kagi API account per call. `KAGI_BASE_URL` points them at another endpoint.
+
+**Background jobs.** A `bash` command still running after `bash_timeout_secs` (default 120) keeps running as a background job instead of being killed, and the model can start one directly with `run_in_background` (servers, watchers). Job output goes to a log under `$TMPDIR/rdsh-jobs/<session>/`; `job_output` reads what is new and `job_kill` stops a job. Each turn starts with a one-line note of the jobs still running and for how long. When a job finishes, the model is told right away, with the last lines of its output: before its next request mid-turn, or in a turn of its own when the session is idle (shown as a status line, not as your message). A `timeout_secs` the model passes still kills the command. Jobs keep the hub from exiting as idle, and they stop when the hub stops (a restart, or quitting the TUI with `--no-daemon`). `rdsh run` waits for its jobs before exiting. Subagents keep the old behavior: their commands are killed at the limit.
+
 ## Keys
 
 The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inserts a newline, in the prompt and in comments; Alt-Enter and Ctrl-J also work in terminals without the kitty keyboard protocol). Esc switches to NORMAL mode.
@@ -48,7 +52,7 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | `/ ? n N` | search (smartcase) |
 | `v` / `V` | charwise / linewise select; `o` swaps ends, `y` yanks via OSC 52 |
 | `c` (or Enter in visual) | comment on the selection (or the current line) |
-| Ctrl-Enter (any mode) | send queued comments plus any prompt text; inside a comment, save it then send |
+| Ctrl-Enter (any mode), `:now` | send queued comments plus any prompt text right away: a running turn is interrupted so the message starts at once (Enter waits for the turn instead); inside a comment, save it then send |
 | Shift-Tab (any mode) | cycle thinking effort: off, low, high, max. The model name in the status line shows it: gray, light blue, blue, deep purple |
 | Enter / `gf` / mouse click on a path | open the file's diff view |
 | Tab / `za` | expand or collapse tool output and reasoning |
@@ -57,6 +61,7 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | `S`, `Ctrl-w h` / `Ctrl-w l` | show or hide the session rail; move focus into it and back (`j k g G`, Enter switches to the session, resuming it if needed; subagent rows open read-only; `y` copies the id) |
 | `:new`, `:q`, `:q!` | start another session; quit (refuses while other sessions run), quit and stop them |
 | `:model`, `:model <id>` | pick this session's model from a list (`models` in the config; Enter picks, `q` backs out), or name any id; it applies from the next turn and a resumed session keeps it |
+| `:host user@box[:/dir]` | add a remote machine to the rail over SSH, start its rdsh hub if needed, and start a session there |
 | `:e path[:line]`, `:send`, `:help`, `:q` | commands |
 | Ctrl-C | interrupt the turn, clear input, or quit (press twice) |
 
@@ -69,7 +74,7 @@ Queued comments are sent with your next message inside a `<review_comments>` blo
 - `src/agent.rs`: agent loop; parallel-safe tool calls run concurrently
 - `src/llm.rs`: chat types, wire format, scripted provider for tests
 - `src/deepseek.rs`: streaming SSE client with retries
-- `src/tools/`: `read_file`, `write_file`, `edit_file`, `bash`, `glob`, `grep`, `task` (subagents)
+- `src/tools/`: `read_file`, `write_file`, `edit_file`, `bash`, `job_output`, `job_kill` (`jobs.rs`), `glob`, `grep`, `web_search`, `web_fetch` (`web.rs`, Kagi), `task` (subagents)
 - `src/trace.rs`: JSONL traces; resume rebuilds the exact model-visible history
 - `src/comments.rs`, `src/links.rs`, `src/diff.rs`: review features
 - `src/tui/`: UI (`app.rs` state and keys, `render.rs`, `transcript.rs` wrapped rows, `motion.rs` vim motions, `fileview.rs`)
@@ -79,6 +84,8 @@ Queued comments are sent with your next message inside a `<review_comments>` blo
 ## Sessions, the hub, and other machines
 
 Sessions run in a background **hub**, not in the TUI. `rdsh` starts the hub on first use (`rdsh serve`, listening on `$XDG_RUNTIME_DIR/rdsh/hub.sock`, a directory only you can read) and attaches to it. Closing the TUI leaves running sessions running; the next `rdsh` attaches again, and several terminals can watch the same session. The hub exits after `serve_idle_secs` (default 1800) with no clients and no running turns. `--no-daemon` runs sessions inside the TUI process instead.
+
+A new session joins the rail only when you send its first message. Sessions you never type into stay out of the rail, and their empty traces are deleted when the hub shuts down.
 
 Other machines are reached over SSH. The remote machine needs rdsh installed and logged in (`rdsh login` there; its own key is used):
 

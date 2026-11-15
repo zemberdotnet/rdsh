@@ -167,10 +167,45 @@ pub struct SessionInfo {
     pub parent: Option<String>,
     /// Working directory the session ran in.
     pub cwd: String,
+    /// Whether the user has sent something. A trace with only `session_start` is not a session.
+    #[serde(default)]
+    pub has_input: bool,
     /// Short model-written title, when one was saved (`title::read`).
     #[serde(default)]
     pub slug: Option<String>,
     pub title: String,
+}
+
+/// What the first few records of a trace say about it.
+struct Head {
+    started: bool,
+    parent: Option<String>,
+    cwd: String,
+    title: String,
+    has_input: bool,
+}
+
+/// Reads the beginning of a trace. The first user message is always among the first records,
+/// so a handful of lines is enough to tell an empty session from a used one.
+fn head(path: &Path) -> Option<Head> {
+    let file = File::open(path).ok()?;
+    let mut h = Head { started: false, parent: None, cwd: String::new(), title: String::new(), has_input: false };
+    for line in BufReader::new(file).lines().take(8).map_while(Result::ok) {
+        match serde_json::from_str::<Record>(&line).map(|r| r.event) {
+            Ok(TraceEvent::SessionStart { parent: p, cwd: c, .. }) => {
+                h.started = true;
+                h.parent = p;
+                h.cwd = c;
+            }
+            Ok(TraceEvent::Message { message: Message::User { content } }) => {
+                h.title = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(80).collect();
+                h.has_input = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    Some(h)
 }
 
 /// Lists sessions newest first. Reads only the first few lines of each file.
@@ -182,35 +217,55 @@ pub fn list_sessions(dir: &Path) -> Vec<SessionInfo> {
         .filter_map(|e| {
             let path = e.path();
             let modified = e.metadata().ok()?.modified().ok()?;
-            let file = File::open(&path).ok()?;
-            let mut parent = None;
-            let mut cwd = String::new();
-            let mut title = String::new();
-            for line in BufReader::new(file).lines().take(8).map_while(Result::ok) {
-                match serde_json::from_str::<Record>(&line).map(|r| r.event) {
-                    Ok(TraceEvent::SessionStart { parent: p, cwd: c, .. }) => {
-                        parent = p;
-                        cwd = c;
-                    }
-                    Ok(TraceEvent::Message { message: Message::User { content } }) => {
-                        title = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(80).collect();
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            let head = head(&path)?;
             let id = path.file_stem()?.to_string_lossy().into_owned();
             let slug = crate::title::read(&path);
-            Some(SessionInfo { id, path, modified, parent, cwd, title, slug })
+            Some(SessionInfo {
+                id,
+                path,
+                modified,
+                parent: head.parent,
+                cwd: head.cwd,
+                has_input: head.has_input,
+                slug,
+                title: head.title,
+            })
         })
         .collect();
     out.sort_by_key(|s| std::cmp::Reverse(s.modified));
     out
 }
 
+/// Deletes traces the user never typed into, along with their titles.
+///
+/// Safe to call when no agent is writing: the hub does it at startup and shutdown.
+///
+/// @returns how many traces were removed.
+pub fn prune_empty_sessions(dir: &Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let mut removed = 0;
+    for path in rd
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+    {
+        let Some(head) = head(&path) else { continue };
+        if !head.started || head.has_input {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            let _ = std::fs::remove_file(crate::title::path_for(&path));
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Finds a session by id, unique id prefix, or `last` (newest top-level session).
+///
+/// Traces the user never typed into are not sessions yet and are skipped.
 pub fn find_session(dir: &Path, query: &str) -> Result<PathBuf> {
-    let sessions = list_sessions(dir);
+    let sessions: Vec<_> = list_sessions(dir).into_iter().filter(|s| s.has_input).collect();
     if query == "last" {
         return sessions
             .into_iter()
@@ -264,5 +319,27 @@ mod tests {
         let s = list_sessions(dir.path());
         assert_eq!(s[0].title, "hello");
         assert_eq!(find_session(dir.path(), "last").unwrap(), dir.path().join("s1.jsonl"));
+    }
+
+    #[test]
+    fn empty_traces_are_flagged_and_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = Trace::create(dir.path(), "empty", "m", Path::new("/w"), None).unwrap();
+        let mut used = Trace::create(dir.path(), "used", "m", Path::new("/w"), None).unwrap();
+        used.record(TraceEvent::Message { message: Message::user("do work") }).unwrap();
+        // A title next to an empty trace goes with it.
+        std::fs::write(crate::title::path_for(&empty.path), "stale\n").unwrap();
+        drop(used);
+
+        let listed = list_sessions(dir.path());
+        assert!(!listed.iter().find(|s| s.id == "empty").unwrap().has_input);
+        assert!(listed.iter().find(|s| s.id == "used").unwrap().has_input);
+        // Only the used session can be found: an empty trace is not a session yet.
+        assert_eq!(find_session(dir.path(), "last").unwrap(), dir.path().join("used.jsonl"));
+
+        assert_eq!(prune_empty_sessions(dir.path()), 1);
+        assert!(!dir.path().join("empty.jsonl").exists());
+        assert!(!crate::title::path_for(&empty.path).exists());
+        assert!(dir.path().join("used.jsonl").exists());
     }
 }

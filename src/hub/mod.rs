@@ -23,6 +23,7 @@ pub use proto::{Notice, Request, Snapshot};
 use crate::{
     agent::{Agent, AgentEvent, EventSink},
     llm::{Effort, Message, Usage},
+    tools::jobs::Jobs,
     trace,
 };
 
@@ -80,6 +81,13 @@ struct Slot {
     turn: Vec<AgentEvent>,
     running: bool,
     usage: Usage,
+    /// The agent's background jobs, which keep the hub alive while they run.
+    jobs: Option<Arc<Jobs>>,
+    /// Whether the user has sent anything to this session. A fresh session is not listed in
+    /// the rail until they do, so empty sessions do not take up space.
+    has_input: bool,
+    /// The first text sent, shown as the title until the trace has a user message.
+    title_hint: Option<String>,
 }
 
 impl Slot {
@@ -104,10 +112,33 @@ impl Slot {
     }
 }
 
+/// Whether a session's history has a message the user sent (job notes are harness messages).
+fn has_user_input(history: &[Message]) -> bool {
+    history.iter().any(|m| matches!(m, Message::User { content } if !crate::tools::jobs::is_note(content)))
+}
+
+/// The first line of `text`, short enough for a rail row.
+fn title_hint(text: &str) -> String {
+    text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(80).collect()
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The last clone is gone, so no agent task can still be writing: sweep empty traces.
+        if let Some(dir) = &self.sessions_dir {
+            trace::prune_empty_sessions(dir);
+        }
+    }
+}
+
 impl Hub {
     /// @param factory builds agents for `New` and `Open`.
     /// @param sessions_dir where traces live; `None` disables listing and `ReadTrace`.
     pub fn new(factory: Factory, sessions_dir: Option<PathBuf>) -> Self {
+        // Sweep traces left by sessions the user never typed into (crashed or killed hubs).
+        if let Some(dir) = &sessions_dir {
+            trace::prune_empty_sessions(dir);
+        }
         Self { inner: Arc::new(Inner { factory, sessions_dir, state: Mutex::new(State::default()) }) }
     }
 
@@ -144,9 +175,9 @@ impl Hub {
         self.state().clients.len()
     }
 
-    /// Whether any session is mid-turn.
+    /// Whether any session is mid-turn or has background jobs running.
     pub fn busy(&self) -> bool {
-        self.state().sessions.values().any(|s| s.running)
+        self.state().sessions.values().any(|s| s.running || s.jobs.as_ref().is_some_and(|j| j.any_running()))
     }
 
     fn notify(&self, client: u64, notice: Notice) {
@@ -191,11 +222,28 @@ impl Hub {
                 self.subscribe(client, &id);
             }
             Request::Send { session_id, text, effort, model } => {
-                let sent = self.state().sessions.get(&session_id).map(|s| s.cmd_tx.send(Turn { text, effort, model }).is_ok());
-                match sent {
-                    Some(true) => {}
-                    Some(false) => self.error(client, Some(session_id), "the session's agent has stopped".into()),
-                    None => self.error(client, Some(session_id), "session is not open".into()),
+                let hint = title_hint(&text);
+                let (sent, newly_input, open) = {
+                    let mut st = self.state();
+                    match st.sessions.get_mut(&session_id) {
+                        Some(s) => {
+                            let newly_input = !s.has_input;
+                            s.has_input = true;
+                            s.title_hint.get_or_insert(hint);
+                            (s.cmd_tx.send(Turn { text, effort, model }).is_ok(), newly_input, true)
+                        }
+                        None => (false, false, false),
+                    }
+                };
+                match (sent, open) {
+                    (true, _) => {
+                        // The first message turns the session into a rail row right away.
+                        if newly_input {
+                            self.broadcast_sessions();
+                        }
+                    }
+                    (false, true) => self.error(client, Some(session_id), "the session's agent has stopped".into()),
+                    (false, false) => self.error(client, Some(session_id), "session is not open".into()),
                 }
             }
             Request::Cancel { session_id } => {
@@ -275,8 +323,19 @@ impl Hub {
     }
 
     fn sessions_notice(&self) -> Notice {
-        let recorded = self.inner.sessions_dir.as_deref().map(trace::list_sessions).unwrap_or_default();
+        let mut recorded = self.inner.sessions_dir.as_deref().map(trace::list_sessions).unwrap_or_default();
         let st = self.state();
+        // A session the user has not typed into yet is not a session: keep it out of the rail
+        // (the hub also deletes its empty trace when it shuts down).
+        recorded.retain(|s| s.has_input || st.sessions.get(&s.id).is_some_and(|slot| slot.has_input));
+        // The trace gets its first user message just after `Send`; show the sent text until then.
+        for s in &mut recorded {
+            if s.title.is_empty()
+                && let Some(slot) = st.sessions.get(&s.id)
+            {
+                s.title = slot.title_hint.clone().unwrap_or_default();
+            }
+        }
         let mut open: Vec<String> = st.sessions.keys().cloned().collect();
         open.sort();
         let running = open.iter().filter(|id| st.sessions[*id].running).cloned().collect();
@@ -295,6 +354,7 @@ impl Hub {
     /// @returns the session id.
     fn spawn(&self, mut agent: Agent) -> String {
         let id = agent.session_id().unwrap_or("unsaved").to_owned();
+        let has_input = has_user_input(agent.history());
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Turn>();
         self.state().sessions.insert(
             id.clone(),
@@ -307,21 +367,41 @@ impl Hub {
                 turn: Vec::new(),
                 running: false,
                 usage: agent.usage,
+                jobs: agent.jobs().cloned(),
+                has_input,
+                title_hint: None,
             },
         );
         let hub = self.clone();
         let sid = id.clone();
+        let jobs = agent.jobs().cloned();
         tokio::spawn(async move {
-            while let Some(Turn { text, effort, model }) = cmd_rx.recv().await {
-                agent.effort = effort;
-                if model.is_some() {
-                    agent.model = model;
+            loop {
+                // A job that finishes while the session is idle gets a turn of its own.
+                let turn = tokio::select! {
+                    t = cmd_rx.recv() => match t {
+                        Some(t) => Some(t),
+                        None => break,
+                    },
+                    _ = job_finished(jobs.as_deref()) => None,
+                };
+                if let Some(Turn { effort, model, .. }) = &turn {
+                    agent.effort = *effort;
+                    if model.is_some() {
+                        agent.model = model.clone();
+                    }
+                } else if !jobs.as_ref().is_some_and(|j| j.has_news()) {
+                    // Already reported mid-turn.
+                    continue;
                 }
                 let cancel = CancellationToken::new();
                 hub.turn_boundary(&sid, &agent, Some(cancel.clone()));
                 let (h, s) = (hub.clone(), sid.clone());
                 let sink: EventSink = Arc::new(move |ev| h.publish(&s, ev));
-                agent.run_turn(text, sink, cancel).await;
+                match turn {
+                    Some(t) => drop(agent.run_turn(t.text, sink, cancel).await),
+                    None => drop(agent.run_job_turn(sink, cancel).await),
+                }
                 hub.turn_boundary(&sid, &agent, None);
             }
         });
@@ -342,5 +422,13 @@ impl Hub {
             }
         }
         self.broadcast_sessions();
+    }
+}
+
+/// Resolves when one of `jobs` finishes; never without jobs.
+async fn job_finished(jobs: Option<&Jobs>) {
+    match jobs {
+        Some(j) => j.finished().await,
+        None => std::future::pending().await,
     }
 }

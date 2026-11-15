@@ -31,7 +31,8 @@ pub struct Config {
     pub subagent_max_steps: usize,
     /// Tool output is truncated (head and tail kept) beyond this many characters.
     pub max_tool_output_chars: usize,
-    /// Default `bash` timeout when the model does not pass one.
+    /// Seconds a `bash` command runs in the foreground before it moves to the background (in
+    /// subagents: before it is killed), unless the model passes its own timeout.
     pub bash_timeout_secs: u64,
     /// Retries for 429/5xx/connect failures before any output streamed.
     pub max_retries: u32,
@@ -65,6 +66,13 @@ pub struct Config {
     /// API key from `DEEPSEEK_API_KEY`; never read from the config file.
     #[serde(skip)]
     pub api_key: Option<String>,
+    /// Kagi key from `KAGI_API_KEY`; enables `web_search` and `web_fetch`. Never read from the
+    /// config file.
+    #[serde(skip)]
+    pub kagi_api_key: Option<String>,
+    /// Kagi API root from `KAGI_BASE_URL`.
+    #[serde(skip)]
+    pub kagi_base_url: Option<String>,
 }
 
 /// A remote machine in the session rail.
@@ -121,6 +129,8 @@ impl Default for Config {
             decision_api_key: None,
             decision_key_source: None,
             api_key: None,
+            kagi_api_key: None,
+            kagi_base_url: None,
         }
     }
 }
@@ -158,6 +168,8 @@ impl Config {
             (None, Some(k)) => (Some(k), Some(KeySource::OpenRouter)),
             (None, None) => (None, None),
         };
+        cfg.kagi_api_key = var("KAGI_API_KEY");
+        cfg.kagi_base_url = var("KAGI_BASE_URL");
         cfg.api_key = match var("DEEPSEEK_API_KEY") {
             Some(k) => Some(k),
             None => crate::auth::load()?,

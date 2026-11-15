@@ -52,7 +52,17 @@ pub struct HostLink {
 /// @param first `Request::New` or `Request::Open` for the first host.
 /// @param effort thinking effort turns start with.
 /// @param models ids `:model` lists.
-pub async fn run(links: Vec<HostLink>, cwd: PathBuf, first: Request, effort: Effort, models: Vec<String>) -> Result<()> {
+/// @param ssh_program SSH client `:host` uses.
+/// @param remote_command command `:host` runs on a remote machine to reach its hub.
+pub async fn run(
+    links: Vec<HostLink>,
+    cwd: PathBuf,
+    first: Request,
+    effort: Effort,
+    models: Vec<String>,
+    ssh_program: String,
+    remote_command: Vec<String>,
+) -> Result<()> {
     // One stream for all hosts; `None` marks a host whose connection ended.
     let (merged_tx, mut notices) = mpsc::unbounded_channel::<(usize, Option<Notice>)>();
     let mut hosts = Vec::new();
@@ -77,6 +87,9 @@ pub async fn run(links: Vec<HostLink>, cwd: PathBuf, first: Request, effort: Eff
     let mut app = App::new(cwd, hosts);
     app.effort = effort;
     app.models = models;
+    app.ssh_program = ssh_program;
+    app.remote_command = remote_command;
+    app.merged_tx = Some(merged_tx);
     app.sidebar_open = true;
     app.expect_open(0);
 

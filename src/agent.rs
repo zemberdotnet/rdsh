@@ -10,7 +10,7 @@ use crate::{
     title::{self, Titler},
     llm::{Delta, Effort, Message, Provider, Request, ToolCall, ToolSpec, Usage},
     prompt,
-    tools::{Registry, ToolCtx, ToolOutput},
+    tools::{Registry, ToolCtx, ToolOutput, jobs::Jobs},
     trace::{Trace, TraceEvent},
     util::truncate_middle,
 };
@@ -37,6 +37,8 @@ pub enum AgentEvent {
     Subagent { call_id: String, event: Box<AgentEvent> },
     /// What the response-length router decided for this turn (top-level agent only).
     ResponseLength(Routing),
+    /// Background jobs finished mid-turn; `text` is the note the model got.
+    JobsNote { text: String },
     /// Non-fatal problem (for example, the trace could not be written).
     Warning(String),
     TurnEnd { cancelled: bool, error: Option<String> },
@@ -78,6 +80,16 @@ pub struct Agent {
     /// Model for the next turn's requests instead of the provider's; subagents inherit it.
     pub model: Option<String>,
     trace_failed: Option<String>,
+    /// Background shell jobs; only top-level agents have them.
+    jobs: Option<Arc<Jobs>>,
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        if let Some(j) = &self.jobs {
+            j.kill_all();
+        }
+    }
 }
 
 impl Agent {
@@ -143,7 +155,16 @@ impl Agent {
 
     fn bare(opts: AgentOptions, history: Vec<Message>) -> Self {
         let specs = opts.tools.specs();
-        Self { opts, specs, history, usage: Usage::default(), effort: Effort::default(), model: None, trace_failed: None }
+        Self { opts, specs, history, usage: Usage::default(), effort: Effort::default(), model: None, trace_failed: None, jobs: None }
+    }
+
+    /// Lets this agent's `bash` calls run as background jobs, which it hears about in notes.
+    pub fn enable_jobs(&mut self, jobs: Arc<Jobs>) {
+        self.jobs = Some(jobs);
+    }
+
+    pub fn jobs(&self) -> Option<&Arc<Jobs>> {
+        self.jobs.as_ref()
     }
 
     pub fn history(&self) -> &[Message] {
@@ -206,9 +227,24 @@ impl Agent {
     /// @param cancel interrupts the model request or running tools.
     /// @returns the final assistant text and how the turn ended.
     pub async fn run_turn(&mut self, input: String, sink: EventSink, cancel: CancellationToken) -> TurnOutcome {
+        self.turn(input, false, sink, cancel).await
+    }
+
+    /// Runs a turn that tells the agent about background jobs that finished while it was idle.
+    ///
+    /// @returns None, without starting a turn, when no job has news.
+    pub async fn run_job_turn(&mut self, sink: EventSink, cancel: CancellationToken) -> Option<TurnOutcome> {
+        let note = self.jobs.as_ref().filter(|j| j.has_news())?.turn_note()?;
+        Some(self.turn(note, true, sink, cancel).await)
+    }
+
+    /// @param jobs_note `input` is a job note from the harness: no title or length routing.
+    async fn turn(&mut self, input: String, jobs_note: bool, sink: EventSink, cancel: CancellationToken) -> TurnOutcome {
         sink(AgentEvent::TurnStarted { text: input.clone() });
         self.log(TraceEvent::Turn { model: self.model().to_owned(), effort: self.effort });
-        self.name_session(&input, &sink);
+        if !jobs_note {
+            self.name_session(&input, &sink);
+        }
         let context = prompt::runtime_context(&self.opts.cwd);
         let latest = self.history.iter().rev().find_map(|m| match m {
             Message::Context { content } => Some(content),
@@ -217,7 +253,7 @@ impl Agent {
         if latest != Some(&context) {
             self.push(Message::Context { content: context });
         }
-        let directive = match self.opts.length.clone() {
+        let directive = match self.opts.length.clone().filter(|_| !jobs_note) {
             Some(router) => {
                 let routed = tokio::select! {
                     biased;
@@ -240,6 +276,9 @@ impl Agent {
         };
         self.push(Message::User { content: input });
         if let Some(content) = directive {
+            self.push(Message::Directive { content });
+        }
+        if let Some(content) = self.jobs.as_ref().filter(|_| !jobs_note).and_then(|j| j.turn_note()) {
             self.push(Message::Directive { content });
         }
         let mut last_text = String::new();
@@ -287,6 +326,10 @@ impl Agent {
             if cancel.is_cancelled() {
                 return self.finish(&sink, last_text, true, None);
             }
+            if let Some(content) = self.jobs.as_ref().and_then(|j| j.finished_note()) {
+                sink(AgentEvent::JobsNote { text: content.clone() });
+                self.push(Message::Directive { content });
+            }
         }
         let max = self.opts.max_steps;
         self.finish(&sink, last_text, false, Some(format!("stopped after {max} model requests without a final answer")))
@@ -328,6 +371,7 @@ impl Agent {
                         bash_timeout: self.opts.bash_timeout,
                         effort: self.effort,
                         model: self.model.clone(),
+                        jobs: self.jobs.clone(),
                     };
                     tokio::select! {
                         biased;

@@ -34,6 +34,9 @@ impl Harness {
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
+        // Don't sign synthetic commits: a global `commit.gpgsign` with `gpg.format=ssh`
+        // would otherwise prompt the SSH-agent (e.g. 1Password) during tests.
+        git(&["config", "commit.gpgsign", "false"]);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
         git(&["add", "."]);
@@ -287,6 +290,36 @@ fn messages_typed_during_a_turn_wait_for_it() {
     assert_eq!(h.sent(), "second");
     assert!(!h.screen().contains("message waiting"));
     assert!(h.screen().contains("› second"));
+}
+
+#[test]
+fn ctrl_enter_during_a_turn_interrupts_it_for_the_new_message() {
+    let ctrl_enter = || Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+    let mut h = Harness::new();
+    h.keys("first");
+    h.key(KeyCode::Enter);
+    h.sent();
+    // Ctrl-Enter sends the prompt, then interrupts the running turn so it starts at once.
+    h.keys("second");
+    h.app.on_event(ctrl_enter());
+    assert!(matches!(h.rx.try_recv(), Ok(Request::Send { text, .. }) if text == "second"));
+    assert!(matches!(h.rx.try_recv(), Ok(Request::Cancel { session_id }) if session_id == "s1"));
+    h.agent(AgentEvent::TurnEnd { cancelled: true, error: None });
+    h.agent(AgentEvent::TurnStarted { text: "second".into() });
+    // A message sent with Enter waits; Ctrl-Enter with an empty prompt (or :now) hurries it.
+    h.keys("third");
+    h.key(KeyCode::Enter);
+    assert!(matches!(h.rx.try_recv(), Ok(Request::Send { text, .. }) if text == "third"));
+    assert!(h.rx.try_recv().is_err());
+    h.key(KeyCode::Esc);
+    h.keys(":now");
+    h.key(KeyCode::Enter);
+    assert!(matches!(h.rx.try_recv(), Ok(Request::Cancel { .. })));
+    h.agent(AgentEvent::TurnEnd { cancelled: true, error: None });
+    h.agent(AgentEvent::TurnStarted { text: "third".into() });
+    // Nothing typed or waiting: nothing is sent or interrupted.
+    h.app.on_event(ctrl_enter());
+    assert!(h.rx.try_recv().is_err());
 }
 
 #[test]
@@ -768,10 +801,14 @@ fn subagent_rows_open_read_only_traces_and_new_starts_a_session() {
     h.keys(":new");
     h.key(KeyCode::Enter);
     assert!(matches!(h.request(), Request::New { cwd: Some(_) }), "new sessions start in this directory");
+    // s1 was used (the rail lists it), so it stays resumable; the fresh s2 has no input yet.
+    if let Some(s1) = h.app.others.iter_mut().find(|v| v.session_id == "s1") {
+        s1.has_input = true;
+    }
     h.notice(Notice::Opened { snapshot: snapshot("s2") });
     assert_eq!(h.app.cur.session_id, "s2");
     let open: Vec<String> = h.app.open_sessions().into_iter().map(|(_, id)| id).collect();
-    assert_eq!(open, ["s2", "s1"], "read-only traces are not listed as resumable");
+    assert_eq!(open, ["s1"], "read-only traces and empty sessions are not listed as resumable");
 }
 
 #[test]
@@ -875,6 +912,7 @@ fn two_hosts() -> TwoHosts {
         modified: std::time::SystemTime::now(),
         parent: None,
         cwd: "/srv/app".into(),
+        has_input: true,
         title: title.into(),
         slug: None,
     };
@@ -992,4 +1030,19 @@ fn a_host_heading_starts_a_session_there_and_disconnects_show() {
     assert!(t.h.screen().contains("not connected to box"));
     // The local host is unaffected.
     assert!(t.h.screen().contains("◆ local"));
+}
+
+#[test]
+fn job_notes_show_as_status_lines_not_user_messages() {
+    let mut h = Harness::new();
+    h.keys("build");
+    h.key(KeyCode::Enter);
+    h.sent();
+    h.complete_turn();
+    h.agent(AgentEvent::TurnStarted {
+        text: "<background_jobs>\njob 1 `cargo build` finished: exit 0 after 3m12s. No output.\n</background_jobs>".into(),
+    });
+    let screen = h.screen();
+    assert!(screen.contains("job 1 `cargo build` finished: exit 0 after 3m12s"), "{screen}");
+    assert!(!screen.contains("<background_jobs>") && !screen.contains("› job 1"), "{screen}");
 }

@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{Agent, AgentEvent, EventSink},
-    tools::summarize,
+    tools::{jobs, summarize},
 };
 
 /// Runs `prompt` as a single turn; Ctrl-C interrupts it.
@@ -26,7 +26,25 @@ pub async fn run(mut agent: Agent, prompt: String) -> i32 {
             }
         })
     };
-    let outcome = agent.run_turn(prompt, sink, cancel).await;
+    let mut outcome = agent.run_turn(prompt, sink.clone(), cancel.clone()).await;
+    // Background jobs would die with the process, so wait for them and report each ending.
+    while !outcome.cancelled
+        && outcome.error.is_none()
+        && let Some(jobs) = agent.jobs().cloned()
+        && (jobs.any_running() || jobs.has_news())
+    {
+        if !jobs.has_news() {
+            eprintln!("[waiting for background jobs: {}]", jobs.running_line().unwrap_or_default());
+            tokio::select! {
+                _ = jobs.finished() => {}
+                _ = cancel.cancelled() => break,
+            }
+        }
+        match agent.run_job_turn(sink.clone(), cancel.clone()).await {
+            Some(o) => outcome = o,
+            None => continue,
+        }
+    }
     watcher.abort();
     let u = agent.usage;
     eprintln!("\n[tokens: {} in ({} cached), {} out]", u.prompt_tokens, u.cached_tokens, u.completion_tokens);
@@ -57,6 +75,7 @@ fn print_event(ev: &AgentEvent, depth: usize) {
             eprintln!("{indent}  ✗ {first} ({duration_ms} ms)");
         }
         AgentEvent::Subagent { event, .. } => print_event(event, depth + 1),
+        AgentEvent::TurnStarted { text } if depth == 0 && jobs::is_note(text) => eprintln!("\n{}", jobs::note_body(text)),
         AgentEvent::Warning(w) => eprintln!("{indent}warning: {w}"),
         AgentEvent::TurnEnd { error: Some(e), .. } if depth == 0 => eprintln!("\nerror: {e}"),
         AgentEvent::TurnEnd { cancelled: true, .. } if depth == 0 => eprintln!("\ninterrupted"),

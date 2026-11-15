@@ -24,11 +24,12 @@ use super::{
 use crate::{
     agent::AgentEvent,
     comments::{Anchor, Comment, compose_message},
+    config::HostConfig,
     diff,
-    hub::{Notice, Request, Snapshot},
+    hub::{net, Notice, Request, Snapshot},
     length::Routing,
     llm::{Effort, Message, Usage},
-    tools::{resolve_path, summarize},
+    tools::{jobs, resolve_path, summarize},
     trace::SessionInfo,
     util::base64,
 };
@@ -71,6 +72,8 @@ pub struct SessionView {
     /// Working directory of the session on its host.
     pub(crate) cwd: PathBuf,
     pub(crate) session_id: String,
+    /// Whether the user has typed into this session (a fresh session is not resumable yet).
+    pub(crate) has_input: bool,
     pub(crate) model: String,
     pub(crate) transcript: Transcript,
     pub(crate) chat_cursor: Cursor,
@@ -106,6 +109,7 @@ impl SessionView {
             host,
             cwd,
             session_id,
+            has_input: false,
             model,
             transcript,
             chat_cursor: Cursor::default(),
@@ -229,6 +233,12 @@ pub struct App {
     pub effort: Effort,
     /// Model ids `:model` lists.
     pub models: Vec<String>,
+    /// SSH client used when `:host` adds a remote machine.
+    pub ssh_program: String,
+    /// Command run on a remote host to reach its hub (usually `rdsh connect`).
+    pub remote_command: Vec<String>,
+    /// Where this TUI's merged notice stream is fed; set by the event loop.
+    pub merged_tx: Option<UnboundedSender<(usize, Option<Notice>)>>,
 }
 
 impl App {
@@ -276,6 +286,9 @@ impl App {
             osc_out: None,
             effort: Effort::default(),
             models: crate::config::Config::default().models,
+            ssh_program: "ssh".into(),
+            remote_command: vec!["rdsh".into(), "connect".into()],
+            merged_tx: None,
         }
     }
 
@@ -489,11 +502,14 @@ impl App {
         self.others.retain(|v| !(v.host == host && v.session_id == id));
         let same = self.cur.host == host && self.cur.session_id == id;
         // Keep the draft and queued comments of a view being refreshed.
-        let carried = same.then(|| (std::mem::take(&mut self.cur.prompt), std::mem::take(&mut self.cur.queue)));
+        let carried = same.then(|| {
+            (std::mem::take(&mut self.cur.prompt), std::mem::take(&mut self.cur.queue), self.cur.has_input)
+        });
         let mut fresh = self.build_view(host, snapshot);
-        if let Some((prompt, queue)) = carried {
+        if let Some((prompt, queue, has_input)) = carried {
             fresh.prompt = prompt;
             fresh.queue = queue;
+            fresh.has_input |= has_input;
         }
         let previous = std::mem::replace(&mut self.cur, fresh);
         let keep_previous = !previous.session_id.is_empty() && !same;
@@ -541,6 +557,45 @@ impl App {
         self.pending_open = Some(PendingOpen::Any(host));
         let cwd = self.new_session_dir(host);
         self.request(host, Request::New { cwd });
+    }
+
+    /// Adds a remote host to the rail from `:host DEST[:DIR]` and starts a session there.
+    ///
+    /// The hub is started on the remote machine by the same `rdsh connect` handshake the CLI
+    /// `--host` path uses: `ssh -T DEST rdsh connect` makes sure a hub is listening, then relays
+    /// the hub protocol. The host is added for this TUI process only (config persistence is a
+    /// follow-up), and failures surface through the notice stream as a disconnect or error.
+    fn add_remote_host(&mut self, spec: &str) {
+        let h = match HostConfig::parse(spec) {
+            Ok(h) => h,
+            Err(e) => return self.set_flash(format!(":host — {e:#}")),
+        };
+        if self.hosts.iter().any(|x| x.name == h.name) {
+            return self.set_flash(format!("host {} is already in the rail", h.name));
+        }
+        let mut ssh_args = vec!["-T".to_owned(), h.ssh.clone()];
+        ssh_args.extend(self.remote_command.iter().cloned());
+        let (req_tx, mut notices) = match net::connect_command(&self.ssh_program, &ssh_args) {
+            Ok(pair) => pair,
+            Err(e) => return self.set_flash(format!(":host {} — {e:#}", h.name)),
+        };
+        let host = self.hosts.len();
+        if let Some(tx) = &self.merged_tx {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(n) = notices.recv().await {
+                    if tx.send((host, Some(n))).is_err() {
+                        return;
+                    }
+                }
+                let _ = tx.send((host, None));
+            });
+        }
+        let _ = req_tx.send(Request::List);
+        self.hosts.push(Host::new(h.name.clone(), false, h.dir.clone().map(PathBuf::from), req_tx));
+        self.refresh_sidebar();
+        self.set_flash(format!("added {} — starting a session…", h.name));
+        self.new_session(host);
     }
 
     /// Enter on a rail row: show that session, resuming it on its host if needed. Subagent
@@ -600,7 +655,7 @@ impl App {
     pub fn open_sessions(&self) -> Vec<(String, String)> {
         std::iter::once(&self.cur)
             .chain(&self.others)
-            .filter(|v| !v.session_id.is_empty() && !v.read_only)
+            .filter(|v| v.has_input && !v.session_id.is_empty() && !v.read_only)
             .map(|v| (self.hosts.get(v.host).map(|h| h.name.clone()).unwrap_or_default(), v.session_id.clone()))
             .collect()
     }
@@ -610,7 +665,11 @@ impl App {
         for m in history {
             match m {
                 Message::System { .. } | Message::Context { .. } | Message::Directive { .. } => {}
+                Message::User { content } if jobs::is_note(content) => {
+                    self.cur.transcript.push(Kind::Info, jobs::note_body(content).to_owned());
+                }
                 Message::User { content } => {
+                    self.cur.has_input = true;
                     self.cur.transcript.push(Kind::User, content.clone());
                     if !self.preview_loading {
                         self.history.push(content.clone());
@@ -857,7 +916,8 @@ impl App {
         }
     }
 
-    /// Ctrl-Enter from any mode: finish the comment being written, then send the queue and prompt.
+    /// Ctrl-Enter from any mode (and `:now`): finish the comment being written, send the queue
+    /// and prompt, and interrupt the running turn so waiting messages start at once.
     fn send_now(&mut self) {
         self.ctrl_c_armed = false;
         self.flash = None;
@@ -866,11 +926,19 @@ impl App {
             Mode::Visual { .. } | Mode::Search { .. } | Mode::Command => self.mode = Mode::Normal,
             Mode::Normal | Mode::Insert => {}
         }
-        if self.cur.queue.is_empty() && self.cur.prompt.is_blank() {
+        let typed = !self.cur.queue.is_empty() || !self.cur.prompt.is_blank();
+        if !typed && self.cur.waiting == 0 {
             self.set_flash("nothing to send — comment with c or type with i");
             return;
         }
-        self.submit();
+        if typed {
+            self.submit();
+        }
+        if self.cur.running {
+            let session_id = self.cur.session_id.clone();
+            self.request(self.cur.host, Request::Cancel { session_id });
+            self.set_flash("interrupting — the waiting message starts next");
+        }
     }
 
     /// Sends the prompt plus all queued comments as the next user message.
@@ -884,6 +952,7 @@ impl App {
             return;
         }
         self.cur.prompt.take();
+        self.cur.has_input = true;
         if !text.is_empty() {
             self.history.push(text.clone());
         }
@@ -1289,6 +1358,8 @@ impl App {
             "new" => {
                 self.new_session(self.cur.host);
             }
+            "host" if !arg.is_empty() => self.add_remote_host(arg),
+            "host" => self.set_flash(":host needs an SSH destination, like user@box or user@box:/dir"),
             "help" | "h" => self.view = View::Help,
             "files" => self.open_files(),
             "model" | "models" if arg.is_empty() => self.open_models(),
@@ -1300,6 +1371,7 @@ impl App {
                 self.set_flash(format!("dropped {n} comments"));
             }
             "send" => self.submit(),
+            "now" => self.send_now(),
             "e" | "edit" | "open" if !arg.is_empty() => {
                 let (p, line) = match arg.rsplit_once(':') {
                     Some((p, l)) if l.parse::<usize>().is_ok() => (p, l.parse().ok()),
@@ -1665,9 +1737,15 @@ impl App {
             AgentEvent::Titled { .. } => {}
             AgentEvent::TurnStarted { text } => {
                 self.close_streams();
-                self.cur.transcript.push(Kind::User, text);
+                // A job note starts a turn of its own; it is not one of the user's messages.
+                if jobs::is_note(&text) {
+                    self.cur.transcript.push(Kind::Info, jobs::note_body(&text).to_owned());
+                } else {
+                    self.cur.has_input = true;
+                    self.cur.transcript.push(Kind::User, text);
+                    self.cur.waiting = self.cur.waiting.saturating_sub(1);
+                }
                 self.cur.running = true;
-                self.cur.waiting = self.cur.waiting.saturating_sub(1);
                 self.cur.follow = true;
                 self.cur.turn_started = Instant::now();
                 self.cur.activity = Some("waiting for model".into());
@@ -1751,6 +1829,9 @@ impl App {
                     Routing::Unsure { level, confidence } => format!("unsure ({level} {confidence:.2})"),
                     Routing::Unavailable { .. } => "unrouted".into(),
                 });
+            }
+            AgentEvent::JobsNote { text } => {
+                self.cur.transcript.push(Kind::Info, jobs::note_body(&text).to_owned());
             }
             AgentEvent::Warning(w) => {
                 self.cur.transcript.push(Kind::Info, w);

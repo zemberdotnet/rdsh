@@ -168,6 +168,7 @@ mod tests {
             modified: SystemTime::now(),
             parent: parent.map(str::to_owned),
             cwd: cwd.into(),
+            has_input: true,
             title: title.into(),
             slug: None,
         }
