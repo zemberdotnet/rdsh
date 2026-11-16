@@ -56,11 +56,11 @@ async fn next(rx: &mut UnboundedReceiver<Notice>) -> Notice {
     tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("notice in time").expect("hub alive")
 }
 
-/// Skips `Sessions` notices.
+/// Skips `Sessions` and `Hello` notices.
 async fn next_non_list(rx: &mut UnboundedReceiver<Notice>) -> Notice {
     loop {
         match next(rx).await {
-            Notice::Sessions { .. } => continue,
+            Notice::Sessions { .. } | Notice::Hello { .. } => continue,
             n => return n,
         }
     }

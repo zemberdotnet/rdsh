@@ -48,7 +48,7 @@ fn scripted_hub(dir: PathBuf, answers: Vec<&'static str>) -> Hub {
 async fn next(rx: &mut UnboundedReceiver<Notice>) -> Notice {
     loop {
         let n = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.expect("notice in time").expect("connected");
-        if !matches!(n, Notice::Sessions { .. }) {
+        if !matches!(n, Notice::Sessions { .. } | Notice::Hello { .. }) {
             return n;
         }
     }

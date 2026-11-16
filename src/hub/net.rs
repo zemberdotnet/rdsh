@@ -73,6 +73,14 @@ pub async fn serve(hub: Hub, socket: &Path, idle: Option<Duration>) -> Result<()
                 tokio::spawn(attach(hub.clone(), r, w));
             }
             _ = tick.tick() => {
+                if hub.restart_requested() {
+                    if hub.busy() {
+                        // Wait for running turns and jobs to drain.
+                    } else {
+                        let _ = std::fs::remove_file(socket);
+                        return Ok(());
+                    }
+                }
                 if hub.clients() > 0 || hub.busy() {
                     idle_since = tokio::time::Instant::now();
                 } else if idle.is_some_and(|d| idle_since.elapsed() >= d) {

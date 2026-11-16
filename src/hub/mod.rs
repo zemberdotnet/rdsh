@@ -11,7 +11,10 @@ pub mod proto;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -47,6 +50,8 @@ struct Inner {
     factory: Factory,
     sessions_dir: Option<PathBuf>,
     state: Mutex<State>,
+    /// Set by `Request::Restart`; the listener stops accepting clients and exits.
+    restart: AtomicBool,
 }
 
 #[derive(Default)]
@@ -139,7 +144,7 @@ impl Hub {
         if let Some(dir) = &sessions_dir {
             trace::prune_empty_sessions(dir);
         }
-        Self { inner: Arc::new(Inner { factory, sessions_dir, state: Mutex::new(State::default()) }) }
+        Self { inner: Arc::new(Inner { factory, sessions_dir, state: Mutex::new(State::default()), restart: AtomicBool::new(false) }) }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -153,6 +158,9 @@ impl Hub {
     pub fn connect(&self) -> (UnboundedSender<Request>, UnboundedReceiver<Notice>) {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel();
         let (ntx, nrx) = mpsc::unbounded_channel();
+        // Sent first on every connection so the client can compare versions before any
+        // session traffic (upgrades key off this).
+        let _ = ntx.send(Notice::Hello { version: env!("CARGO_PKG_VERSION").to_owned() });
         let id = {
             let mut st = self.state();
             st.next_client += 1;
@@ -178,6 +186,11 @@ impl Hub {
     /// Whether any session is mid-turn or has background jobs running.
     pub fn busy(&self) -> bool {
         self.state().sessions.values().any(|s| s.running || s.jobs.as_ref().is_some_and(|j| j.any_running()))
+    }
+
+    /// Whether `Request::Restart` has been received.
+    pub fn restart_requested(&self) -> bool {
+        self.inner.restart.load(Ordering::SeqCst)
     }
 
     fn notify(&self, client: u64, notice: Notice) {
@@ -279,6 +292,15 @@ impl Hub {
                 match loaded {
                     Ok((id, l)) => self.notify(client, Notice::Trace { session_id: id, cwd: l.cwd, history: l.messages }),
                     Err(e) => self.error(client, Some(session_id), format!("{e:#}")),
+                }
+            }
+            Request::Restart => {
+                // Draining happens in the serve loop: it stops accepting new clients and exits
+                // once no session is busy. Tell the requesting client now.
+                self.inner.restart.store(true, Ordering::SeqCst);
+                let n = Notice::Restarting;
+                for c in self.state().clients.iter() {
+                    let _ = c.tx.send(n.clone());
                 }
             }
         }

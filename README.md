@@ -62,6 +62,7 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | `:new`, `:q`, `:q!` | start another session; quit (refuses while other sessions run), quit and stop them |
 | `:model`, `:model <id>` | pick this session's model from a list (`models` in the config; Enter picks, `q` backs out), or name any id; it applies from the next turn and a resumed session keeps it |
 | `:host user@box[:/dir]` | add a remote machine to the rail over SSH, start its rdsh hub if needed, and start a session there |
+| `:restart` | ask the current host's hub to drain and exit; the next connection starts the latest binary (also happens automatically when a newer client connects) |
 | `:e path[:line]`, `:send`, `:help`, `:q` | commands |
 | Ctrl-C | interrupt the turn, clear input, or quit (press twice) |
 

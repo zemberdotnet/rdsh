@@ -30,6 +30,33 @@ pub fn today() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Compares two dotted version strings numerically, e.g. `0.99.0 < 0.100.0 < 1.0 < 2.0`.
+///
+/// Components are parsed as unsigned integers, with a missing component treated as `0`. A
+/// leading `v` is ignored. Non-numeric components compare as 0 (the numeric part still wins),
+/// which keeps a version like `0.2.0-rc1` usable while remaining simple.
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(s: &str) -> Vec<u64> {
+        s.trim()
+            .trim_start_matches('v')
+            .split('.')
+            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+    let (a, b) = (parts(a), parts(b));
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        match x.cmp(&y) {
+            std::cmp::Ordering::Equal => {}
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 /// A sortable, collision-resistant session id: `YYYYMMDD-HHMMSS-xxxx` (UTC).
 pub fn new_session_id() -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -150,5 +177,17 @@ mod tests {
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(base64(b"hi!"), "aGkh");
         assert_eq!(base64(b"h"), "aA==");
+    }
+
+    #[test]
+    fn versions_compare_numerically() {
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_versions("0.99.0", "0.100.0"), Less);
+        assert_eq!(compare_versions("0.100", "1.0"), Less);
+        assert_eq!(compare_versions("1.0", "2.0"), Less);
+        assert_eq!(compare_versions("2.0", "1.0"), Greater);
+        assert_eq!(compare_versions("0.2.0", "0.2.0"), Equal);
+        assert_eq!(compare_versions("1.0.0", "1.0"), Equal);
+        assert_eq!(compare_versions("v1.2.3", "1.2.4"), Less);
     }
 }

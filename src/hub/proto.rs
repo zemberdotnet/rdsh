@@ -48,12 +48,18 @@ pub enum Request {
     /// Read a recorded session without running it (subagents, sessions owned elsewhere);
     /// answered with `Trace`.
     ReadTrace { session_id: String },
+    /// Ask the hub to stop accepting new turns, then exit so the next connection starts the
+    /// latest binary. Answered with `Restarting` and, after draining, the connection closes.
+    Restart,
 }
 
 /// Hub → client.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Notice {
+    /// Sent first on every connection: the hub's build/version so a client can tell whether it
+    /// is older or newer than the binary it was launched from.
+    Hello { version: String },
     /// Recorded sessions plus which of them the hub currently runs. Sent on `List` and whenever
     /// that set changes.
     Sessions { recorded: Vec<SessionInfo>, open: Vec<String>, running: Vec<String> },
@@ -67,6 +73,8 @@ pub enum Notice {
     File { file: Box<FileDiff> },
     /// Reply to `ChangedFiles`: `(git status, path relative to cwd)` pairs.
     ChangedFiles { cwd: String, files: Vec<(String, String)> },
+    /// The hub is draining and about to exit (reply to `Restart`).
+    Restarting,
     Error { session_id: Option<String>, message: String },
 }
 

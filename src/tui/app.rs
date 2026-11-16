@@ -149,6 +149,10 @@ pub struct Host {
     pub dir: Option<PathBuf>,
     req_tx: UnboundedSender<Request>,
     pub connected: bool,
+    /// Hub version from its `Hello` notice, once seen.
+    pub version: Option<String>,
+    /// The hub version we already asked to restart; avoids a restart loop on reconnect.
+    restart_requested: Option<String>,
     /// From the host's last `Sessions` notice.
     pub recorded: Vec<SessionInfo>,
     pub open: HashSet<String>,
@@ -165,6 +169,8 @@ impl Host {
             dir,
             req_tx,
             connected: true,
+            version: None,
+            restart_requested: None,
             recorded: Vec::new(),
             open: HashSet::new(),
             running: HashSet::new(),
@@ -216,8 +222,6 @@ pub struct App {
     /// Read-only views of rail rows loaded for previewing, with their trace's age when loaded.
     previews: HashMap<(usize, String), (Option<std::time::SystemTime>, SessionView)>,
     preview_requested: HashSet<(usize, String)>,
-    /// The mouse is over the rail (previews without taking focus).
-    pub(crate) hover: bool,
     /// Building a preview: its messages stay out of the prompt history.
     preview_loading: bool,
     /// Drawing a preview: no cursor.
@@ -276,7 +280,6 @@ impl App {
             sidebar_open: false,
             previews: HashMap::new(),
             preview_requested: HashSet::new(),
-            hover: false,
             preview_loading: false,
             previewing: false,
             history: Vec::new(),
@@ -337,6 +340,22 @@ impl App {
             return;
         }
         match n {
+            Notice::Hello { version } => {
+                // The connecting TUI is assumed to be the latest binary. A hub whose version is
+                // strictly older is asked to drain and restart; an equal or newer hub is left alone.
+                let client_version = env!("CARGO_PKG_VERSION");
+                let older = crate::util::compare_versions(&version, client_version).is_lt();
+                let already = self.hosts[host].restart_requested.as_deref() == Some(version.as_str());
+                self.hosts[host].version = Some(version.clone());
+                if older && !already {
+                    self.hosts[host].restart_requested = Some(version.clone());
+                    self.request(host, Request::Restart);
+                    self.set_flash(format!("{} is older (hub {version}, client {client_version}) — restarting…", self.hosts[host].name));
+                }
+            }
+            Notice::Restarting => {
+                self.set_flash(format!("{} is draining and will restart", self.hosts[host].name));
+            }
             Notice::Sessions { recorded, open, running } => {
                 // Drop previews of sessions whose trace changed since they were loaded.
                 let modified: HashMap<&str, std::time::SystemTime> = recorded.iter().map(|s| (s.id.as_str(), s.modified)).collect();
@@ -453,10 +472,10 @@ impl App {
         self.others.iter().position(|v| v.host == host && v.session_id == id)
     }
 
-    /// The rail row being previewed: the selection, while the rail is focused or hovered, when
-    /// it is a session that is not the one on screen.
+    /// The rail row being previewed: the selection, while the rail has keyboard focus, when it
+    /// is a session that is not the one on screen. Hovering never previews.
     pub(crate) fn preview_id(&self) -> Option<(usize, String)> {
-        if !self.sidebar_open || !(self.sidebar_focus || self.hover) {
+        if !self.sidebar_open || !self.sidebar_focus {
             return None;
         }
         let row = self.sidebar.rows().get(self.sidebar_sel)?;
@@ -1358,6 +1377,10 @@ impl App {
             "new" => {
                 self.new_session(self.cur.host);
             }
+            "restart" => {
+                self.request(self.cur.host, Request::Restart);
+                self.set_flash(format!("restarting {}…", self.hosts[self.cur.host].name));
+            }
             "host" if !arg.is_empty() => self.add_remote_host(arg),
             "host" => self.set_flash(":host needs an SSH destination, like user@box or user@box:/dir"),
             "help" | "h" => self.view = View::Help,
@@ -1616,20 +1639,13 @@ impl App {
                 }
                 MouseEventKind::ScrollDown => self.sidebar_sel = (self.sidebar_sel + 1).min(last),
                 MouseEventKind::ScrollUp => self.sidebar_sel = self.sidebar_sel.saturating_sub(1),
-                // Hovering a row previews it without taking keyboard focus.
-                MouseEventKind::Moved if m.row > rail.y => {
-                    let i = self.sidebar_scroll + (m.row - rail.y - 1) as usize;
-                    if i <= last && !self.sidebar.rows().is_empty() {
-                        self.hover = true;
-                        self.sidebar_sel = i;
-                    }
-                }
+                // Moving the mouse over the rail changes nothing: selection and previews follow
+                // clicks and keys only.
                 _ => {}
             }
             self.request_preview();
             return;
         }
-        self.hover = false;
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.sidebar_focus = false;
         }
