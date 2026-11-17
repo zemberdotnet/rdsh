@@ -1,0 +1,16 @@
+{
+  "name": "rdsh-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "check": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts"
+  },
+  "devDependencies": {
+    "d3": "^7.9.2",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0"
+  }
+}

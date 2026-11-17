@@ -79,6 +79,7 @@ Queued comments are sent with your next message inside a `<review_comments>` blo
 - `src/trace.rs`: JSONL traces; resume rebuilds the exact model-visible history
 - `src/comments.rs`, `src/links.rs`, `src/diff.rs`: review features
 - `src/tui/`: UI (`app.rs` state and keys, `render.rs`, `transcript.rs` wrapped rows, `motion.rs` vim motions, `fileview.rs`)
+- `src/webview.rs`: `rdsh web` (HTTP, login, the WebSocket relay to the hubs); `web/src/`: the browser client (`app.ts` state, `keys.ts`, `view.ts`, `layout.ts` grid and markdown, `session.ts` agent events, `rail.ts`, `diagram.ts`)
 
 `cargo test` runs the unit tests, the agent-loop integration tests (scripted provider) and the TUI behavior tests (key events against a test backend).
 
@@ -105,3 +106,31 @@ rdsh --host me@build-box:/srv/app           # new sessions there start in /srv/a
 If rdsh is not on the remote `PATH` for non-interactive shells, set `remote_command` to its full path, e.g. `["/home/me/.cargo/bin/rdsh", "connect"]`.
 
 With several hosts the rail groups sessions under a heading per host (`◆ build`; `✗ build (disconnected)` when the connection drops). Enter on a heading starts a session on that host. Everything about a remote session happens on its host: its agent and tools run there, and file links, diffs (`Enter`/`gf`, `r` to reload) and the changed-files list (`F`) are read there. The status line shows `host @ session`.
+
+## Browser
+
+```sh
+rdsh web                                    # serves the browser UI on 127.0.0.1:7357 and opens it
+rdsh web --host me@build-box --no-open      # remote hosts work the same as in the TUI; just print the URL
+```
+
+`rdsh web` is a client like the TUI: for each open page it connects to the local hub and to every configured host (over SSH, as above), and relays them over one WebSocket. Hubs still never listen on the network. The page is a monospace grid with the TUI's keys where the browser allows them; the browser keeps `Ctrl-w`, so window commands use `Ctrl-Space` (`Ctrl-Space h` focuses the rail). `:help` lists everything. Sessions keep running in the hub when the tab closes, and the URL names the session on screen, so a reload or bookmark comes back to it.
+
+Access: the server binds `127.0.0.1` only. The URL it prints carries a token from `$XDG_RUNTIME_DIR/rdsh/web.token` (made once, so tabs survive restarts); the first visit swaps it for an HttpOnly, SameSite=Strict cookie. Requests must name `127.0.0.1` or `localhost` as their host, and the WebSocket must come from the page's own origin with the cookie, so other sites open in the same browser can't drive your agents. To use it from another machine, forward the port: `ssh -L 7357:127.0.0.1:7357 box` and open the printed URL locally.
+
+**Diagrams.** Turns sent from the browser tell the model, once, that it can draw: a ```` ```d3 ```` block in its reply becomes an interactive diagram (if the session continues from the TUI, the model is told to stop, since the terminal shows the block as code). The script gets `d3` (v7), `svg`, `g` (pan/zoom layer), `W`, `H`, `C` (palette), `CH` (character width) and `pick(label)`, which puts a clicked item into your prompt as context. `// rows: N` sets the height, `// title: …` the caption. `Enter` on a diagram gives it the keys (`hjkl` pan, `+`/`-` zoom, `0` reset, `Esc` leaves). A script that throws shows its error, and the error goes to the model with your next message so it can fix it.
+
+Diagram scripts are model-written, so each runs isolated: in a sandboxed iframe with an opaque origin (no access to the page, its cookie, storage or the WebSocket; no popups, forms or tab navigation), loaded from its own `<random>.localhost` name so the browser gives it its own process (a hung script is removed after a few seconds without freezing the page or other diagrams), under a CSP that allows no network (D3 is served by `rdsh web`), and removed if it navigates itself away. Its messages to the page are limited to focusing itself, adding a pick to the prompt (never sending it), and `Esc`/`Ctrl-Space` to leave: a script cannot type, send or run commands.
+
+**Questions.** In sessions a client is attached to, the agent has an `ask` tool: it puts one or more forms in front of you (text, paragraph, single or multiple choice with an optional "other", yes/no, number; defaults it proposes; optional fields) and waits. In the browser the form docks above the prompt: Tab moves between fields, Enter goes to the next, Ctrl-Enter to the next form or submits, Esc returns to the chat with the form still waiting, `i` comes back to it. You can also answer in your own words (`o`, or "reply in words"): the next message you send is the answer. Every client watching the session sees the form, and the first answer wins. The TUI shows the questions as text, and your next message there is the answer. `rdsh run` and subagents don't get the tool.
+
+The page uses DejaVu Sans Mono, served by `rdsh web` (license in `web/src/fonts/LICENSE`), so it looks the same on every machine and loads nothing from other sites.
+
+The client is TypeScript in `web/src`, bundled by esbuild into `web/dist`, which is committed and compiled into the binary, so building rdsh does not need Node. To work on it (Node comes with the dev shell):
+
+```sh
+cd web && npm install
+npm run watch                               # rebuilds web/dist on change
+RDSH_WEB_DIR=web/dist cargo run -- web      # serve from disk: reload the page to see changes
+npm run check && npm test                   # types, unit tests
+```

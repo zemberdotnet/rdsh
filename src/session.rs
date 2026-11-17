@@ -74,6 +74,8 @@ pub fn build(cfg: &Config, cwd: &Path, provider: Arc<dyn Provider>, start: Start
     registry.add(Arc::new(tools::bash::Bash { background: true }));
     registry.add(Arc::new(tools::jobs::JobOutput));
     registry.add(Arc::new(tools::jobs::JobKill));
+    // Offered to the model only once a client that can answer attaches (`Agent::enable_questions`).
+    registry.add(Arc::new(tools::ask::AskTool));
     let system_prompt = prompt::main(provider.model(), &registry);
     let provider_for_titles = provider.clone();
     let length = match cfg.length_routing {

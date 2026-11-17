@@ -36,7 +36,12 @@ pub enum Request {
         effort: Effort,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// The client draws ```d3 blocks as diagrams (the browser); the agent is told so.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        diagrams: bool,
     },
+    /// Answer the `ask` call `question_id` (its tool call id); the first answer wins.
+    Answer { session_id: String, question_id: String, answer: crate::tools::ask::Answer },
     /// Interrupt the running turn.
     Cancel { session_id: String },
     /// Stop receiving events for a session. Its agent keeps running.

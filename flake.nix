@@ -10,7 +10,7 @@
     in {
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer git ];
+          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer git nodejs ];
         };
       });
     };

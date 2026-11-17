@@ -102,7 +102,7 @@ async fn two_clients_see_the_same_session_and_a_late_joiner_misses_nothing() {
     assert_eq!(id, "s1");
 
     // A starts a turn; B joins while the model is still thinking.
-    a_tx.send(Request::Send { session_id: id.clone(), text: "hello".into(), effort: Effort::Low, model: None }).unwrap();
+    a_tx.send(Request::Send { session_id: id.clone(), text: "hello".into(), effort: Effort::Low, model: None, diagrams: false }).unwrap();
     let Notice::Event { event: AgentEvent::TurnStarted { .. }, .. } = next_non_list(&mut a_rx).await else { panic!() };
     b_tx.send(Request::Open { session_id: id.clone() }).unwrap();
     let Notice::Opened { snapshot: late } = next_non_list(&mut b_rx).await else { panic!() };
@@ -120,7 +120,7 @@ async fn two_clients_see_the_same_session_and_a_late_joiner_misses_nothing() {
     assert!(b_all.iter().any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "first answer")));
 
     // Either client can drive the session; both see the turn.
-    b_tx.send(Request::Send { session_id: id.clone(), text: "again".into(), effort: Effort::Off, model: None }).unwrap();
+    b_tx.send(Request::Send { session_id: id.clone(), text: "again".into(), effort: Effort::Off, model: None, diagrams: false }).unwrap();
     let a2 = turn_events(&mut a_rx).await;
     let b2 = turn_events(&mut b_rx).await;
     assert_eq!(kinds(&a2), kinds(&b2));
@@ -148,7 +148,7 @@ async fn untouched_sessions_stay_out_of_the_rail_until_the_first_message() {
 
     // Sending the first message makes it a rail row immediately, titled from the text while
     // the trace still only has its `session_start` record.
-    let send = Request::Send { session_id: id.clone(), text: "hello".into(), effort: Effort::High, model: None };
+    let send = Request::Send { session_id: id.clone(), text: "hello".into(), effort: Effort::High, model: None, diagrams: false };
     tx.send(send).unwrap();
     let mut row = None;
     for _ in 0..10 {
@@ -199,7 +199,7 @@ async fn sessions_keep_running_without_viewers_and_resume_on_open() {
     let id = snapshot.session_id;
     // Stop watching, then send: the turn still runs.
     tx.send(Request::Close { session_id: id.clone() }).unwrap();
-    tx.send(Request::Send { session_id: id.clone(), text: "work".into(), effort: Effort::High, model: None }).unwrap();
+    tx.send(Request::Send { session_id: id.clone(), text: "work".into(), effort: Effort::High, model: None, diagrams: false }).unwrap();
     // Wait until the hub reports the session idle again.
     let mut saw_running = false;
     loop {
@@ -223,7 +223,7 @@ async fn sessions_keep_running_without_viewers_and_resume_on_open() {
     let Notice::Opened { snapshot } = next_non_list(&mut rx2).await else { panic!() };
     assert_eq!(snapshot.session_id, id);
     assert!(!snapshot.history.is_empty());
-    tx2.send(Request::Send { session_id: id.clone(), text: "continue".into(), effort: Effort::High, model: None }).unwrap();
+    tx2.send(Request::Send { session_id: id.clone(), text: "continue".into(), effort: Effort::High, model: None, diagrams: false }).unwrap();
     let evs = turn_events(&mut rx2).await;
     assert!(evs.iter().any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "resumed answer")));
     assert_eq!(builds.load(Ordering::SeqCst), 2, "one New, one Resume");
@@ -245,7 +245,7 @@ async fn a_model_picked_for_a_turn_sticks_and_is_traced() {
     assert_eq!(snapshot.model, "scripted");
     let send = |text: &str, model: Option<&str>| {
         let model = model.map(str::to_owned);
-        tx.send(Request::Send { session_id: id.clone(), text: text.into(), effort: Effort::High, model }).unwrap();
+        tx.send(Request::Send { session_id: id.clone(), text: text.into(), effort: Effort::High, model, diagrams: false }).unwrap();
     };
     send("a", None);
     turn_events(&mut rx).await;
@@ -280,7 +280,7 @@ async fn cancel_read_trace_and_errors() {
     tx.send(Request::New { cwd: None }).unwrap();
     let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
     let id = snapshot.session_id;
-    tx.send(Request::Send { session_id: id.clone(), text: "x".into(), effort: Effort::High, model: None }).unwrap();
+    tx.send(Request::Send { session_id: id.clone(), text: "x".into(), effort: Effort::High, model: None, diagrams: false }).unwrap();
     let Notice::Event { event: AgentEvent::TurnStarted { .. }, .. } = next_non_list(&mut rx).await else { panic!() };
     tx.send(Request::Cancel { session_id: id.clone() }).unwrap();
     let evs = turn_events(&mut rx).await;
@@ -292,7 +292,7 @@ async fn cancel_read_trace_and_errors() {
 
     tx.send(Request::Open { session_id: "nope".into() }).unwrap();
     assert!(matches!(next_non_list(&mut rx).await, Notice::Error { .. }));
-    tx.send(Request::Send { session_id: "nope".into(), text: "x".into(), effort: Effort::High, model: None }).unwrap();
+    tx.send(Request::Send { session_id: "nope".into(), text: "x".into(), effort: Effort::High, model: None, diagrams: false }).unwrap();
     assert!(matches!(next_non_list(&mut rx).await, Notice::Error { .. }));
 }
 
@@ -312,11 +312,11 @@ fn protocol_messages_roundtrip_as_json() {
     let text = serde_json::to_string(&n).unwrap();
     let back: Notice = serde_json::from_str(&text).unwrap();
     assert_eq!(serde_json::to_string(&back).unwrap(), text);
-    let r = Request::Send { session_id: "s1".into(), text: "hi".into(), effort: Effort::High, model: None };
+    let r = Request::Send { session_id: "s1".into(), text: "hi".into(), effort: Effort::High, model: None, diagrams: false };
     assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&r).unwrap()).unwrap(), r);
     // Clients from before thinking effort existed get the default.
     let old: Request = serde_json::from_str(r#"{"type":"send","session_id":"s1","text":"hi"}"#).unwrap();
-    assert_eq!(old, Request::Send { session_id: "s1".into(), text: "hi".into(), effort: Effort::High, model: None });
+    assert_eq!(old, Request::Send { session_id: "s1".into(), text: "hi".into(), effort: Effort::High, model: None, diagrams: false });
     assert!(text.contains(r#""type":"event""#));
 }
 
@@ -350,7 +350,7 @@ async fn a_job_finishing_while_idle_starts_a_turn_and_keeps_the_hub_busy() {
     let (tx, mut rx) = hub.connect();
     tx.send(Request::New { cwd: None }).unwrap();
     let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
-    tx.send(Request::Send { session_id: snapshot.session_id, text: "build".into(), effort: Effort::Low, model: None }).unwrap();
+    tx.send(Request::Send { session_id: snapshot.session_id, text: "build".into(), effort: Effort::Low, model: None, diagrams: false }).unwrap();
     turn_events(&mut rx).await;
     // The turn is over but the job runs: the hub must not shut down as idle.
     assert!(hub.busy());
@@ -359,4 +359,83 @@ async fn a_job_finishing_while_idle_starts_a_turn_and_keeps_the_hub_busy() {
     assert!(text.starts_with("<background_jobs>") && text.contains("finished: exit 0") && text.contains("built"), "{text}");
     assert!(evs.iter().any(|e| matches!(e, AgentEvent::Assistant { message: Message::Assistant { content, .. }, .. } if content == "the build is done")));
     assert!(!hub.busy());
+}
+
+/// Waits for a session event matching `f`, skipping the rest.
+async fn event_where(rx: &mut UnboundedReceiver<Notice>, f: impl Fn(&AgentEvent) -> bool) -> AgentEvent {
+    loop {
+        if let Notice::Event { event, .. } = next_non_list(rx).await
+            && f(&event)
+        {
+            return event;
+        }
+    }
+}
+
+#[tokio::test]
+async fn ask_waits_for_a_client_and_the_first_answer_wins() {
+    use rdsh::{
+        llm::ToolCall,
+        tools::ask::{Answer, AskTool},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let form = serde_json::json!({"title": "Open a PR", "forms": [{"fields": [
+        {"id": "title", "label": "PR title", "type": "text", "default": "Fix rail"},
+        {"id": "draft", "label": "Draft?", "type": "confirm"}
+    ]}]});
+    let provider = Arc::new(ScriptedProvider::new([
+        Message::assistant("", vec![ToolCall { id: "q1".into(), name: "ask".into(), arguments: form.to_string() }]),
+        Message::assistant("opening it", vec![]),
+    ]));
+    let d = dir.path().to_path_buf();
+    let p = provider.clone();
+    let factory: Factory = Arc::new(move |_| {
+        let mut opts = options(p.clone(), &d, trace::Trace::create(&d, "s1", "scripted", &d, None)?);
+        let mut tools = tools::builtin();
+        tools.add(Arc::new(AskTool));
+        opts.tools = Arc::new(tools);
+        Ok(Agent::new(opts))
+    });
+    let hub = Hub::new(factory, Some(dir.path().to_path_buf()));
+    let (a, mut a_rx) = hub.connect();
+    let (b, mut b_rx) = hub.connect();
+    a.send(Request::New { cwd: None }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut a_rx).await else { panic!("opened") };
+    let id = snapshot.session_id;
+    b.send(Request::Open { session_id: id.clone() }).unwrap();
+    assert!(matches!(next_non_list(&mut b_rx).await, Notice::Opened { .. }));
+    a.send(Request::Send { session_id: id.clone(), text: "open a PR".into(), effort: Effort::High, model: None, diagrams: false }).unwrap();
+
+    // Both clients see the question; a client joining now sees it in the snapshot.
+    let q = event_where(&mut a_rx, |e| matches!(e, AgentEvent::Question { .. })).await;
+    let AgentEvent::Question { call_id, ask } = q else { unreachable!() };
+    assert_eq!((call_id.as_str(), ask.forms[0].fields.len()), ("q1", 2));
+    event_where(&mut b_rx, |e| matches!(e, AgentEvent::Question { .. })).await;
+    let (c, mut c_rx) = hub.connect();
+    c.send(Request::Open { session_id: id.clone() }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut c_rx).await else { panic!("opened") };
+    assert!(snapshot.turn.iter().any(|e| matches!(e, AgentEvent::Question { .. })));
+
+    // The model was offered `ask` because hub sessions can answer.
+    assert!(provider.requests().len() == 1);
+
+    let mut values = serde_json::Map::new();
+    values.insert("title".into(), serde_json::json!("Fix rail counts"));
+    values.insert("draft".into(), serde_json::json!(false));
+    b.send(Request::Answer { session_id: id.clone(), question_id: "q1".into(), answer: Answer::Form { values } }).unwrap();
+    let ans = event_where(&mut a_rx, |e| matches!(e, AgentEvent::Answered { .. })).await;
+    assert!(matches!(ans, AgentEvent::Answered { call_id, .. } if call_id == "q1"));
+    event_where(&mut a_rx, |e| matches!(e, AgentEvent::TurnEnd { .. })).await;
+
+    // A late answer from another client is refused.
+    a.send(Request::Answer { session_id: id.clone(), question_id: "q1".into(), answer: Answer::Dismissed }).unwrap();
+    assert!(matches!(next_non_list(&mut a_rx).await, Notice::Error { .. }));
+
+    let reqs = provider.requests();
+    let result = reqs[1].iter().find_map(|m| match m {
+        Message::Tool { name, content, .. } if name == "ask" => Some(content.clone()),
+        _ => None,
+    });
+    let result = result.expect("the answer reached the model");
+    assert!(result.contains("title: \"Fix rail counts\"") && result.contains("draft: false"), "{result}");
 }

@@ -19,3 +19,4 @@ pub mod tools;
 pub mod trace;
 pub mod tui;
 pub mod util;
+pub mod webview;

@@ -65,7 +65,7 @@ async fn wait_for_socket(socket: &Path) {
 }
 
 async fn run_turn(tx: &tokio::sync::mpsc::UnboundedSender<Request>, rx: &mut UnboundedReceiver<Notice>, id: &str, text: &str) -> Vec<AgentEvent> {
-    tx.send(Request::Send { session_id: id.into(), text: text.into(), effort: Effort::High, model: None }).unwrap();
+    tx.send(Request::Send { session_id: id.into(), text: text.into(), effort: Effort::High, model: None, diagrams: false }).unwrap();
     let mut out = Vec::new();
     loop {
         if let Notice::Event { event, .. } = next(rx).await {

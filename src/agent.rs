@@ -39,6 +39,10 @@ pub enum AgentEvent {
     ResponseLength(Routing),
     /// Background jobs finished mid-turn; `text` is the note the model got.
     JobsNote { text: String },
+    /// The `ask` call `call_id` is waiting for the user to answer these forms.
+    Question { call_id: String, ask: crate::tools::ask::Ask },
+    /// The `ask` call `call_id` got its answer (from any client).
+    Answered { call_id: String, answer: crate::tools::ask::Answer },
     /// Non-fatal problem (for example, the trace could not be written).
     Warning(String),
     TurnEnd { cancelled: bool, error: Option<String> },
@@ -79,9 +83,13 @@ pub struct Agent {
     pub effort: Effort,
     /// Model for the next turn's requests instead of the provider's; subagents inherit it.
     pub model: Option<String>,
+    /// The user reads this session in a client that draws ```d3 blocks (`rdsh web`).
+    pub diagrams: bool,
     trace_failed: Option<String>,
     /// Background shell jobs; only top-level agents have them.
     jobs: Option<Arc<Jobs>>,
+    /// Questions from `ask` waiting for the user; set by a client that can answer them.
+    questions: Option<Arc<crate::tools::ask::Questions>>,
 }
 
 impl Drop for Agent {
@@ -154,13 +162,20 @@ impl Agent {
     }
 
     fn bare(opts: AgentOptions, history: Vec<Message>) -> Self {
-        let specs = opts.tools.specs();
-        Self { opts, specs, history, usage: Usage::default(), effort: Effort::default(), model: None, trace_failed: None, jobs: None }
+        // `ask` is offered only once someone can answer (`enable_questions`).
+        let specs = opts.tools.specs().into_iter().filter(|s| s.name != "ask").collect();
+        Self { opts, specs, history, usage: Usage::default(), effort: Effort::default(), model: None, diagrams: false, trace_failed: None, jobs: None, questions: None }
     }
 
     /// Lets this agent's `bash` calls run as background jobs, which it hears about in notes.
     pub fn enable_jobs(&mut self, jobs: Arc<Jobs>) {
         self.jobs = Some(jobs);
+    }
+
+    /// Lets this agent's `ask` calls reach the user, and offers the tool to the model.
+    pub fn enable_questions(&mut self, questions: Arc<crate::tools::ask::Questions>) {
+        self.questions = Some(questions);
+        self.specs = self.opts.tools.specs();
     }
 
     pub fn jobs(&self) -> Option<&Arc<Jobs>> {
@@ -278,6 +293,11 @@ impl Agent {
         if let Some(content) = directive {
             self.push(Message::Directive { content });
         }
+        if !jobs_note
+            && let Some(content) = prompt::diagrams_note(&self.history, self.diagrams)
+        {
+            self.push(Message::Directive { content });
+        }
         if let Some(content) = self.jobs.as_ref().filter(|_| !jobs_note).and_then(|j| j.turn_note()) {
             self.push(Message::Directive { content });
         }
@@ -372,6 +392,7 @@ impl Agent {
                         effort: self.effort,
                         model: self.model.clone(),
                         jobs: self.jobs.clone(),
+                        questions: self.questions.clone(),
                     };
                     tokio::select! {
                         biased;

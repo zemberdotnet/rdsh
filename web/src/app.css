@@ -1,0 +1,100 @@
+/* DejaVu Sans Mono: the installed copy when there is one (rendered with the system's own
+   font settings, like the terminal), else the one rdsh web serves (license: fonts/LICENSE). */
+@font-face { font-family: "DejaVu Sans Mono"; src: local("DejaVu Sans Mono"), local("DejaVuSansMono"), url(fonts/DejaVuSansMono.woff2) format("woff2"); font-weight: 400; font-style: normal; }
+@font-face { font-family: "DejaVu Sans Mono"; src: local("DejaVu Sans Mono Bold"), local("DejaVuSansMono-Bold"), url(fonts/DejaVuSansMono-Bold.woff2) format("woff2"); font-weight: 700; font-style: normal; }
+@font-face { font-family: "DejaVu Sans Mono"; src: local("DejaVu Sans Mono Oblique"), local("DejaVuSansMono-Oblique"), url(fonts/DejaVuSansMono-Oblique.woff2) format("woff2"); font-weight: 400; font-style: italic; }
+@font-face { font-family: "DejaVu Sans Mono"; src: local("DejaVu Sans Mono Bold Oblique"), local("DejaVuSansMono-BoldOblique"), url(fonts/DejaVuSansMono-BoldOblique.woff2) format("woff2"); font-weight: 700; font-style: italic; }
+
+/* Gruvbox dark, the same palette as src/tui/theme.rs. */
+:root {
+  --bg: #282828; --fg: #ebdbb2; --fg-dim: #a89984; --gray: #928374;
+  --panel: #3c3836; --sel: #504945; --code: #32302f;
+  --red: #fb4934; --green: #b8bb26; --yellow: #fabd2f; --blue: #83a598;
+  --purple: #d3869b; --aqua: #8ec07c; --orange: #fe8019;
+  --lh: 20px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+body {
+  font: 14px/var(--lh) "DejaVu Sans Mono", monospace;
+  overflow: hidden; font-variant-ligatures: none; font-kerning: none;
+  /* Set by View.measure so every cell is a whole number of device pixels, as in a terminal. */
+  letter-spacing: var(--ls, 0);
+}
+#app { display: flex; flex-direction: column; height: 100vh; }
+#body { flex: 1; display: flex; min-height: 0; }
+#rail { flex: none; background: var(--bg); border-right: 1px solid var(--panel); overflow: hidden; white-space: pre; cursor: default; user-select: none; }
+#rail.hidden { display: none; }
+#main { flex: 1; position: relative; overflow: hidden; min-width: 0; }
+#content { position: absolute; left: 0; right: 0; top: 0; }
+#lines { white-space: pre; }
+.row { height: var(--lh); overflow: hidden; }
+#overlays { position: absolute; inset: 0; pointer-events: none; }
+#overlays iframe { position: absolute; border: 1px solid var(--panel); background: var(--bg); pointer-events: auto; border-radius: 2px; }
+#overlays iframe.active { border-color: var(--purple); box-shadow: 0 0 0 1px var(--purple); }
+#cursor { position: absolute; height: var(--lh); background: var(--fg); color: var(--bg); white-space: pre; pointer-events: none; }
+#cursor.dim { background: transparent; color: transparent; outline: 1px solid var(--gray); }
+#cursor.off { display: none; }
+#sep { height: var(--lh); white-space: pre; color: var(--gray); overflow: hidden; }
+#prompt { display: flex; background: var(--bg); }
+#prompt .g { color: var(--aqua); font-weight: 700; white-space: pre; }
+#input { flex: 1; font: inherit; letter-spacing: inherit; color: var(--fg); background: transparent; border: 0; outline: 0; resize: none; padding: 0; margin: 0; line-height: var(--lh); caret-color: var(--fg); overflow: hidden; }
+#input.ro { color: var(--gray); }
+#input::placeholder { color: var(--gray); }
+.caret { background: var(--fg); }
+#status { height: var(--lh); white-space: pre; overflow: hidden; display: flex; }
+#status .l { flex: 1; overflow: hidden; }
+#status .r { flex: none; color: var(--gray); }
+.badge { color: var(--bg); font-weight: 700; }
+
+/* Text classes used by rows. */
+.dim { color: var(--gray); } .fgdim { color: var(--fg-dim); }
+.b { font-weight: 700; } .i { font-style: italic; }
+.user { background: var(--panel); }
+.ug { color: var(--aqua); font-weight: 700; }
+.h1 { color: var(--orange); font-weight: 700; } .h2 { color: var(--yellow); font-weight: 700; } .h3 { color: var(--aqua); font-weight: 700; }
+.ic { color: var(--orange); }
+.link { color: var(--blue); text-decoration: underline; }
+.code { background: var(--code); }
+.lang { color: var(--gray); }
+.kw { color: var(--red); } .str { color: var(--green); } .num { color: var(--purple); } .com { color: var(--gray); font-style: italic; } .ty { color: var(--yellow); }
+.ok { color: var(--green); } .bad { color: var(--red); } .run { color: var(--yellow); } .purple { color: var(--purple); } .aqua { color: var(--aqua); } .orange { color: var(--orange); } .blue { color: var(--blue); }
+.err { color: var(--red); }
+.vis { background: var(--sel); }
+.match { background: var(--yellow); color: var(--bg); }
+.rsel { background: var(--sel); color: var(--fg); }
+.rhead { background: var(--panel); font-weight: 700; }
+
+#help { position: fixed; inset: 0; background: color-mix(in srgb, var(--bg) 92%, transparent); white-space: pre; overflow: auto; padding: 1ch 2ch; display: none; }
+#help.open { display: block; }
+#help .h { color: var(--yellow); font-weight: 700; }
+#help .k { color: var(--aqua); }
+.rhead { background: transparent; }
+#rail .row { cursor: pointer; }
+/* Mode badges and the model name's color for each thinking effort. */
+.m-normal { background: var(--blue); } .m-insert { background: var(--green); }
+.m-visual, .m-vline { background: var(--orange); } .m-command, .m-search { background: var(--aqua); } .m-diagram { background: var(--purple); }
+.e-off { color: var(--gray); } .e-low { color: #8fc1e3; } .e-high { color: #4f86d9; } .e-max { color: #8c5ad8; }
+/* The form panel of an `ask` call, docked above the prompt. */
+#form { flex: none; max-height: 60vh; overflow: auto; border-top: 1px solid var(--yellow); background: var(--bg); padding: 0 1ch calc(var(--lh) / 2); }
+#form.sent { opacity: .55; pointer-events: none; }
+#form .fhead { display: flex; justify-content: space-between; color: var(--yellow); line-height: var(--lh); padding-top: calc(var(--lh) / 2); }
+#form .fdesc { color: var(--fg-dim); white-space: pre-wrap; }
+#form .field { margin-top: calc(var(--lh) / 2); }
+#form .label { color: var(--fg); font-weight: 700; }
+#form .help { white-space: pre-wrap; }
+#form .err { color: var(--red); }
+#form input[type=text], #form input[type=number], #form textarea { letter-spacing: inherit;
+  font: inherit; line-height: var(--lh); color: var(--fg); background: var(--panel); border: 0; outline: 0;
+  padding: 0 1ch; width: min(100%, 100ch); box-sizing: border-box; resize: vertical; caret-color: var(--fg);
+}
+#form input.other { width: 40ch; }
+#form input:focus, #form textarea:focus { box-shadow: inset 2px 0 0 var(--yellow); }
+#form .opt { display: block; cursor: pointer; }
+#form .opt:focus-within { color: var(--yellow); }
+#form input[type=radio], #form input[type=checkbox] { accent-color: var(--yellow); margin: 0 .5ch 0 0; vertical-align: -1px; }
+#form .fbar { display: flex; gap: 1ch; align-items: center; flex-wrap: wrap; margin-top: calc(var(--lh) / 2); }
+#form button { font: inherit; letter-spacing: inherit; color: var(--fg); background: var(--panel); border: 0; padding: 0 1ch; cursor: pointer; line-height: var(--lh); }
+#form button.primary { background: var(--yellow); color: var(--bg); font-weight: 700; }
+#form button:focus { outline: 1px solid var(--yellow); }
+.m-form { background: var(--yellow); }

@@ -72,6 +72,7 @@ struct Turn {
     text: String,
     effort: Effort,
     model: Option<String>,
+    diagrams: bool,
 }
 
 /// Hub-side record of one running agent.
@@ -88,6 +89,8 @@ struct Slot {
     usage: Usage,
     /// The agent's background jobs, which keep the hub alive while they run.
     jobs: Option<Arc<Jobs>>,
+    /// Its `ask` calls waiting for an answer.
+    questions: Arc<crate::tools::ask::Questions>,
     /// Whether the user has sent anything to this session. A fresh session is not listed in
     /// the rail until they do, so empty sessions do not take up space.
     has_input: bool,
@@ -234,7 +237,7 @@ impl Hub {
                 }
                 self.subscribe(client, &id);
             }
-            Request::Send { session_id, text, effort, model } => {
+            Request::Send { session_id, text, effort, model, diagrams } => {
                 let hint = title_hint(&text);
                 let (sent, newly_input, open) = {
                     let mut st = self.state();
@@ -243,7 +246,7 @@ impl Hub {
                             let newly_input = !s.has_input;
                             s.has_input = true;
                             s.title_hint.get_or_insert(hint);
-                            (s.cmd_tx.send(Turn { text, effort, model }).is_ok(), newly_input, true)
+                            (s.cmd_tx.send(Turn { text, effort, model, diagrams }).is_ok(), newly_input, true)
                         }
                         None => (false, false, false),
                     }
@@ -257,6 +260,12 @@ impl Hub {
                     }
                     (false, true) => self.error(client, Some(session_id), "the session's agent has stopped".into()),
                     (false, false) => self.error(client, Some(session_id), "session is not open".into()),
+                }
+            }
+            Request::Answer { session_id, question_id, answer } => {
+                let questions = self.state().sessions.get(&session_id).map(|s| s.questions.clone());
+                if !questions.is_some_and(|q| q.answer(&question_id, answer)) {
+                    self.error(client, Some(session_id), "that question is no longer waiting (answered elsewhere, or the turn ended)".into());
                 }
             }
             Request::Cancel { session_id } => {
@@ -377,6 +386,9 @@ impl Hub {
     fn spawn(&self, mut agent: Agent) -> String {
         let id = agent.session_id().unwrap_or("unsaved").to_owned();
         let has_input = has_user_input(agent.history());
+        // Clients of the hub can answer forms, so the agent may ask.
+        let questions = Arc::new(crate::tools::ask::Questions::default());
+        agent.enable_questions(questions.clone());
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Turn>();
         self.state().sessions.insert(
             id.clone(),
@@ -390,6 +402,7 @@ impl Hub {
                 running: false,
                 usage: agent.usage,
                 jobs: agent.jobs().cloned(),
+                questions,
                 has_input,
                 title_hint: None,
             },
@@ -407,8 +420,9 @@ impl Hub {
                     },
                     _ = job_finished(jobs.as_deref()) => None,
                 };
-                if let Some(Turn { effort, model, .. }) = &turn {
+                if let Some(Turn { effort, model, diagrams, .. }) = &turn {
                     agent.effort = *effort;
+                    agent.diagrams = *diagrams;
                     if model.is_some() {
                         agent.model = model.clone();
                     }

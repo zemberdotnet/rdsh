@@ -99,6 +99,8 @@ pub struct SessionView {
     pub(crate) subagent_calls: HashMap<String, String>,
     /// A recorded trace shown without an agent (subagents, sessions owned elsewhere).
     pub(crate) read_only: bool,
+    /// Tool call id of an `ask` waiting for the user; the next message answers it.
+    pub(crate) question: Option<String>,
 }
 
 impl SessionView {
@@ -128,6 +130,7 @@ impl SessionView {
             tool_entries: HashMap::new(),
             subagent_calls: HashMap::new(),
             read_only: false,
+            question: None,
         }
     }
 }
@@ -1026,6 +1029,14 @@ impl App {
         self.hist_pos = None;
         let msg = compose_message(&self.cur.queue, &text);
         self.cur.queue.clear();
+        if let Some(question_id) = self.cur.question.take() {
+            // The agent is waiting on `ask`: this message is the answer, not a new turn.
+            let session_id = self.cur.session_id.clone();
+            let answer = crate::tools::ask::Answer::Text { text: msg };
+            self.request(self.cur.host, Request::Answer { session_id, question_id, answer });
+            self.view = View::Chat;
+            return;
+        }
         // The hub queues turns; the user entry appears when the turn starts (`TurnStarted`),
         // the same way for every client viewing this session.
         if self.cur.running {
@@ -1033,7 +1044,7 @@ impl App {
             self.set_flash("queued — sends when the current turn finishes");
         }
         let session_id = self.cur.session_id.clone();
-        self.request(self.cur.host, Request::Send { session_id, text: msg, effort: self.effort, model: Some(self.cur.model.clone()).filter(|m| !m.is_empty()) });
+        self.request(self.cur.host, Request::Send { session_id, text: msg, effort: self.effort, model: Some(self.cur.model.clone()).filter(|m| !m.is_empty()), diagrams: false });
         self.view = View::Chat;
     }
 
@@ -1898,11 +1909,26 @@ impl App {
             AgentEvent::JobsNote { text } => {
                 self.cur.transcript.push(Kind::Info, jobs::note_body(&text).to_owned());
             }
+            AgentEvent::Question { call_id, ask } => {
+                // Forms are drawn by `rdsh web`; here the questions are text and the next
+                // message is the answer.
+                self.cur.question = Some(call_id);
+                let text = format!("{}\n\nYour next message is the answer (or fill in the form in rdsh web).", ask.as_text());
+                self.cur.transcript.push(Kind::Info, text);
+                self.cur.activity = Some("waiting for your answer".into());
+            }
+            AgentEvent::Answered { call_id, .. } => {
+                if self.cur.question.as_deref() == Some(call_id.as_str()) {
+                    self.cur.question = None;
+                }
+                self.cur.activity = Some("waiting for model".into());
+            }
             AgentEvent::Warning(w) => {
                 self.cur.transcript.push(Kind::Info, w);
             }
             AgentEvent::TurnEnd { cancelled, error } => {
                 self.close_streams();
+                self.cur.question = None;
                 self.cur.running = false;
                 self.cur.activity = None;
                 let running: Vec<usize> = self

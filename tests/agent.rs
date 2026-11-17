@@ -377,3 +377,66 @@ async fn sessions_are_titled_once_in_the_background() {
     agent.run_turn("again".into(), sink, CancellationToken::new()).await;
     assert_eq!(namer.requests().len(), 1, "named once");
 }
+
+#[tokio::test]
+async fn the_browser_turn_tells_the_model_about_diagrams_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([
+        Message::assistant("one", vec![]),
+        Message::assistant("two", vec![]),
+        Message::assistant("three", vec![]),
+    ]));
+    let mut agent = agent_with(provider.clone(), dir.path(), None);
+    let notes = |msgs: &[Message]| -> Vec<String> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                Message::Directive { content } if content.starts_with("<diagrams>") => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    agent.diagrams = true;
+    for text in ["a", "b"] {
+        let (sink, _) = collecting_sink();
+        agent.run_turn(text.into(), sink, CancellationToken::new()).await;
+    }
+    agent.diagrams = false;
+    let (sink, _) = collecting_sink();
+    agent.run_turn("c".into(), sink, CancellationToken::new()).await;
+    let reqs = provider.requests();
+    let on = notes(&reqs[0]);
+    assert_eq!(on.len(), 1);
+    assert!(on[0].contains("```d3") && on[0].contains("pick(label)"));
+    assert_eq!(notes(&reqs[1]).len(), 1, "not repeated on the next browser turn");
+    let all = notes(&reqs[2]);
+    assert_eq!(all.len(), 2, "back in the terminal: one note saying so");
+    assert!(all[1].contains("don't draw"));
+}
+
+#[tokio::test]
+async fn ask_is_offered_only_when_someone_can_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([Message::assistant("a", vec![]), Message::assistant("b", vec![])]));
+    let mut tools = tools::builtin();
+    tools.add(Arc::new(rdsh::tools::ask::AskTool));
+    let mut agent = Agent::new(AgentOptions {
+        provider: provider.clone(),
+        tools: Arc::new(tools),
+        system_prompt: "sys".into(),
+        max_steps: 3,
+        cwd: dir.path().to_path_buf(),
+        bash_timeout: Duration::from_secs(5),
+        max_tool_output: 30_000,
+        trace: None,
+        length: None,
+        titler: None,
+    });
+    let (sink, _) = collecting_sink();
+    agent.run_turn("headless".into(), sink, CancellationToken::new()).await;
+    agent.enable_questions(Arc::new(rdsh::tools::ask::Questions::default()));
+    let (sink, _) = collecting_sink();
+    agent.run_turn("in a client".into(), sink, CancellationToken::new()).await;
+    let offered = provider.tool_names();
+    assert!(!offered[0].iter().any(|t| t == "ask"), "nobody to answer: not offered");
+    assert!(offered[1].iter().any(|t| t == "ask"));
+}

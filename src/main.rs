@@ -9,6 +9,7 @@ use rdsh::{
     llm::{Message, Provider},
     session::{self, Start},
     trace, tui,
+    webview::{self, Connector, HostSpec, Settings},
 };
 
 const HELP: &str = "\
@@ -19,6 +20,7 @@ USAGE:
     rdsh run [OPTIONS] <PROMPT>    run one turn headless (stdout: answer, stderr: progress)
     rdsh login                     store a DeepSeek API key (~/.config/rdsh/credentials.json)
     rdsh logout                    remove the stored key
+    rdsh web [--port N]            browser UI: serves it on 127.0.0.1 and opens it
     rdsh serve [--socket PATH]     run the session hub in the foreground (rdsh starts it on demand)
     rdsh connect [--socket PATH]   relay stdin/stdout to the local hub (used over SSH)
     rdsh sessions [--all]          list recorded sessions
@@ -31,6 +33,8 @@ OPTIONS:
         --host <DEST[:DIR]>  also attach to the hub on an SSH host (repeatable; or a config host name)
         --no-daemon        run sessions inside this process instead of the background hub
         --socket <PATH>    hub socket (default $XDG_RUNTIME_DIR/rdsh/hub.sock)
+        --port <N>         `rdsh web` port (default 7357; another free one when taken)
+        --no-open          `rdsh web`: print the URL instead of opening a browser
     -h, --help             show this help
     -V, --version          show version
 
@@ -51,6 +55,8 @@ struct Args {
     hosts: Vec<String>,
     no_daemon: bool,
     socket: Option<PathBuf>,
+    port: Option<u16>,
+    no_open: bool,
 }
 
 fn parse_args() -> Result<Option<Args>> {
@@ -64,6 +70,8 @@ fn parse_args() -> Result<Option<Args>> {
         hosts: Vec::new(),
         no_daemon: false,
         socket: None,
+        port: None,
+        no_open: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -84,9 +92,11 @@ fn parse_args() -> Result<Option<Args>> {
             "--host" => a.hosts.push(value("--host")?),
             "--no-daemon" => a.no_daemon = true,
             "--socket" => a.socket = Some(PathBuf::from(value("--socket")?)),
+            "--port" => a.port = Some(value("--port")?.parse().context("--port needs a number")?),
+            "--no-open" => a.no_open = true,
             "--" => a.positional.extend(it.by_ref()),
             s if s.starts_with('-') && s.len() > 1 => bail!("unknown option {s} (see --help)"),
-            "run" | "sessions" | "trace" | "login" | "logout" | "serve" | "connect" if a.command.is_none() && a.positional.is_empty() => {
+            "run" | "sessions" | "trace" | "login" | "logout" | "serve" | "connect" | "web" if a.command.is_none() && a.positional.is_empty() => {
                 a.command = Some(arg.clone())
             }
             _ => a.positional.push(arg.clone()),
@@ -177,6 +187,53 @@ fn real_main() -> Result<i32> {
                 Ok(0)
             })
         }
+        Some("web") => {
+            let socket = args.socket.clone().unwrap_or_else(net::default_socket);
+            let exe = std::env::current_exe().context("locating the rdsh binary")?;
+            let mut hosts = vec![HostSpec { name: "local".into(), local: true, dir: None, ssh: None }];
+            hosts.extend(remote_hosts(&cfg, &args)?.iter().map(HostSpec::remote));
+            let settings = Settings {
+                cwd: cwd.display().to_string(),
+                effort: cfg.effort,
+                models: cfg.models.clone(),
+                hosts,
+                assets_dir: std::env::var_os("RDSH_WEB_DIR").map(PathBuf::from),
+            };
+            let (ssh_program, remote_command) = (cfg.ssh_program.clone(), cfg.remote_command.clone());
+            let token_dir = socket.parent().map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+            runtime()?.block_on(async move {
+                if net::connect_socket(&socket).await.is_err() {
+                    // Starting the hub: check the key here so the error is readable.
+                    DeepSeek::new(&cfg)?;
+                }
+                let connector: Connector = Arc::new(move |spec: HostSpec| {
+                    let (socket, exe) = (socket.clone(), exe.clone());
+                    let (ssh_program, remote_command) = (ssh_program.clone(), remote_command.clone());
+                    Box::pin(async move {
+                        match spec.ssh {
+                            None => {
+                                net::ensure_server(&socket, &exe).await?;
+                                net::connect_socket(&socket).await
+                            }
+                            Some(dest) => {
+                                let mut ssh_args = vec!["-T".to_owned(), dest];
+                                ssh_args.extend(remote_command);
+                                net::connect_command(&ssh_program, &ssh_args)
+                            }
+                        }
+                    })
+                });
+                let token = webview::load_token(&token_dir)?;
+                let listener = webview::bind(args.port.unwrap_or(7357), args.port.is_none()).await?;
+                let url = webview::login_url(&listener, &token)?;
+                eprintln!("rdsh web: {url}");
+                if !args.no_open {
+                    open_browser(&url);
+                }
+                webview::serve(listener, settings, connector, token).await?;
+                Ok(0)
+            })
+        }
         _ => {
             if let Some(p) = args.positional.first() {
                 bail!("unexpected argument {p:?} (did you mean `rdsh run`?)");
@@ -190,16 +247,7 @@ fn real_main() -> Result<i32> {
                 }
                 None => Request::New { cwd: Some(cwd.display().to_string()) },
             };
-            let mut remotes = cfg.hosts.clone();
-            for spec in &args.hosts {
-                let h = match cfg.hosts.iter().find(|h| h.name == *spec) {
-                    Some(known) => known.clone(),
-                    None => HostConfig::parse(spec)?,
-                };
-                if !remotes.iter().any(|r| r.name == h.name) {
-                    remotes.push(h);
-                }
-            }
+            let remotes = remote_hosts(&cfg, &args)?;
             let ssh_program = cfg.ssh_program.clone();
             let remote_command = cfg.remote_command.clone();
             let effort = cfg.effort;
@@ -232,6 +280,32 @@ fn real_main() -> Result<i32> {
             })
         }
     }
+}
+
+/// Remote hosts from the config plus `--host` flags (config names or `DEST[:DIR]`).
+fn remote_hosts(cfg: &Config, args: &Args) -> Result<Vec<HostConfig>> {
+    let mut remotes = cfg.hosts.clone();
+    for spec in &args.hosts {
+        let h = match cfg.hosts.iter().find(|h| h.name == *spec) {
+            Some(known) => known.clone(),
+            None => HostConfig::parse(spec)?,
+        };
+        if !remotes.iter().any(|r| r.name == h.name) {
+            remotes.push(h);
+        }
+    }
+    Ok(remotes)
+}
+
+/// Opens `url` in the default browser; failures leave the printed URL to the user.
+fn open_browser(url: &str) {
+    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Builds agents for a hub: new sessions in the requested directory (default `default_cwd`),

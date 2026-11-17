@@ -979,7 +979,7 @@ fn several_hosts_share_the_rail_and_requests_go_to_the_sessions_host() {
     // Sending goes to box.
     t.h.keys("ithanks");
     t.h.key(KeyCode::Enter);
-    assert_eq!(t.remote_request(), Request::Send { session_id: "r1".into(), text: "thanks".into(), effort: Effort::High, model: Some("test-model".into()) });
+    assert_eq!(t.remote_request(), Request::Send { session_id: "r1".into(), text: "thanks".into(), effort: Effort::High, model: Some("test-model".into()), diagrams: false });
 
     // A file link in a remote session is read on box (no local file exists).
     t.h.key(KeyCode::Esc);

@@ -1,5 +1,6 @@
 //! Tool registry and built-in tools.
 
+pub mod ask;
 pub mod bash;
 pub mod fs;
 pub mod jobs;
@@ -58,6 +59,9 @@ pub struct ToolCtx {
     pub model: Option<String>,
     /// Background jobs of the calling agent; `None` for subagents.
     pub jobs: Option<Arc<jobs::Jobs>>,
+    /// Where `ask` waits for the user's answers; `None` when no one can answer (subagents,
+    /// `rdsh run`).
+    pub questions: Option<Arc<ask::Questions>>,
 }
 
 pub trait Tool: Send + Sync {
@@ -172,6 +176,10 @@ pub fn summarize(name: &str, arguments: &str) -> String {
             if path.is_empty() { get("pattern") } else { format!("{}  in {path}", get("pattern")) }
         }
         "task" => get("description"),
+        "ask" => args.get("title").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| {
+            let n = args.pointer("/forms").and_then(Value::as_array).map_or(0, |f| f.iter().map(|f| f["fields"].as_array().map_or(0, Vec::len)).sum());
+            format!("{n} question{}", if n == 1 { "" } else { "s" })
+        }),
         "web_search" => get("query"),
         "web_fetch" => args.get("urls").and_then(Value::as_array).map_or_else(|| get("url"), |a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")),
         "job_output" | "job_kill" => args.get("id").map(|id| format!("job {id}")).unwrap_or_default(),

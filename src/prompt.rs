@@ -57,3 +57,58 @@ pub fn runtime_context(cwd: &Path) -> String {
         date = today(),
     )
 }
+
+const DIAGRAMS_ON: &str = "<diagrams>\n\
+The user is reading this session in rdsh's browser view, which draws fenced ```d3 code blocks as \
+interactive diagrams. Draw one when a picture explains better than text: architecture and data flow, \
+dependency or call graphs, state machines, timelines, sizes and comparisons. Don't draw what a short \
+list says as well, and keep explaining in prose around it.\n\n\
+The block is the body of a function run in a sandboxed frame with no network access, so use only data \
+you already have. In scope: `d3` (v7), `svg` (sized to the frame), `g` (a group with pan and zoom: draw \
+into it), `W` and `H` (frame size in pixels), `C` (colors for a dark background: bg fg fgdim gray panel \
+sel red green yellow blue purple aqua orange), `CH` (pixel width of one character of the 12px monospace \
+font, for sizing labels), and `pick(label)`, which puts `label` into the user's prompt as context: call \
+it from click handlers on the meaningful items. Begin with `// title: <caption>`; `// rows: <n>` sets \
+the height in text rows (default 18, at most 60).\n\
+</diagrams>";
+
+const DIAGRAMS_OFF: &str = "<diagrams>The user is now in a terminal, which shows ```d3 blocks as plain \
+code: don't draw diagrams.</diagrams>";
+
+/// The note telling the model whether its ```d3 blocks are drawn, when that differs from what the
+/// history last said (so it is sent once per change, not every turn).
+///
+/// @param drawn whether this turn comes from a client that draws diagrams.
+pub fn diagrams_note(history: &[crate::llm::Message], drawn: bool) -> Option<String> {
+    let last = history.iter().rev().find_map(|m| match m {
+        crate::llm::Message::Directive { content } if content.starts_with("<diagrams>") => Some(content.as_str()),
+        _ => None,
+    });
+    match (last, drawn) {
+        (None, false) => None,
+        (Some(l), true) if l == DIAGRAMS_ON => None,
+        (Some(l), false) if l == DIAGRAMS_OFF => None,
+        (_, true) => Some(DIAGRAMS_ON.to_owned()),
+        (_, false) => Some(DIAGRAMS_OFF.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod diagram_tests {
+    use super::*;
+    use crate::llm::Message;
+
+    #[test]
+    fn the_diagram_note_is_sent_once_per_change() {
+        let mut h = vec![Message::user("hi")];
+        assert_eq!(diagrams_note(&h, false), None, "terminal sessions never hear about diagrams");
+        let on = diagrams_note(&h, true).unwrap();
+        h.push(Message::Directive { content: on });
+        assert_eq!(diagrams_note(&h, true), None);
+        let off = diagrams_note(&h, false).unwrap();
+        assert!(off.contains("don't draw"));
+        h.push(Message::Directive { content: off });
+        assert_eq!(diagrams_note(&h, false), None);
+        assert!(diagrams_note(&h, true).is_some());
+    }
+}

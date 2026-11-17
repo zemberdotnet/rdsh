@@ -66,6 +66,7 @@ fn ctx() -> ToolCtx {
         effort: Default::default(),
         model: None,
         jobs: None,
+        questions: None,
     }
 }
 

@@ -212,6 +212,7 @@ pub struct ScriptedProvider {
     requests: Mutex<Vec<Vec<Message>>>,
     efforts: Mutex<Vec<Effort>>,
     models: Mutex<Vec<Option<String>>>,
+    tools: Mutex<Vec<Vec<String>>>,
     delay: Option<Duration>,
 }
 
@@ -235,6 +236,11 @@ impl ScriptedProvider {
         self.requests.lock().unwrap().clone()
     }
 
+    /// Names of the tools offered in every request so far.
+    pub fn tool_names(&self) -> Vec<Vec<String>> {
+        self.tools.lock().unwrap().clone()
+    }
+
     /// Thinking effort of every request so far.
     pub fn efforts(&self) -> Vec<Effort> {
         self.efforts.lock().unwrap().clone()
@@ -256,6 +262,7 @@ impl Provider for ScriptedProvider {
             self.requests.lock().unwrap().push(req.messages.to_vec());
             self.efforts.lock().unwrap().push(req.effort);
             self.models.lock().unwrap().push(req.model.map(str::to_owned));
+            self.tools.lock().unwrap().push(req.tools.iter().map(|t| t.name.clone()).collect());
             if let Some(d) = self.delay {
                 tokio::time::sleep(d).await;
             }
