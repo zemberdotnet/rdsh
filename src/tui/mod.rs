@@ -131,6 +131,9 @@ async fn event_loop(
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Lets finished subagents age out of the rail while nothing else happens.
+    let mut age = tokio::time::interval(Duration::from_secs(30));
+    age.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Every wake-up below changes visible state, so each iteration redraws.
     loop {
         terminal.draw(|f| app.draw(f))?;
@@ -159,6 +162,9 @@ async fn event_loop(
             }
             _ = tick.tick(), if animating => {
                 app.spinner = app.spinner.wrapping_add(1);
+            }
+            _ = age.tick(), if app.sidebar_open => {
+                app.refresh_sidebar();
             }
         }
     }

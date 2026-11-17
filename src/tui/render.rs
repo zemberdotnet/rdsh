@@ -253,7 +253,12 @@ impl App {
         } else {
             Style::default().bg(PANEL).fg(GRAY).add_modifier(Modifier::BOLD)
         };
-        let mut lines: Vec<Line> = vec![Line::from(Span::styled(" SESSIONS", header))];
+        let mut title = vec![Span::styled(" SESSIONS", header)];
+        if self.sidebar_hidden > 0 {
+            // `zh` brings them back.
+            title.push(Span::styled(format!(" +{} old", self.sidebar_hidden), Style::default().bg(PANEL).fg(GRAY)));
+        }
+        let mut lines: Vec<Line> = vec![Line::from(title)];
         let rows = self.sidebar.rows();
         if rows.is_empty() {
             lines.push(Line::from(Span::styled(" none in this directory", base.fg(GRAY))));
@@ -686,7 +691,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l(""),
         h("Sessions"),
         l("  S shows or hides the left rail: this directory's sessions, subagents nested beneath"),
-        l("  Ctrl-w h (or click) focuses it: j k g G Ctrl-d/u move and preview · Enter switches · y copies the id"),
+        l("  Ctrl-w h (or click) focuses it: j k g G Ctrl-d/u move and preview (counts work: 3j, 5G) · Enter switches · y copies the id"),
+        l("  Subagents finished over 5 minutes ago are hidden (header shows +N old) · zh shows or hides them"),
         l("  Sessions keep running while you look at another; subagent rows open read-only · :new starts one"),
         l("  :host user@box[:/dir] adds a remote machine, starts its rdsh hub over SSH, and starts a session there"),
         l("  :restart asks this host's hub to drain, exit, and come back on the latest binary"),

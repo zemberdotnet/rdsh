@@ -18,7 +18,7 @@ use super::{
     input::{Input, InputAction},
     motion::{self, Cursor, Lines, Motion, Pos},
     render::FILE_GUTTER,
-    sidebar::{Live, LiveSub, Sidebar},
+    sidebar::{Live, LiveSub, STALE_SUBAGENT, Sidebar},
     transcript::{GUTTER, Kind, ToolEntry, ToolStatus, Transcript},
 };
 use crate::{
@@ -219,6 +219,10 @@ pub struct App {
     pub(crate) sidebar_scroll: usize,
     /// Whether the session rail is shown.
     pub(crate) sidebar_open: bool,
+    /// Show subagents that finished long ago (`zh` toggles, as in lf).
+    sidebar_show_stale: bool,
+    /// How many old subagent rows the rail is hiding.
+    pub(crate) sidebar_hidden: usize,
     /// Read-only views of rail rows loaded for previewing, with their trace's age when loaded.
     previews: HashMap<(usize, String), (Option<std::time::SystemTime>, SessionView)>,
     preview_requested: HashSet<(usize, String)>,
@@ -278,6 +282,8 @@ impl App {
             sidebar_sel: 0,
             sidebar_scroll: 0,
             sidebar_open: false,
+            sidebar_show_stale: false,
+            sidebar_hidden: 0,
             previews: HashMap::new(),
             preview_requested: HashSet::new(),
             preview_loading: false,
@@ -723,6 +729,8 @@ impl App {
     /// seen. Cheap: no filesystem work happens here.
     pub fn refresh_sidebar(&mut self) {
         let selected = self.sidebar.rows().get(self.sidebar_sel).map(|r| (r.host, r.header, r.id.clone()));
+        let cutoff = std::time::SystemTime::now() - STALE_SUBAGENT;
+        let mut hidden = 0;
         let parts: Vec<(String, Sidebar)> = self
             .hosts
             .iter()
@@ -734,9 +742,18 @@ impl App {
                     (None, false) => None,
                 };
                 let title = if h.connected { h.name.clone() } else { format!("{} (disconnected)", h.name) };
-                (title, Sidebar::build(i, &h.recorded, filter.as_deref(), &h.live, &h.running))
+                let mut part = Sidebar::build(i, &h.recorded, filter.as_deref(), &h.live, &h.running);
+                if !self.sidebar_show_stale {
+                    // The session on screen and the row under the cursor stay put.
+                    hidden += part.hide_finished_before(cutoff, |r| {
+                        (i == self.cur.host && r.id == self.cur.session_id)
+                            || selected.as_ref().is_some_and(|(h, _, id)| *h == i && *id == r.id)
+                    });
+                }
+                (title, part)
             })
             .collect();
+        self.sidebar_hidden = hidden;
         // A single host needs no heading.
         self.sidebar = if parts.len() == 1 {
             parts.into_iter().next().map(|(_, s)| s).unwrap_or_default()
@@ -776,17 +793,48 @@ impl App {
         let n = self.sidebar.rows().len();
         let last = n.saturating_sub(1);
         let half = (self.sidebar_area.map_or(10, |a| a.height as usize) / 2).max(1);
-        if self.pending.take() == Some('W') {
-            if matches!(k.code, KeyCode::Char('l' | 'w') | KeyCode::Right) {
-                self.sidebar_focus = false;
+        match self.pending.take() {
+            Some('W') => {
+                if matches!(k.code, KeyCode::Char('l' | 'w') | KeyCode::Right) {
+                    self.sidebar_focus = false;
+                }
+                return;
             }
+            Some('z') => {
+                if k.code == KeyCode::Char('h') {
+                    self.sidebar_show_stale = !self.sidebar_show_stale;
+                    let before = self.sidebar.rows().len();
+                    self.refresh_sidebar();
+                    let changed = self.sidebar.rows().len().abs_diff(before);
+                    self.set_flash(match (self.sidebar_show_stale, changed) {
+                        (true, 0) => "no finished subagents to show".to_owned(),
+                        (true, n) => format!("showing {n} finished subagents"),
+                        (false, _) => "hiding subagents finished over 5 minutes ago".to_owned(),
+                    });
+                    self.request_preview();
+                }
+                self.count = None;
+                return;
+            }
+            _ => {}
+        }
+        if let KeyCode::Char(c) = k.code
+            && !ctrl
+            && c.is_ascii_digit()
+            && (c != '0' || self.count.is_some())
+        {
+            let d = c.to_digit(10).unwrap_or(0) as usize;
+            self.count = Some(self.count.unwrap_or(0).saturating_mul(10).saturating_add(d).min(100_000));
             return;
         }
+        let count = self.count.take();
+        let step = count.unwrap_or(1);
         match (k.code, ctrl) {
-            (KeyCode::Char('j') | KeyCode::Down, false) => self.sidebar_sel = (self.sidebar_sel + 1).min(last),
-            (KeyCode::Char('k') | KeyCode::Up, false) => self.sidebar_sel = self.sidebar_sel.saturating_sub(1),
+            (KeyCode::Char('j') | KeyCode::Down, false) => self.sidebar_sel = (self.sidebar_sel + step).min(last),
+            (KeyCode::Char('k') | KeyCode::Up, false) => self.sidebar_sel = self.sidebar_sel.saturating_sub(step),
             (KeyCode::Char('g') | KeyCode::Home, false) => self.sidebar_sel = 0,
-            (KeyCode::Char('G') | KeyCode::End, false) => self.sidebar_sel = last,
+            (KeyCode::Char('G') | KeyCode::End, false) => self.sidebar_sel = count.map_or(last, |n| n.saturating_sub(1).min(last)),
+            (KeyCode::Char('z'), false) => self.pending = Some('z'),
             (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => self.sidebar_sel = (self.sidebar_sel + half).min(last),
             (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => self.sidebar_sel = self.sidebar_sel.saturating_sub(half),
             (KeyCode::Char('w'), true) => self.pending = Some('W'),
@@ -1703,6 +1751,7 @@ impl App {
             && s.state != state
         {
             s.state = state;
+            s.finished = (state != Live::Running).then(std::time::SystemTime::now);
             self.refresh_sidebar();
         }
     }
@@ -1803,7 +1852,7 @@ impl App {
                 self.cur.subagent_calls.insert(call_id, session_id.clone());
                 let parent = self.cur.session_id.clone();
                 if let Some(h) = self.hosts.get_mut(self.cur.host) {
-                    h.live.insert(session_id, LiveSub { parent, title, state: Live::Running });
+                    h.live.insert(session_id, LiveSub { parent, title, state: Live::Running, finished: None });
                 }
                 self.refresh_sidebar();
             }

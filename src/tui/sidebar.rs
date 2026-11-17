@@ -4,11 +4,17 @@
 //! start (`AgentEvent::SubagentStarted`), so a subagent appears as soon as it starts even
 //! before its trace has a title on disk.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, SystemTime},
+};
 
 use unicode_width::UnicodeWidthChar;
 
 use crate::trace::SessionInfo;
+
+/// Finished subagents older than this are hidden from the rail until `zh` shows them.
+pub const STALE_SUBAGENT: Duration = Duration::from_secs(5 * 60);
 
 /// How a subagent is doing right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +31,8 @@ pub struct LiveSub {
     pub parent: String,
     pub title: String,
     pub state: Live,
+    /// When it stopped running, once it has.
+    pub finished: Option<SystemTime>,
 }
 
 /// One row of the rail.
@@ -40,6 +48,8 @@ pub struct Row {
     pub title: String,
     /// `Running` for a session mid-turn in the hub; for subagents, the outcome seen, if any.
     pub live: Option<Live>,
+    /// For a subagent that is not running: when it finished (or its trace was last written).
+    pub finished: Option<SystemTime>,
 }
 
 /// The rail's rows in display order: sessions newest first, each followed by its subagents
@@ -75,6 +85,11 @@ impl Sidebar {
                 let l = live.get(&s.id);
                 // The `task` description is the short label; the trace title is the full prompt.
                 let title = l.map(|l| l.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| s.title.clone());
+                let finished = match l {
+                    Some(l) if l.state == Live::Running => None,
+                    Some(l) => l.finished.or(Some(s.modified)),
+                    None => Some(s.modified),
+                };
                 subs.entry(p.as_str()).or_default().push(Row {
                     id: s.id.clone(),
                     host,
@@ -82,6 +97,7 @@ impl Sidebar {
                     depth: 1,
                     title,
                     live: l.map(|l| l.state),
+                    finished,
                 });
             }
         }
@@ -96,6 +112,7 @@ impl Sidebar {
                     depth: 1,
                     title: l.title.clone(),
                     live: Some(l.state),
+                    finished: l.finished,
                 });
             }
         }
@@ -103,7 +120,7 @@ impl Sidebar {
         for s in infos.iter().filter(|s| s.parent.is_none() && cwd.is_none_or(|c| s.cwd == c)) {
             let live = running.contains(&s.id).then_some(Live::Running);
             let title = s.slug.clone().unwrap_or_else(|| s.title.clone());
-            rows.push(Row { id: s.id.clone(), host, header: false, depth: 0, title, live });
+            rows.push(Row { id: s.id.clone(), host, header: false, depth: 0, title, live, finished: None });
             if let Some(mut children) = subs.remove(s.id.as_str()) {
                 children.sort_by_key(|r| sub_number(&r.id));
                 rows.extend(children);
@@ -121,11 +138,28 @@ impl Sidebar {
         self.rows.iter().position(|r| !r.header && r.host == host && r.id == id)
     }
 
+    /// Drops subagent rows that finished before `cutoff`, except those `keep` names and the
+    /// subagents of a session still mid-turn (their traces can go quiet during a long tool call).
+    ///
+    /// @return how many rows were dropped.
+    pub fn hide_finished_before(&mut self, cutoff: SystemTime, keep: impl Fn(&Row) -> bool) -> usize {
+        let before = self.rows.len();
+        let mut parent_running = false;
+        self.rows.retain(|r| {
+            if r.depth == 0 {
+                parent_running = r.live == Some(Live::Running);
+                return true;
+            }
+            parent_running || keep(r) || r.finished.is_none_or(|t| t >= cutoff)
+        });
+        before - self.rows.len()
+    }
+
     /// Joins per-host rails, each under a heading row titled with the host's name.
     pub fn grouped(parts: Vec<(String, Sidebar)>) -> Self {
         let mut rows = Vec::new();
         for (i, (name, part)) in parts.into_iter().enumerate() {
-            rows.push(Row { id: String::new(), host: i, header: true, depth: 0, title: name, live: None });
+            rows.push(Row { id: String::new(), host: i, header: true, depth: 0, title: name, live: None, finished: None });
             rows.extend(part.rows);
         }
         Self { rows }
@@ -197,8 +231,8 @@ mod tests {
     fn live_subagents_show_before_their_trace_has_a_title() {
         let infos = vec![info("b-sub1", "", Some("b"), "/p"), info("b", "root", None, "/p")];
         let mut live = HashMap::new();
-        live.insert("b-sub1".into(), LiveSub { parent: "b".into(), title: "scan lexer".into(), state: Live::Done });
-        live.insert("b-sub2".into(), LiveSub { parent: "b".into(), title: "check docs".into(), state: Live::Running });
+        live.insert("b-sub1".into(), LiveSub { parent: "b".into(), title: "scan lexer".into(), state: Live::Done, finished: None });
+        live.insert("b-sub2".into(), LiveSub { parent: "b".into(), title: "check docs".into(), state: Live::Running, finished: None });
         let sb = Sidebar::build(0, &infos, Some("/p"), &live, &HashSet::new());
         let rows = sb.rows();
         assert_eq!(ids(&sb), [("b", 0), ("b-sub1", 1), ("b-sub2", 1)]);
@@ -210,9 +244,38 @@ mod tests {
     fn live_task_label_wins_over_the_trace_prompt() {
         let infos = vec![info("b-sub1", "read Cargo.toml and report", Some("b"), "/p"), info("b", "root", None, "/p")];
         let mut live = HashMap::new();
-        live.insert("b-sub1".into(), LiveSub { parent: "b".into(), title: "inspect manifest".into(), state: Live::Done });
+        live.insert("b-sub1".into(), LiveSub { parent: "b".into(), title: "inspect manifest".into(), state: Live::Done, finished: None });
         assert_eq!(Sidebar::build(0, &infos, Some("/p"), &live, &HashSet::new()).rows()[1].title, "inspect manifest");
         assert_eq!(Sidebar::build(0, &infos, Some("/p"), &HashMap::new(), &HashSet::new()).rows()[1].title, "read Cargo.toml and report");
+    }
+
+    #[test]
+    fn finished_subagents_hide_after_a_while() {
+        let old = SystemTime::now() - STALE_SUBAGENT * 2;
+        let mut stale = info("b-sub1", "old", Some("b"), "/p");
+        stale.modified = old;
+        let mut kept = info("b-sub3", "old but open", Some("b"), "/p");
+        kept.modified = old;
+        let mut busy = info("c-sub1", "quiet but parent busy", Some("c"), "/p");
+        busy.modified = old;
+        let infos = vec![
+            stale,
+            info("b-sub2", "recent", Some("b"), "/p"),
+            kept,
+            info("b", "root", None, "/p"),
+            busy,
+            info("c", "running", None, "/p"),
+        ];
+        let mut live = HashMap::new();
+        // Running in this process: never hidden, however old its trace.
+        live.insert("b-sub4".into(), LiveSub { parent: "b".into(), title: "live".into(), state: Live::Running, finished: None });
+        // Finished here long ago: its own finish time wins over a fresh trace.
+        live.insert("b-sub2".into(), LiveSub { parent: "b".into(), title: "recent".into(), state: Live::Done, finished: Some(old) });
+        let running = HashSet::from(["c".to_owned()]);
+        let mut sb = Sidebar::build(0, &infos, Some("/p"), &live, &running);
+        let hidden = sb.hide_finished_before(SystemTime::now() - STALE_SUBAGENT, |r| r.id == "b-sub3");
+        assert_eq!(hidden, 2);
+        assert_eq!(ids(&sb), [("b", 0), ("b-sub3", 1), ("b-sub4", 1), ("c", 0), ("c-sub1", 1)]);
     }
 
     #[test]

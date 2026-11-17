@@ -58,7 +58,7 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | Tab / `za` | expand or collapse tool output and reasoning |
 | `Q` | comment queue (`e` edit, `dd` delete, `D` clear) |
 | `F` | list changed files (`git status`) |
-| `S`, `Ctrl-w h` / `Ctrl-w l` | show or hide the session rail; move focus into it and back (`j k g G`, Enter switches to the session, resuming it if needed; subagent rows open read-only; `y` copies the id) |
+| `S`, `Ctrl-w h` / `Ctrl-w l` | show or hide the session rail; move focus into it and back (`j k g G` with counts like `3j`, `zh` shows subagents that finished over 5 minutes ago, Enter switches to the session, resuming it if needed; subagent rows open read-only; `y` copies the id) |
 | `:new`, `:q`, `:q!` | start another session; quit (refuses while other sessions run), quit and stop them |
 | `:model`, `:model <id>` | pick this session's model from a list (`models` in the config; Enter picks, `q` backs out), or name any id; it applies from the next turn and a resumed session keeps it |
 | `:host user@box[:/dir]` | add a remote machine to the rail over SSH, start its rdsh hub if needed, and start a session there |

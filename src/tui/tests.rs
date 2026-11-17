@@ -1062,3 +1062,35 @@ fn job_notes_show_as_status_lines_not_user_messages() {
     assert!(screen.contains("job 1 `cargo build` finished: exit 0 after 3m12s"), "{screen}");
     assert!(!screen.contains("<background_jobs>") && !screen.contains("› job 1"), "{screen}");
 }
+
+#[test]
+fn rail_takes_counts_and_zh_shows_old_subagents() {
+    use crate::tui::sidebar::{Live, LiveSub, STALE_SUBAGENT};
+    let mut h = harness_with_session();
+    let old = std::time::SystemTime::now() - STALE_SUBAGENT * 2;
+    for (id, finished) in [("s1-sub1", Some(old)), ("s1-sub2", None), ("s1-sub3", Some(old))] {
+        let state = if finished.is_some() { Live::Done } else { Live::Running };
+        h.app.hosts[0].live.insert(id.into(), LiveSub { parent: "s1".into(), title: id.into(), state, finished });
+    }
+    h.app.refresh_sidebar();
+    h.key(KeyCode::Esc);
+    h.ctrl('w');
+    h.key(KeyCode::Char('h'));
+    // The finished pair is hidden; the header says so.
+    let ids = |h: &Harness| h.app.sidebar.rows().iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&h), ["s1", "s1-sub2", "s0"]);
+    assert!(h.screen().contains("+2 old"));
+    h.keys("2j");
+    assert_eq!(h.rail_id(), "s0");
+    h.keys("2k");
+    assert_eq!(h.rail_id(), "s1");
+    h.keys("zh");
+    assert_eq!(ids(&h), ["s1", "s1-sub1", "s1-sub2", "s1-sub3", "s0"]);
+    assert_eq!(h.rail_id(), "s1");
+    h.keys("3j");
+    assert_eq!(h.rail_id(), "s1-sub3");
+    h.keys("1G");
+    assert_eq!(h.rail_id(), "s1");
+    h.keys("zh");
+    assert_eq!(ids(&h), ["s1", "s1-sub2", "s0"]);
+}
