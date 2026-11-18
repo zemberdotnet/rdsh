@@ -163,7 +163,7 @@ pub(crate) fn opt_bool(args: &Value, key: &str) -> bool {
     }
 }
 
-/// One-line human summary of a call, used by the TUI and headless output.
+/// One-line human summary of a call, used by headless output and traces.
 pub fn summarize(name: &str, arguments: &str) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     let get = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_owned();

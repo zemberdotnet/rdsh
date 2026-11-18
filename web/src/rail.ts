@@ -1,5 +1,5 @@
 // The session rail: recorded sessions newest first, their subagents nested beneath, one group
-// per host. Port of src/tui/sidebar.rs.
+// per host.
 
 import { millis, type SessionInfo } from "./proto.ts";
 

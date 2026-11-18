@@ -158,44 +158,9 @@ pub fn open_browser(url: &str) {
         .spawn();
 }
 
-/// `http(s)://` URLs in `text` as `(start, end, url)`, char offsets. Trailing sentence
-/// punctuation and closing brackets without a matching opener are left out.
-pub fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
-    static URL: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r#"https?://[^\s<>"'`]+"#).expect("valid url regex"));
-    URL.find_iter(text)
-        .filter_map(|m| {
-            let mut url = m.as_str();
-            loop {
-                let trimmed = url.trim_end_matches(['.', ',', ';', ':', '!', '?', '*', '_']);
-                let unbalanced = |open: char, close: char| {
-                    trimmed.ends_with(close) && trimmed.matches(open).count() < trimmed.matches(close).count()
-                };
-                let next = if unbalanced('(', ')') || unbalanced('[', ']') { &trimmed[..trimmed.len() - 1] } else { trimmed };
-                if next == url {
-                    break;
-                }
-                url = next;
-            }
-            (url.len() > "https://".len()).then(|| {
-                let start = text[..m.start()].chars().count();
-                (start, start + url.chars().count(), url.to_owned())
-            })
-        })
-        .collect()
-}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn urls_drop_trailing_punctuation_and_unmatched_brackets() {
-        let urls = |s: &str| find_urls(s);
-        assert_eq!(urls("see https://x.dev/a."), [(4, 19, "https://x.dev/a".into())]);
-        assert_eq!(urls("(https://en.wikipedia.org/wiki/Rust_(language))")[0].2, "https://en.wikipedia.org/wiki/Rust_(language)");
-        assert_eq!(urls("é http://a.b/c, and **https://d.e**")[1], (22, 33, "https://d.e".into()));
-        assert!(urls("https:// nothing").is_empty());
-    }
 
     #[test]
     fn civil_dates() {

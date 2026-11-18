@@ -1,5 +1,5 @@
 // A file opened from the chat: its diff against HEAD (or the default branch) or the whole file
-// with changed lines marked. Ported from src/tui/fileview.rs; drawn with the transcript's rows.
+// with changed lines marked. Drawn with the transcript's rows.
 
 import { diffRows, type Row, type Seg } from "./layout.ts";
 import type { Base, DiffLine, FileDiff } from "./proto.ts";
@@ -79,7 +79,7 @@ export class FileView {
       const kind = l.kind === "Del" ? "del" : l.kind === "Add" ? "add" : "ctx";
       const n = l.kind === "Del" ? l.old : l.new;
       diffRows(kind, l.text, n, lang, W, words.get(l)).forEach((r, i) => {
-        // A queued comment on the line marks it, as in the TUI.
+        // A queued comment on the line marks it.
         const g: Seg = i === 0 && n != null && commented.has(n) ? ["● ", "orange"] : r.g ?? ["  ", ""];
         push({ ...r, g }, l);
       });

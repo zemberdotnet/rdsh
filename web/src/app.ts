@@ -1,9 +1,9 @@
-// Page state: hosts, sessions, the rail, modes. Handles messages from `rdsh web` the way
-// src/tui/app.rs handles hub notices, and turns user actions into requests.
+// Page state: hosts, sessions, the rail, modes. Handles messages from `rdsh web` (hub notices,
+// relayed) and turns user actions into requests.
 
 import { composeMessage, label, type Anchor, type Comment } from "./comments.ts";
 import { FileView } from "./fileview.ts";
-import { layout, parseFileHref, type Diagram, type PathLinks, type Row } from "./layout.ts";
+import { layout, parseFileHref, splitLine, type Diagram, type PathLinks, type Row } from "./layout.ts";
 import { EFFORTS, millis, type Answer, type ClientMsg, type Effort, type HostSpec, type Notice, type Request, type ServerMsg, type SessionInfo, type Snapshot } from "./proto.ts";
 import { rail, type HostRail, type LiveSub, type RailRow } from "./rail.ts";
 import { SessionView, type Hooks } from "./session.ts";
@@ -283,7 +283,7 @@ export class App {
         break;
       }
       case "changed_files":
-        this.setFlash("the changed-files list is TUI only for now (F)");
+        this.setFlash("the changed-files list is not in the browser yet");
         break;
       case "error":
         this.pendingOpen = null;
@@ -896,7 +896,14 @@ export class App {
         this.request(this.cur.host, { type: "restart" });
         return;
       case "rail": this.railOpen = !this.railOpen; return;
-      case "e": case "files": this.setFlash("file views come in the next step"); return;
+      case "e": {
+        if (!arg) return this.setFlash("usage: :e path[:line]", true);
+        const [path, line] = splitLine(arg);
+        this.openFile(path, line);
+        return;
+      }
+      case "files": this.setFlash("the changed-files list is not in the browser yet", true); return;
+      case "now": this.sendNow(); return;
     }
     this.setFlash(`unknown command: ${name}`, true);
   }
@@ -936,7 +943,7 @@ function parseHash(): { host: string; id: string; readOnly: boolean } | null {
   return m ? { host: decodeURIComponent(m[1]), id: decodeURIComponent(m[2]), readOnly: !!m[3] } : null;
 }
 
-/** Where a chat quote came from, as the TUI names it (src/tui/transcript.rs). */
+/** Where a chat quote came from, named as the model would refer to it. */
 function sourceLabel(e: Row["e"]): string {
   switch (e.k) {
     case "user": return "my earlier message";

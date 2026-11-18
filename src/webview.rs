@@ -1,6 +1,6 @@
 //! `rdsh web`: serves the browser client and relays its WebSocket to the hubs.
 //!
-//! The page talks to this process, not to a hub. Like the TUI it is a client: each browser
+//! The page talks to this process, not to a hub. It is a client: each browser
 //! connection gets one hub connection per host (the local socket, `ssh host rdsh connect` for
 //! remote ones), and every message on the WebSocket is tagged with the host's index. Hubs keep
 //! never listening on the network.
@@ -356,7 +356,7 @@ async fn link_host(i: usize, spec: HostSpec, connector: Connector, links: Links,
             *slot = Some(tx.clone());
         }
         while let Some(n) = notices.recv().await {
-            // Same rule as the TUI: a hub older than this binary is asked to drain and restart.
+            // A hub older than this binary is asked to drain and restart.
             if let Notice::Hello { version } = &n
                 && !restart_asked
                 && crate::util::compare_versions(version, env!("CARGO_PKG_VERSION")).is_lt()

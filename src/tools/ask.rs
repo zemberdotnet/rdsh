@@ -3,7 +3,7 @@
 //! The tool emits `AgentEvent::Question` with the forms; every client watching the session shows
 //! them. The first `Request::Answer` for the call wins: the hub hands it to [`Questions`], the
 //! tool wakes, emits `AgentEvent::Answered` (so the other clients close the form) and returns the
-//! values to the model. A client that cannot draw forms (the TUI) shows the questions as text and
+//! values to the model. A client that cannot draw forms shows the questions as text and
 //! sends the user's next message as a plain-text answer.
 
 use std::{

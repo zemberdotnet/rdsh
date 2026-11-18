@@ -335,7 +335,7 @@ export class View {
     const H = (t: string) => `<span class="h">${t}</span>\n`;
     const K = (k: string, d: string) => `  <span class="k">${esc(k.padEnd(28))}</span>${esc(d)}\n`;
     el.innerHTML =
-      H("rdsh web") + `  <span class="dim">rdsh ${esc(this.app.version)} · the same keys as the TUI where the browser allows</span>\n\n` +
+      H("rdsh web") + `  <span class="dim">rdsh ${esc(this.app.version)} · vim keys where the browser allows</span>\n\n` +
       H("Moving") + K("h j k l  w b e  0 ^ $", "counts work: 5j, 3w") + K("gg G 12G", "top, bottom, row") +
       K("Ctrl-d Ctrl-u Ctrl-f Ctrl-b", "half page, page") + K("Ctrl-e Ctrl-y  zz zt zb", "scroll") + K("H M L", "top, middle, bottom of the screen") +
       K("{ }", "previous / next entry") + "\n" +

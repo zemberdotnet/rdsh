@@ -17,7 +17,7 @@ use tokio::{io::AsyncReadExt, sync::Notify, task::JoinHandle};
 use super::{Tool, ToolCtx, ToolOutput, opt_u64, schema};
 use crate::llm::{BoxFuture, ToolSpec};
 
-/// Opening tag of every job note; the TUI shows user messages starting with it as status lines.
+/// Opening tag of every job note; clients show user messages starting with it as status lines.
 pub const NOTE_TAG: &str = "<background_jobs>";
 const NOTE_END: &str = "</background_jobs>";
 /// Output lines quoted in a job's completion note.

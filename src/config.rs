@@ -48,11 +48,11 @@ pub struct Config {
     pub stream_idle_timeout_secs: u64,
     /// Where session traces are written; defaults to `$XDG_DATA_HOME/rdsh/sessions`.
     pub sessions_dir: Option<PathBuf>,
-    /// Ask the decision model how long each reply should be (top-level TUI turns only).
+    /// Ask the decision model how long each reply should be (top-level turns only, not subagents or `rdsh run`).
     pub length_routing: bool,
     /// Name new sessions with a short model-written title for the session rail.
     pub session_titles: bool,
-    /// Remote machines whose hubs the TUI also attaches to (over SSH).
+    /// Remote machines whose hubs the browser UI also attaches to (over SSH).
     pub hosts: Vec<HostConfig>,
     /// SSH client used for remote hosts.
     pub ssh_program: String,

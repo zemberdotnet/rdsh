@@ -1,5 +1,5 @@
 // One session as the page shows it: transcript entries built from history and live agent
-// events. Ported from SessionView and App::on_agent / load_history in src/tui/app.rs.
+// events.
 
 import type { Comment } from "./comments.ts";
 import type { AgentEvent, Ask, Message, QueuedTurn, Snapshot, Usage } from "./proto.ts";

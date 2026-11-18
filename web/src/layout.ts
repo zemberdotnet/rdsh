@@ -77,7 +77,7 @@ export interface PathLinks {
 /** Set by `layout` for the duration of one call. */
 let paths: PathLinks | null = null;
 
-/** Same shape as the TUI's candidates (src/links.rs): a path, then up to two `:N` parts. */
+/** A path, then up to two `:N` parts (`src/a.rs:12:5`). */
 const PATH = /[~\w./@+\-]+(?::\d+){0,2}/g;
 
 /** Splits `src/a.rs:12:5` into the path and its line. */

@@ -3,25 +3,25 @@ use std::{path::PathBuf, process::ExitCode, sync::Arc};
 use anyhow::{Context, Result, bail};
 use rdsh::{
     config::{Config, HostConfig},
-    hub::{Factory, Hub, OpenKind, Request, net},
+    hub::{Factory, Hub, OpenKind, net},
     headless,
     llm::{Message, Provider},
     providers,
     session::{self, Start},
-    trace, tui,
+    trace,
     webview::{self, Connector, HostSpec, Settings},
 };
 
 const HELP: &str = "\
-rdsh — terminal coding agent for DeepSeek and OpenAI models
+rdsh — coding agent for DeepSeek and OpenAI models, in the browser
 
 USAGE:
-    rdsh [OPTIONS]                 interactive TUI
+    rdsh [OPTIONS]                 the browser UI: serves it on 127.0.0.1 and opens it
     rdsh run [OPTIONS] <PROMPT>    run one turn headless (stdout: answer, stderr: progress)
     rdsh login [PROVIDER]          log in: chatgpt (subscription; --device for a code), openai
                                    (API key) or deepseek (API key); asks when PROVIDER is omitted
     rdsh logout [PROVIDER]         remove one provider's login, or all of them
-    rdsh web [--port N]            browser UI: serves it on 127.0.0.1 and opens it
+    rdsh web                       the same as `rdsh`
     rdsh serve [--socket PATH]     run the session hub in the foreground (rdsh starts it on demand)
     rdsh connect [--socket PATH]   relay stdin/stdout to the local hub (used over SSH)
     rdsh sessions [--all]          list recorded sessions
@@ -29,13 +29,12 @@ USAGE:
 
 OPTIONS:
     -m, --model <MODEL>    model id (default: the last login's, env RDSH_MODEL)
-    -r, --resume <ID>      resume a session by id, prefix, or `last`
-    -C, --cwd <DIR>        working directory (default: current)
+    -r, --resume <ID>      open a session by id, prefix, or `last`
+    -C, --cwd <DIR>        directory for new sessions (default: current)
         --host <DEST[:DIR]>  also attach to the hub on an SSH host (repeatable; or a config host name)
-        --no-daemon        run sessions inside this process instead of the background hub
         --socket <PATH>    hub socket (default $XDG_RUNTIME_DIR/rdsh/hub.sock)
-        --port <N>         `rdsh web` port (default 7357; another free one when taken)
-        --no-open          `rdsh web`: print the URL instead of opening a browser
+        --port <N>         port (default 7357; another free one when taken)
+        --no-open          print the URL instead of opening a browser
         --device           `rdsh login chatgpt`: sign in with a code instead of a redirect
     -h, --help             show this help
     -V, --version          show version
@@ -57,7 +56,6 @@ struct Args {
     cwd: Option<PathBuf>,
     all: bool,
     hosts: Vec<String>,
-    no_daemon: bool,
     socket: Option<PathBuf>,
     port: Option<u16>,
     no_open: bool,
@@ -73,7 +71,6 @@ fn parse_args() -> Result<Option<Args>> {
         cwd: None,
         all: false,
         hosts: Vec::new(),
-        no_daemon: false,
         socket: None,
         port: None,
         no_open: false,
@@ -96,7 +93,6 @@ fn parse_args() -> Result<Option<Args>> {
             "-C" | "--cwd" => a.cwd = Some(PathBuf::from(value("--cwd")?)),
             "--all" => a.all = true,
             "--host" => a.hosts.push(value("--host")?),
-            "--no-daemon" => a.no_daemon = true,
             "--socket" => a.socket = Some(PathBuf::from(value("--socket")?)),
             "--port" => a.port = Some(value("--port")?.parse().context("--port needs a number")?),
             "--no-open" => a.no_open = true,
@@ -140,7 +136,7 @@ fn real_main() -> Result<i32> {
                 let code = rdsh::auth::login(&cfg, provider, args.device).await?;
                 // A running hub keeps the default model it started with.
                 if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
-                    eprintln!("The session hub is running with its old default model; `:restart` in the TUI picks up this login.");
+                    eprintln!("The session hub is running with its old default model; `:restart` in the browser picks up this login.");
                 }
                 Ok(code)
             })
@@ -205,7 +201,19 @@ fn real_main() -> Result<i32> {
                 Ok(0)
             })
         }
-        Some("web") => {
+        // `rdsh` and `rdsh web`: the browser UI.
+        _ => {
+            if let Some(p) = args.positional.first() {
+                bail!("unexpected argument {p:?} (did you mean `rdsh run`?)");
+            }
+            // A session to resume opens in the page (it fails here when it does not exist).
+            let session = match args.resume.as_deref() {
+                Some(q) => {
+                    let path = trace::find_session(&cfg.sessions_dir(), q)?;
+                    path.file_stem().map(|s| s.to_string_lossy().into_owned())
+                }
+                None => None,
+            };
             let socket = args.socket.clone().unwrap_or_else(net::default_socket);
             let exe = std::env::current_exe().context("locating the rdsh binary")?;
             let mut hosts = vec![HostSpec { name: "local".into(), local: true, dir: None, ssh: None }];
@@ -243,62 +251,15 @@ fn real_main() -> Result<i32> {
                 });
                 let token = webview::load_token(&token_dir)?;
                 let listener = webview::bind(args.port.unwrap_or(7357), args.port.is_none()).await?;
-                let url = webview::login_url(&listener, &token)?;
+                let mut url = webview::login_url(&listener, &token)?;
+                if let Some(id) = &session {
+                    url.push_str(&format!("#local/{id}"));
+                }
                 eprintln!("rdsh web: {url}");
                 if !args.no_open {
                     rdsh::util::open_browser(&url);
                 }
                 webview::serve(listener, settings, connector, token).await?;
-                Ok(0)
-            })
-        }
-        _ => {
-            if let Some(p) = args.positional.first() {
-                bail!("unexpected argument {p:?} (did you mean `rdsh run`?)");
-            }
-            // Fail before the TUI starts when the session to resume does not exist.
-            let first = match args.resume.as_deref() {
-                Some(q) => {
-                    let path = trace::find_session(&cfg.sessions_dir(), q)?;
-                    let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    Request::Open { session_id: id }
-                }
-                None => Request::New { cwd: Some(cwd.display().to_string()) },
-            };
-            let remotes = remote_hosts(&cfg, &args)?;
-            let ssh_program = cfg.ssh_program.clone();
-            let remote_command = cfg.remote_command.clone();
-            let effort = cfg.effort;
-            let models = cfg.models.clone();
-            let socket = args.socket.clone().unwrap_or_else(net::default_socket);
-            let no_daemon = args.no_daemon;
-            runtime()?.block_on(async {
-                let (req_tx, notices) = if no_daemon {
-                    let provider: Arc<dyn Provider> = providers::build(&cfg)?;
-                    let sessions_dir = cfg.sessions_dir();
-                    Hub::new(factory(cfg, cwd.clone(), provider), Some(sessions_dir)).connect()
-                } else {
-                    if net::connect_socket(&socket).await.is_err() {
-                        // Starting the hub: check the key here so the error is readable.
-                        providers::build(&cfg)?;
-                        let exe = std::env::current_exe().context("locating the rdsh binary")?;
-                        net::ensure_server(&socket, &exe).await?;
-                    }
-                    net::connect_socket(&socket).await?
-                };
-                let relink = match no_daemon {
-                    true => None,
-                    false => Some(net::Relink::Socket { socket, exe: std::env::current_exe().context("locating the rdsh binary")? }),
-                };
-                let mut links = vec![tui::HostLink { name: "local".into(), local: true, dir: None, req_tx, notices, relink }];
-                for h in remotes {
-                    let mut ssh_args = vec!["-T".to_owned(), h.ssh.clone()];
-                    ssh_args.extend(remote_command.iter().cloned());
-                    let (req_tx, notices) = net::connect_command(&ssh_program, &ssh_args)?;
-                    let relink = Some(net::Relink::Command { program: ssh_program.clone(), args: ssh_args });
-                    links.push(tui::HostLink { name: h.name, local: false, dir: h.dir.map(PathBuf::from), req_tx, notices, relink });
-                }
-                tui::run(links, cwd, first, effort, models, ssh_program, remote_command).await?;
                 Ok(0)
             })
         }

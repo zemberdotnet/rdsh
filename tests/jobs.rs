@@ -143,7 +143,7 @@ async fn a_job_finishing_mid_turn_is_noted_before_the_next_request() {
     let note = notes(&reqs[2]).pop().expect("a note after the second tool round");
     assert!(note.contains("job 1 `echo hi` finished: exit 0") && note.contains("hi"), "{note}");
     assert!(matches!(reqs[2].last(), Some(Message::Directive { .. })));
-    assert_eq!(rx.try_recv().unwrap(), note, "the TUI sees the same note");
+    assert_eq!(rx.try_recv().unwrap(), note, "clients see the same note");
     assert!(!agent.jobs().unwrap().has_news());
 }
 

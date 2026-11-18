@@ -163,7 +163,7 @@ fn grep(cwd: &Path, root: &Path, pattern: &str, filter: Option<&str>, ci: bool) 
             continue;
         }
         let text = String::from_utf8_lossy(&bytes);
-        // Paths are shown relative to the working directory so they are clickable in the TUI.
+        // Paths are shown relative to the working directory so they link in the browser.
         let shown = rel(cwd, path);
         for (i, line) in text.lines().enumerate() {
             if re.is_match(line) {

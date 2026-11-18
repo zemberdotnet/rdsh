@@ -1,7 +1,7 @@
 //! The session hub: owns every running agent and fans its events out to subscribed clients.
 //!
 //! Clients talk to the hub only through [`Request`] and [`Notice`] values over a pair of
-//! channels ([`Hub::connect`]), so the TUI does not know whether the hub lives in its own
+//! channels ([`Hub::connect`]), so a client does not know whether the hub lives in its own
 //! process or behind a socket. Each session's agent runs in its own task and keeps running
 //! while no client is looking at it.
 

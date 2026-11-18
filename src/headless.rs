@@ -1,4 +1,4 @@
-//! `rdsh run`: one turn without the TUI. Assistant text goes to stdout, progress to stderr.
+//! `rdsh run`: one turn without the browser. Assistant text goes to stdout, progress to stderr.
 
 use std::{io::Write, sync::Arc};
 

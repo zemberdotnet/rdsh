@@ -1,5 +1,4 @@
-// Review comments queued by the user and the message that carries them. A port of
-// src/comments.rs: the browser composes exactly what the TUI sends.
+// Review comments queued by the user and the message that carries them.
 
 /** What a comment is attached to. */
 export type Anchor =
