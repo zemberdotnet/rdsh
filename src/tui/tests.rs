@@ -986,7 +986,7 @@ fn several_hosts_share_the_rail_and_requests_go_to_the_sessions_host() {
     t.h.keys("gg}");
     t.h.keys("w");
     t.h.key(KeyCode::Enter);
-    assert_eq!(t.remote_request(), Request::ReadFile { cwd: "/srv/app".into(), path: "/srv/app/src/build.rs".into() });
+    assert_eq!(t.remote_request(), Request::ReadFile { cwd: "/srv/app".into(), path: "/srv/app/src/build.rs".into(), base: crate::diff::Base::Head });
     let file = crate::diff::FileDiff {
         path: "/srv/app/src/build.rs".into(),
         rel: "src/build.rs".into(),
@@ -997,6 +997,7 @@ fn several_hosts_share_the_rail_and_requests_go_to_the_sessions_host() {
         removed: 1,
         error: None,
         head_source: None,
+        base: None,
     };
     t.h.app.on_notice(1, Notice::File { file: Box::new(file.clone()) });
     t.h.draw();
@@ -1005,7 +1006,7 @@ fn several_hosts_share_the_rail_and_requests_go_to_the_sessions_host() {
     assert!(t.h.screen().contains("src/build.rs"));
     // Reloading asks box again.
     t.h.key(KeyCode::Char('r'));
-    assert_eq!(t.remote_request(), Request::ReadFile { cwd: "/srv/app".into(), path: "/srv/app/src/build.rs".into() });
+    assert_eq!(t.remote_request(), Request::ReadFile { cwd: "/srv/app".into(), path: "/srv/app/src/build.rs".into(), base: crate::diff::Base::Head });
     t.h.key(KeyCode::Char('q'));
 
     // Changed files come from box too.
@@ -1015,7 +1016,7 @@ fn several_hosts_share_the_rail_and_requests_go_to_the_sessions_host() {
     t.h.draw();
     assert!(t.h.screen().contains("Changed files"));
     t.h.key(KeyCode::Enter);
-    assert_eq!(t.remote_request(), Request::ReadFile { cwd: "/srv/app".into(), path: "/srv/app/src/build.rs".into() });
+    assert_eq!(t.remote_request(), Request::ReadFile { cwd: "/srv/app".into(), path: "/srv/app/src/build.rs".into(), base: crate::diff::Base::Head });
 }
 
 #[test]
@@ -1093,4 +1094,43 @@ fn rail_takes_counts_and_zh_shows_old_subagents() {
     assert_eq!(h.rail_id(), "s1");
     h.keys("zh");
     assert_eq!(ids(&h), ["s1", "s1-sub2", "s0"]);
+}
+
+#[test]
+fn shift_tab_in_a_file_diffs_against_the_default_branch() {
+    let mut h = Harness::new();
+    let root = h._dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+    };
+    let effort = h.app.effort;
+    h.key(KeyCode::Esc);
+
+    // No remote yet: Shift-Tab stays on HEAD and says why.
+    h.app.open_file(root.join("src/lib.rs"), None);
+    h.draw();
+    h.key(KeyCode::BackTab);
+    let View::File(fv) = &h.app.view else { panic!("file view") };
+    assert!(fv.base.is_head());
+    assert!(h.app.flash.as_deref().is_some_and(|f| f.contains("no default branch")), "{:?}", h.app.flash);
+    h.key(KeyCode::Char('q'));
+
+    // origin/main at the first commit; the branch commits the change, so HEAD is clean.
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&["commit", "-qam", "change"]);
+    h.app.open_file(root.join("src/lib.rs"), None);
+    h.draw();
+    assert!(h.screen().contains("src/lib.rs — no changes — file view"), "{}", h.screen());
+    h.key(KeyCode::BackTab);
+    let View::File(fv) = &h.app.view else { panic!("file view") };
+    assert!(!fv.base.is_head());
+    assert_eq!(fv.file.base.as_deref(), Some("origin/main"));
+    assert!(h.screen().contains("src/lib.rs — +2 -1 vs origin/main"), "{}", h.screen());
+    assert_eq!(h.app.flash.as_deref(), Some("diff against origin/main"));
+    // Reloading keeps the base; Shift-Tab goes back to HEAD. Thinking effort never moved.
+    h.key(KeyCode::Char('r'));
+    assert!(h.screen().contains("vs origin/main"), "{}", h.screen());
+    h.key(KeyCode::BackTab);
+    assert!(h.screen().contains("src/lib.rs — no changes"), "{}", h.screen());
+    assert_eq!(h.app.effort, effort);
 }

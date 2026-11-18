@@ -325,7 +325,7 @@ impl App {
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(format!(" {} ", fv.title()), Style::default().add_modifier(Modifier::BOLD).bg(PANEL)),
-                Span::styled("  Tab diff/file · ]c [c hunks · v/V select · c comment · r reload · q back", dim()),
+                Span::styled("  Tab diff/file · S-Tab vs HEAD/branch · ]c [c hunks · v/V select · c comment · r reload · q back", dim()),
             ])),
             head,
         );
@@ -687,7 +687,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l(""),
         h("Files"),
         l("  Enter / gf / click on a path opens it: diff view (Tab toggles full file), comment on lines with v/V c"),
-        l("  F lists changed files · :e path[:line] opens any file · r reloads · q or Esc goes back"),
+        l("  Shift-Tab diffs against the default branch (origin/main) and back · F lists changed files"),
+        l("  :e path[:line] opens any file · r reloads · q or Esc goes back"),
         l(""),
         h("Sessions"),
         l("  S shows or hides the left rail: this directory's sessions, subagents nested beneath"),

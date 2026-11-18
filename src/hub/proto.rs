@@ -46,8 +46,14 @@ pub enum Request {
     Cancel { session_id: String },
     /// Stop receiving events for a session. Its agent keeps running.
     Close { session_id: String },
-    /// Load `path` (relative to `cwd`) with its git diff on the host; answered with `File`.
-    ReadFile { cwd: String, path: String },
+    /// Load `path` (relative to `cwd`) with its git diff against `base` on the host; answered
+    /// with `File`.
+    ReadFile {
+        cwd: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "crate::diff::Base::is_head")]
+        base: crate::diff::Base,
+    },
     /// Files with uncommitted changes under `cwd` on the host; answered with `ChangedFiles`.
     ChangedFiles { cwd: String },
     /// Read a recorded session without running it (subagents, sessions owned elsewhere);

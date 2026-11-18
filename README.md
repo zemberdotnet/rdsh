@@ -23,11 +23,13 @@ Without direnv, use `nix develop`. `DEEPSEEK_API_KEY` (environment or `.env`) ov
 Optional `~/.config/rdsh/config.json` (all keys optional):
 
 ```json
-{ "model": "deepseek-flash", "models": ["deepseek-flash", "deepseek-v4-pro"], "effort": "high", "max_steps": 200, "subagent_max_steps": 50,
+{ "model": "deepseek-flash", "models": ["deepseek-flash", "deepseek-v4-pro"], "effort": "high", "max_steps": 200, "subagent_max_steps": 0,
   "max_tool_output_chars": 30000, "bash_timeout_secs": 120, "max_retries": 3,
   "stream_idle_timeout_secs": 180, "sessions_dir": "/path/to/sessions",
   "length_routing": true, "decision_url": null, "decision_model": null, "decision_timeout_ms": 2500 }
 ```
+
+`max_steps` caps model requests per turn and `subagent_max_steps` per subagent task; 0 means no limit, which is the default for subagents.
 
 **Response length.** With `OPENROUTER_API_KEY` (or `TYPESAFE_API_KEY`) set, each TUI turn first asks
 Jev, TypeSafe's decision model, how long the reply should be (`yesno`, `brief`, `standard`, `detailed`),
@@ -53,7 +55,7 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | `v` / `V` | charwise / linewise select; `o` swaps ends, `y` yanks via OSC 52 |
 | `c` (or Enter in visual) | comment on the selection (or the current line) |
 | Ctrl-Enter (any mode), `:now` | send queued comments plus any prompt text right away: a running turn is interrupted so the message starts at once (Enter waits for the turn instead); inside a comment, save it then send |
-| Shift-Tab (any mode) | cycle thinking effort: off, low, high, max. The model name in the status line shows it: gray, light blue, blue, deep purple |
+| Shift-Tab (any mode) | cycle thinking effort: off, low, high, max (in an open file it switches the diff base instead). The model name in the status line shows it: gray, light blue, blue, deep purple |
 | Enter / `gf` / mouse click on a path | open the file's diff view |
 | Tab / `za` | expand or collapse tool output and reasoning |
 | `Q` | comment queue (`e` edit, `dd` delete, `D` clear) |
@@ -66,7 +68,7 @@ The app starts in INSERT mode: type, then press Enter to send (Shift-Enter inser
 | `:e path[:line]`, `:send`, `:help`, `:q` | commands |
 | Ctrl-C | interrupt the turn, clear input, or quit (press twice) |
 
-In the file view, the diff against HEAD is shown first; untracked files show as fully added. Code is syntax-highlighted with tree-sitter (Rust, Python, JavaScript, TypeScript and TSX, Go, C, C++, JSON, Bash, TOML, YAML, Nix, Markdown). Deleted lines are highlighted from the HEAD version, and changed lines get a tinted background. Tab switches to the full file with changed lines marked. `v`/`V` then `c`, or Enter, comments on lines, and commented lines show `●`. `r` reloads; `q` goes back.
+In the file view, the diff against HEAD is shown first; untracked files show as fully added. Code is syntax-highlighted with tree-sitter (Rust, Python, JavaScript, TypeScript and TSX, Go, C, C++, JSON, Bash, TOML, YAML, Nix, Markdown). Deleted lines are highlighted from the HEAD version, and changed lines get a tinted background. Tab switches to the full file with changed lines marked. Shift-Tab compares against the default branch instead (`origin/HEAD`, else `origin/main` or `origin/master`, from where the branch left it, as a pull request shows it) and back to HEAD. `v`/`V` then `c`, or Enter, comments on lines, and commented lines show `●`. `r` reloads; `q` goes back.
 
 Queued comments are sent with your next message inside a `<review_comments>` block. Each comment quotes the chat text or diff lines it refers to.
 

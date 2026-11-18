@@ -418,6 +418,7 @@ impl App {
                 {
                     // A reload.
                     fv.replace(*file);
+                    self.check_file_base();
                 }
             }
             Notice::ChangedFiles { cwd, files } => {
@@ -904,8 +905,12 @@ impl App {
             return;
         }
         if k.code == KeyCode::BackTab || (k.code == KeyCode::Tab && k.modifiers.contains(KeyModifiers::SHIFT)) {
-            self.effort = self.effort.next();
             self.ctrl_c_armed = false;
+            // An open file switches its diff base instead.
+            if matches!(self.view, View::File(_)) && matches!(self.mode, Mode::Normal | Mode::Visual { .. }) {
+                return self.toggle_file_base();
+            }
+            self.effort = self.effort.next();
             self.set_flash(format!("thinking {}", self.effort.name()));
             return;
         }
@@ -1207,17 +1212,7 @@ impl App {
             (KeyCode::Esc, _) if visual => self.mode = Mode::Normal,
             (KeyCode::Esc | KeyCode::Char('q'), _) if in_file => self.close_view(),
             (KeyCode::Char('r'), false) if in_file => {
-                let cwd = self.cur.cwd.clone();
-                let mut remote = None;
-                if let View::File(fv) = &mut self.view {
-                    match &fv.remote {
-                        Some((h, c)) => remote = Some((*h, c.clone(), fv.file.path.display().to_string())),
-                        None => fv.reload(&cwd),
-                    }
-                }
-                if let Some((h, c, path)) = remote {
-                    self.request(h, Request::ReadFile { cwd: c, path });
-                }
+                self.reload_file();
                 self.set_flash("reloaded");
             }
             (KeyCode::Char('i' | 'a' | 'A' | 'I'), false) => self.mode = Mode::Insert,
@@ -1529,10 +1524,53 @@ impl App {
         self.open_file_on(self.cur.host, self.cur.cwd.clone(), path, line);
     }
 
+    /// Re-reads the open file against its view's base, on its host when remote.
+    fn reload_file(&mut self) {
+        let cwd = self.cur.cwd.clone();
+        let View::File(fv) = &mut self.view else { return };
+        match &fv.remote {
+            Some((h, c)) => {
+                let (h, req) = (*h, Request::ReadFile { cwd: c.clone(), path: fv.file.path.display().to_string(), base: fv.base });
+                self.request(h, req);
+            }
+            None => {
+                fv.reload(&cwd);
+                self.check_file_base();
+            }
+        }
+    }
+
+    /// Switches the open file between its uncommitted changes and the branch's changes against
+    /// the default branch.
+    fn toggle_file_base(&mut self) {
+        let View::File(fv) = &mut self.view else { return };
+        fv.base = fv.base.toggle();
+        if fv.base.is_head() {
+            self.set_flash("diff against HEAD");
+        }
+        self.reload_file();
+    }
+
+    /// After a load against the default branch: names the branch, or falls back to HEAD when
+    /// the repository has none.
+    fn check_file_base(&mut self) {
+        let View::File(fv) = &mut self.view else { return };
+        if fv.base.is_head() {
+            return;
+        }
+        match fv.file.base.clone() {
+            Some(b) => self.set_flash(format!("diff against {b}")),
+            None => {
+                fv.base = diff::Base::Head;
+                self.set_flash("no default branch (origin/HEAD, origin/main, origin/master); showing HEAD");
+            }
+        }
+    }
+
     fn open_file_on(&mut self, host: usize, cwd: PathBuf, path: PathBuf, line: Option<usize>) {
         if !self.host_is_local(host) {
             self.pending_file = Some(line);
-            let req = Request::ReadFile { cwd: cwd.display().to_string(), path: path.display().to_string() };
+            let req = Request::ReadFile { cwd: cwd.display().to_string(), path: path.display().to_string(), base: diff::Base::Head };
             return self.request(host, req);
         }
         let file = diff::load(&cwd, &path);

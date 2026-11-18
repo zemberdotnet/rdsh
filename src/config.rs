@@ -25,9 +25,9 @@ pub struct Config {
     pub effort: Effort,
     /// OpenAI-compatible base URL (`DEEPSEEK_BASE_URL` overrides).
     pub base_url: String,
-    /// Maximum model requests per user turn in the main agent.
+    /// Maximum model requests per user turn in the main agent; 0 is unlimited.
     pub max_steps: usize,
-    /// Maximum model requests per subagent task.
+    /// Maximum model requests per subagent task; 0 (the default) is unlimited.
     pub subagent_max_steps: usize,
     /// Tool output is truncated (head and tail kept) beyond this many characters.
     pub max_tool_output_chars: usize,
@@ -111,7 +111,7 @@ impl Default for Config {
             effort: Effort::High,
             base_url: "https://api.deepseek.com".into(),
             max_steps: 200,
-            subagent_max_steps: 50,
+            subagent_max_steps: 0,
             max_tool_output_chars: 30_000,
             bash_timeout_secs: 120,
             max_retries: 3,
@@ -188,9 +188,6 @@ impl Config {
         }
         if let Some(h) = self.hosts.iter().find(|h| h.name.is_empty() || h.ssh.is_empty() || h.name == "local") {
             bail!("config: host entries need a `name` (not \"local\") and an `ssh` destination: {h:?}");
-        }
-        if self.max_steps == 0 || self.subagent_max_steps == 0 {
-            bail!("config: `max_steps` and `subagent_max_steps` must be at least 1");
         }
         if self.max_tool_output_chars < 1000 {
             bail!("config: `max_tool_output_chars` must be at least 1000");
@@ -281,8 +278,8 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_zero_steps() {
-        let cfg = Config { max_steps: 0, ..Config::default() };
+    fn validation_rejects_tiny_tool_output() {
+        let cfg = Config { max_tool_output_chars: 10, ..Config::default() };
         assert!(cfg.validate().is_err());
         assert!(Config::default().validate().is_ok());
     }

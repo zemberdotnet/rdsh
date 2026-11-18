@@ -1,5 +1,5 @@
-//! Git-backed views of a file: its current diff against HEAD and the full file with
-//! changed lines marked.
+//! Git-backed views of a file: its current diff against HEAD (or the default branch) and the
+//! full file with changed lines marked.
 
 use std::{
     collections::HashSet,
@@ -39,13 +39,38 @@ impl DiffLine {
     }
 }
 
+/// What the working-tree file is compared against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Base {
+    /// The last commit: uncommitted changes.
+    #[default]
+    Head,
+    /// Where this branch left the remote's default branch (`origin/HEAD`, else `origin/main` or
+    /// `origin/master`): everything the branch changes, as a pull request would show it.
+    Default,
+}
+
+impl Base {
+    pub fn is_head(&self) -> bool {
+        *self == Base::Head
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Base::Head => Base::Default,
+            Base::Default => Base::Head,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Status {
-    /// Tracked with uncommitted changes.
+    /// Tracked with changes against the base.
     Modified,
     /// Not tracked by git; every line counts as added.
     Untracked,
-    /// Tracked and identical to HEAD.
+    /// Tracked and identical to the base.
     Clean,
     /// Not inside a git work tree.
     NoRepo,
@@ -64,8 +89,12 @@ pub struct FileDiff {
     pub removed: usize,
     /// Set when the file could not be read (binary, missing, permission).
     pub error: Option<String>,
-    /// The HEAD version of a modified file, for highlighting deleted lines.
+    /// The base version of a modified file, for highlighting deleted lines.
     pub head_source: Option<String>,
+    /// Branch compared against (`origin/main`) when the base is the default branch; `None`
+    /// means HEAD, including when no default branch could be found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 const MAX_FULL_LINES: usize = 50_000;
@@ -75,22 +104,46 @@ fn git(cwd: &Path, args: &[&str]) -> Option<(bool, String)> {
     Some((out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned()))
 }
 
-/// Loads the diff and full views of `path`.
+/// The remote default branch (`origin/main`) and the commit where HEAD left it.
+fn default_base(dir: &Path) -> Option<(String, String)> {
+    let symbolic = git(dir, &["rev-parse", "--abbrev-ref", "origin/HEAD"])
+        .filter(|(ok, s)| *ok && !s.trim().is_empty() && s.trim() != "origin/HEAD")
+        .map(|(_, s)| s.trim().to_owned());
+    let branch = symbolic.into_iter().chain(["origin/main".to_owned(), "origin/master".to_owned()]).find(|b| {
+        git(dir, &["rev-parse", "--verify", "--quiet", &format!("{b}^{{commit}}")]).is_some_and(|(ok, _)| ok)
+    })?;
+    let fork = git(dir, &["merge-base", "HEAD", &branch])
+        .filter(|(ok, _)| *ok)
+        .map_or_else(|| branch.clone(), |(_, s)| s.trim().to_owned());
+    Some((branch, fork))
+}
+
+/// Loads the diff and full views of `path` against HEAD.
 ///
 /// @param cwd working directory (used for git and relative display paths).
 /// @param path file to show; need not be tracked.
 /// @returns both views; never fails, problems are reported in `error`.
 pub fn load(cwd: &Path, path: &Path) -> FileDiff {
+    load_against(cwd, path, Base::Head)
+}
+
+/// Like [`load`], comparing against `base`. Without a default branch it falls back to HEAD and
+/// leaves `FileDiff::base` unset.
+pub fn load_against(cwd: &Path, path: &Path, base: Base) -> FileDiff {
     let rel = path.strip_prefix(cwd).unwrap_or(path).to_string_lossy().into_owned();
     let dir = path.parent().filter(|p| p.is_dir()).unwrap_or(cwd);
     let p = path.to_string_lossy();
     let in_repo = git(dir, &["rev-parse", "--is-inside-work-tree"]).is_some_and(|(ok, s)| ok && s.trim() == "true");
+    let (label, rev) = match base {
+        Base::Default if in_repo => default_base(dir).map_or((None, "HEAD".to_owned()), |(b, r)| (Some(b), r)),
+        _ => (None, "HEAD".to_owned()),
+    };
     let (status, diff_text) = if !in_repo {
         (Status::NoRepo, String::new())
     } else if !git(dir, &["ls-files", "--error-unmatch", "--", &p]).is_some_and(|(ok, _)| ok) {
         (Status::Untracked, String::new())
     } else {
-        let args = ["diff", "--no-color", "--no-ext-diff", "HEAD", "--", &p];
+        let args = ["diff", "--no-color", "--no-ext-diff", &rev, "--", &p];
         let text = match git(dir, &args) {
             Some((true, t)) => t,
             // No HEAD yet (fresh repository): compare against the index.
@@ -136,11 +189,11 @@ pub fn load(cwd: &Path, path: &Path) -> FileDiff {
         })
         .collect();
     let head_source = (status == Status::Modified)
-        .then(|| path.file_name().map(|n| format!("HEAD:./{}", n.to_string_lossy())))
+        .then(|| path.file_name().map(|n| format!("{rev}:./{}", n.to_string_lossy())))
         .flatten()
         .and_then(|spec| git(dir, &["show", &spec]))
         .and_then(|(ok, text)| ok.then_some(text));
-    FileDiff { path: path.to_owned(), rel, status, diff, full, added, removed, error, head_source }
+    FileDiff { path: path.to_owned(), rel, status, diff, full, added, removed, error, head_source, base: label }
 }
 
 /// Parses `git diff` output into typed lines with old/new line numbers.

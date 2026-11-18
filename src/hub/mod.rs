@@ -278,11 +278,11 @@ impl Hub {
                     c.subscribed.remove(&session_id);
                 }
             }
-            Request::ReadFile { cwd, path } => {
+            Request::ReadFile { cwd, path, base } => {
                 let cwd = PathBuf::from(cwd);
                 let full = crate::tools::resolve_path(&cwd, &path);
                 if full.is_file() {
-                    self.notify(client, Notice::File { file: Box::new(crate::diff::load(&cwd, &full)) });
+                    self.notify(client, Notice::File { file: Box::new(crate::diff::load_against(&cwd, &full, base)) });
                 } else {
                     self.error(client, None, format!("no such file on this host: {}", full.display()));
                 }

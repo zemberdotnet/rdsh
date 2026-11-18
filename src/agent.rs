@@ -63,6 +63,7 @@ pub struct AgentOptions {
     pub provider: Arc<dyn Provider>,
     pub tools: Arc<Registry>,
     pub system_prompt: String,
+    /// Model requests per turn before it stops; 0 is unlimited.
     pub max_steps: usize,
     pub cwd: PathBuf,
     pub bash_timeout: Duration,
@@ -302,7 +303,11 @@ impl Agent {
             self.push(Message::Directive { content });
         }
         let mut last_text = String::new();
-        for _ in 0..self.opts.max_steps {
+        let max = match self.opts.max_steps {
+            0 => usize::MAX,
+            n => n,
+        };
+        for _ in 0..max {
             let delta_sink = |d: Delta| {
                 sink(match d {
                     Delta::Text(t) => AgentEvent::TextDelta(t),
@@ -351,7 +356,6 @@ impl Agent {
                 self.push(Message::Directive { content });
             }
         }
-        let max = self.opts.max_steps;
         self.finish(&sink, last_text, false, Some(format!("stopped after {max} model requests without a final answer")))
     }
 

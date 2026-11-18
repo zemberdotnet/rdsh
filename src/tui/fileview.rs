@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     comments::Anchor,
-    diff::{self, DiffLine, FileDiff, Kind, Status},
+    diff::{self, Base, DiffLine, FileDiff, Kind, Status},
     util::sanitize,
 };
 
@@ -40,7 +40,9 @@ pub struct FileView {
     pub hscroll: usize,
     /// Syntax runs per line of the current file (index = new line number - 1).
     hl_new: Vec<Vec<Run>>,
-    /// Syntax runs per line of the HEAD version (index = old line number - 1).
+    /// What the diff is against; Shift-Tab switches it.
+    pub base: Base,
+    /// Syntax runs per line of the base version (index = old line number - 1).
     hl_old: Vec<Vec<Run>>,
 }
 
@@ -57,6 +59,7 @@ impl FileView {
     /// @param line 1-based line to place the cursor on, if known.
     pub fn new(file: FileDiff, line: Option<usize>) -> Self {
         let full = file.diff.is_empty();
+        let base = if file.base.is_some() { Base::Default } else { Base::Head };
         let mut v = Self {
             file,
             full,
@@ -67,6 +70,7 @@ impl FileView {
             scroll: 0,
             hscroll: 0,
             remote: None,
+            base,
             hl_new: Vec::new(),
             hl_old: Vec::new(),
         };
@@ -112,7 +116,7 @@ impl FileView {
     }
 
     /// Syntax runs for display row `row`: added and context lines use the current file,
-    /// deleted lines the HEAD version.
+    /// deleted lines the base version.
     pub fn syntax(&self, row: usize) -> &[Run] {
         let Some(l) = self.lines.get(row) else { return &[] };
         let (runs, n) = match l.kind {
@@ -165,7 +169,7 @@ impl FileView {
     pub fn reload(&mut self, cwd: &Path) {
         let line = self.current_line_number();
         let full = self.full;
-        self.file = diff::load(cwd, &self.file.path.clone());
+        self.file = diff::load_against(cwd, &self.file.path.clone(), self.base);
         self.highlight();
         self.full = full || self.file.diff.is_empty();
         self.rebuild();
@@ -197,9 +201,10 @@ impl FileView {
             Status::NoRepo => "not in a git repository".into(),
         };
         let mode = if self.full { "file" } else { "diff" };
+        let against = f.base.as_deref().map(|b| format!(" vs {b}")).unwrap_or_default();
         match &f.error {
             Some(e) => format!("{} — {e}", f.rel),
-            None => format!("{} — {state} — {mode} view", f.rel),
+            None => format!("{} — {state}{against} — {mode} view", f.rel),
         }
     }
 }
