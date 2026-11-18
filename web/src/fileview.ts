@@ -1,7 +1,7 @@
 // A file opened from the chat: its diff against HEAD (or the default branch) or the whole file
 // with changed lines marked. Ported from src/tui/fileview.rs; drawn with the transcript's rows.
 
-import { diffRows, type Row } from "./layout.ts";
+import { diffRows, type Row, type Seg } from "./layout.ts";
 import type { Base, DiffLine, FileDiff } from "./proto.ts";
 import type { Cursor, Entry } from "./session.ts";
 import { pairRanges } from "./worddiff.ts";
@@ -59,7 +59,7 @@ export class FileView {
   }
 
   /** Rows for width `W`: a title, then one or more rows per line (long lines wrap). */
-  rows(W: number): Row[] {
+  rows(W: number, commented: Set<number> = new Set()): Row[] {
     const lang = this.file.rel.split(".").pop() ?? "";
     const src = (this.full ? this.file.full : this.file.diff).filter((l) => l.kind !== "Meta");
     const rows: Row[] = [];
@@ -77,7 +77,12 @@ export class FileView {
         continue;
       }
       const kind = l.kind === "Del" ? "del" : l.kind === "Add" ? "add" : "ctx";
-      for (const r of diffRows(kind, l.text, l.kind === "Del" ? l.old : l.new, lang, W, words.get(l))) push({ ...r, g: r.g ?? ["  ", ""] }, l);
+      const n = l.kind === "Del" ? l.old : l.new;
+      diffRows(kind, l.text, n, lang, W, words.get(l)).forEach((r, i) => {
+        // A queued comment on the line marks it, as in the TUI.
+        const g: Seg = i === 0 && n != null && commented.has(n) ? ["● ", "orange"] : r.g ?? ["  ", ""];
+        push({ ...r, g }, l);
+      });
     }
     if (this.jump != null && rows.length > 1) {
       const want = this.jump;

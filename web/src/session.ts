@@ -1,6 +1,7 @@
 // One session as the page shows it: transcript entries built from history and live agent
 // events. Ported from SessionView and App::on_agent / load_history in src/tui/app.rs.
 
+import type { Comment } from "./comments.ts";
 import type { AgentEvent, Ask, Message, QueuedTurn, Snapshot, Usage } from "./proto.ts";
 
 export const COLLAPSED_OUTPUT_LINES = 4;
@@ -70,6 +71,8 @@ export class SessionView {
   draft = "";
   queued: QueuedTurn[] = [];
   queueEdit: QueueEdit | null = null;
+  /** Review comments waiting to go out with this session's next message. */
+  comments: Comment[] = [];
   /** An `ask` call waiting for the user. */
   question: { callId: string; ask: Ask } | null = null;
   cur: Cursor = { row: 0, col: 0, top: 0, follow: true, want: null };

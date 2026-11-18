@@ -1,13 +1,14 @@
 // Page state: hosts, sessions, the rail, modes. Handles messages from `rdsh web` the way
 // src/tui/app.rs handles hub notices, and turns user actions into requests.
 
+import { composeMessage, label, type Anchor, type Comment } from "./comments.ts";
 import { FileView } from "./fileview.ts";
 import { layout, parseFileHref, type Diagram, type PathLinks, type Row } from "./layout.ts";
 import { EFFORTS, millis, type Answer, type ClientMsg, type Effort, type HostSpec, type Notice, type Request, type ServerMsg, type SessionInfo, type Snapshot } from "./proto.ts";
 import { rail, type HostRail, type LiveSub, type RailRow } from "./rail.ts";
 import { SessionView, type Hooks } from "./session.ts";
 
-export type Mode = "normal" | "insert" | "command" | "search" | "visual" | "vline" | "diagram" | "form";
+export type Mode = "normal" | "insert" | "command" | "search" | "visual" | "vline" | "diagram" | "form" | "comment";
 
 export interface Host extends HostRail {
   spec: HostSpec;
@@ -539,14 +540,16 @@ export class App {
       if (this.request(v.host, { type: "edit_queued", session_id: v.id, turn_id: edit.id, text })) edit.submitted = text;
       return;
     }
-    if (!text) return;
+    if (!text && !v.comments.length) return;
     if (v.question && !v.readOnly) {
       // The agent is waiting on a form: a typed message answers it in words.
       this.prompt.set("");
       v.draft = "";
-      if (this.history[this.history.length - 1] !== text) this.history.push(text);
+      if (text && this.history[this.history.length - 1] !== text) this.history.push(text);
       this.histPos = null;
-      return this.answer({ type: "text", text });
+      const answer = composeMessage(v.comments, text);
+      v.comments = [];
+      return this.answer({ type: "text", text: answer });
     }
     if (v.readOnly || !v.id) {
       this.setFlash(v.readOnly ? "read-only trace — open a session to send" : "no session yet", true);
@@ -555,8 +558,13 @@ export class App {
     this.prompt.set("");
     v.draft = "";
     v.hasInput = true;
-    if (this.history[this.history.length - 1] !== text) this.history.push(text);
+    if (text && this.history[this.history.length - 1] !== text) this.history.push(text);
     this.histPos = null;
+    // Queued review comments go first, quoted, in a <review_comments> block.
+    if (v.comments.length) {
+      text = composeMessage(v.comments, text);
+      v.comments = [];
+    }
     // The hub queues turns; the user entry appears when the turn starts.
     if (v.running) this.setFlash("queued — sends when the current turn finishes");
     const errors = this.diagramErrors();
@@ -578,7 +586,127 @@ export class App {
 
   /** The cursor of what the main pane shows: the open file, else the session. */
   cursor() {
-    return this.file?.cur ?? this.shown().cur;
+    return this.queueView?.cur ?? this.file?.cur ?? this.shown().cur;
+  }
+
+  // ------------------------------------------------------------------ review comments
+
+  /** What the comment being written is about; `editing` when changing a queued one instead. */
+  commentTarget: Anchor | null = null;
+  editing: number | null = null;
+  /** The comment queue on screen (`Q`): the selected comment, and a cursor on its heading. */
+  queueView: { sel: number; cur: { row: number; col: number; top: number; follow: boolean; want: number | null }; heads: number[] } | null = null;
+
+  /**
+   * `c` (or Enter in a file): starts a comment on the visual selection, or on the line under the
+   * cursor. Chat text is quoted; file lines keep their line numbers and diff signs.
+   */
+  beginComment(): boolean {
+    const v = this.cur;
+    if (v.readOnly || !v.id) {
+      this.setFlash("open a session to comment in", true);
+      return false;
+    }
+    const c = this.cursor();
+    const from = this.mode === "visual" || this.mode === "vline" ? this.vAnchor ?? c : c;
+    const [s, t] = from.row < c.row || (from.row === c.row && from.col <= c.col) ? [from, c] : [c, from];
+    const linewise = this.mode !== "visual";
+    let anchor: Anchor | null = null;
+    if (this.file) {
+      const lines = this.file.lineOf.slice(s.row, t.row + 1).filter((l, i, all) => l && l.kind !== "Hunk" && all.indexOf(l) === i);
+      if (lines.length) {
+        const nums = lines.flatMap((l) => (l!.new ?? l!.old) ?? []);
+        const snippet = lines.map((l) => (l!.kind === "Add" ? "+" : l!.kind === "Del" ? "-" : " ") + l!.text).join("\n");
+        anchor = { kind: "file", path: this.file.file.rel, lines: nums.length ? [Math.min(...nums), Math.max(...nums)] : null, snippet };
+      }
+    } else {
+      const sel = this.rows.slice(s.row, t.row + 1);
+      const quote = sel
+        .map((r, i) => (linewise ? r.text : r.text.slice(i === 0 ? s.col : 0, i === sel.length - 1 ? t.col + 1 : undefined)))
+        .join("\n").replace(/^\n+|\s+$/g, "");
+      const entries = [...new Set(sel.filter((r) => r.text.trim()).map((r) => r.e))];
+      if (quote.trim()) anchor = { kind: "chat", source: entries.length === 1 ? sourceLabel(entries[0]) : "several messages", quote };
+    }
+    if (!anchor) {
+      this.setFlash("nothing to comment on here — select text with v or V", true);
+      return false;
+    }
+    this.commentTarget = anchor;
+    this.editing = null;
+    this.mode = "comment";
+    return true;
+  }
+
+  /** Saves the comment editor's text into the queue (or into the queued comment being edited). */
+  saveComment(body: string) {
+    const v = this.cur;
+    if (!body.trim()) this.setFlash("empty comment discarded");
+    else if (this.editing != null) {
+      const c = v.comments[this.editing];
+      if (c) c.body = body;
+    } else if (this.commentTarget) {
+      v.comments.push({ anchor: this.commentTarget, body });
+      this.setFlash(`comment queued (${v.comments.length}) — sent with your next message`);
+    }
+    this.closeComment();
+  }
+
+  closeComment() {
+    this.commentTarget = null;
+    this.editing = null;
+    this.vAnchor = null;
+    this.mode = "normal";
+  }
+
+  /** The comment being edited: its subject and starting text. */
+  commentDraft(): { title: string; excerpt: string; body: string } | null {
+    if (this.mode !== "comment") return null;
+    if (this.editing != null) {
+      const c = this.cur.comments[this.editing];
+      if (!c) return null;
+      return { title: `Edit comment [${this.editing + 1}]`, excerpt: c.anchor.kind === "chat" ? c.anchor.quote : c.anchor.snippet, body: c.body };
+    }
+    const a = this.commentTarget;
+    if (!a) return null;
+    const on = a.kind === "chat" ? a.source : a.lines ? `${a.path}:${a.lines[0]}${a.lines[1] !== a.lines[0] ? `-${a.lines[1]}` : ""}` : a.path;
+    return { title: `Comment on ${on}`, excerpt: a.kind === "chat" ? a.quote : a.snippet, body: "" };
+  }
+
+  /** `Q`: the comment queue, to review, edit or delete before sending. */
+  openQueue() {
+    this.queueView = { sel: 0, cur: { row: 0, col: 0, top: 0, follow: false, want: null }, heads: [] };
+  }
+
+  closeQueue() {
+    this.queueView = null;
+  }
+
+  /** Edits the selected queued comment in the comment editor. */
+  editQueued() {
+    const q = this.queueView;
+    if (!q || !this.cur.comments[q.sel]) return;
+    this.editing = q.sel;
+    this.commentTarget = null;
+    this.mode = "comment";
+  }
+
+  deleteQueued(all = false) {
+    const q = this.queueView;
+    const list = this.cur.comments;
+    if (!q) return;
+    if (all) list.splice(0);
+    else list.splice(q.sel, 1);
+    q.sel = Math.max(0, Math.min(q.sel, list.length - 1));
+  }
+
+  /** Line numbers of `path` that queued comments cover, for the file view's markers. */
+  commentedLines(path: string): Set<number> {
+    const out = new Set<number>();
+    for (const c of this.cur.comments) {
+      const a = c.anchor;
+      if (a.kind === "file" && a.path === path && a.lines) for (let n = a.lines[0]; n <= a.lines[1]; n++) out.add(n);
+    }
+    return out;
   }
 
   /** Opens a link: a file from the chat in the file view, anything else in a new tab. */
@@ -721,8 +849,8 @@ export class App {
       if (edit.submitted !== null) edit.now = true;
       return;
     }
-    const typed = !!this.prompt.get().trim();
-    if (!typed && !v.queued.length) return this.setFlash("nothing to send — type with i");
+    const typed = !!this.prompt.get().trim() || v.comments.length > 0;
+    if (!typed && !v.queued.length) return this.setFlash("nothing to send — comment with c or type with i");
     const answering = typed && !!v.question;
     if (typed) this.submit();
     if (v.running && !answering) this.runQueuedNow(v, v.queued.length + (typed ? 1 : 0));
@@ -777,8 +905,12 @@ export class App {
 
   relayout(cols: number) {
     this.cols = cols;
+    if (this.queueView) {
+      this.rows = queueRows(this.cur.comments, this.queueView, Math.max(10, cols - 3));
+      return;
+    }
     if (this.file) {
-      this.rows = this.file.rows(Math.max(10, cols - 3));
+      this.rows = this.file.rows(Math.max(10, cols - 3), this.commentedLines(this.file.file.rel));
       return;
     }
     const v = this.shown();
@@ -803,3 +935,38 @@ function parseHash(): { host: string; id: string; readOnly: boolean } | null {
   const m = location.hash.match(/^#([^/]+)\/([^/]+)(\/trace)?$/);
   return m ? { host: decodeURIComponent(m[1]), id: decodeURIComponent(m[2]), readOnly: !!m[3] } : null;
 }
+
+/** Where a chat quote came from, as the TUI names it (src/tui/transcript.rs). */
+function sourceLabel(e: Row["e"]): string {
+  switch (e.k) {
+    case "user": return "my earlier message";
+    case "assistant": return "your response";
+    case "reasoning": return "your reasoning";
+    case "tool": return `the ${e.tool!.name} call (${e.tool!.summary})`;
+    default: return "a status message";
+  }
+}
+
+/** Rows of the comment queue: a title, then each comment's label, excerpt and text. */
+function queueRows(comments: Comment[], q: NonNullable<App["queueView"]>, W: number): Row[] {
+  const e = { id: -2, k: "info" as const, text: "", collapsed: false, streaming: false, v: 0 };
+  const rows: Row[] = [];
+  const push = (segs: Row["segs"], bg?: string) => rows.push({ g: ["  ", ""], segs, bg, e, text: segs.map((x) => x[0]).join("") });
+  push([[` Comment queue — ${comments.length} `, "b"], ["  sent with your next message · j/k · e edit · dd delete · D clear · q back", "dim"]], "code");
+  push([]);
+  if (!comments.length) push([["No comments yet. In the chat or a file, press c (or select with v/V, then c).", "dim"]]);
+  q.heads = [];
+  comments.forEach((c, i) => {
+    q.heads.push(rows.length);
+    push([[`[${i + 1}] ${label(c)}`, "b"]], i === q.sel ? "user" : undefined);
+    const ex = (c.anchor.kind === "chat" ? c.anchor.quote : c.anchor.snippet).split("\n");
+    for (const l of ex.slice(0, 6)) push([["  ▌ ", "dim"], [l.slice(0, Math.max(1, W - 6)), "fgdim"]]);
+    if (ex.length > 6) push([[`  ▌ … +${ex.length - 6} lines`, "dim"]]);
+    for (const l of c.body.split("\n")) push([["  ", ""], [l, ""]]);
+    push([]);
+  });
+  q.cur.row = q.heads[q.sel] ?? 0;
+  q.cur.col = 0;
+  return rows;
+}
+

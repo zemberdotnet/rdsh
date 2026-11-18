@@ -60,6 +60,7 @@ function connect() {
 
 document.addEventListener("keydown", (e) => {
   if (document.activeElement === input && app.mode === "insert") return;
+  if (document.activeElement?.id === "comment-input" && app.mode === "comment") return;
   if (keys.handle(e)) {
     e.preventDefault();
     redraw();
@@ -79,6 +80,22 @@ input.addEventListener("keydown", (e) => {
     redraw();
   }
 });
+// The review comment editor: Enter saves, Shift-Enter is a newline, Ctrl-Enter saves and
+// sends, Esc cancels.
+const commentInput = document.querySelector("#comment-input") as HTMLTextAreaElement;
+commentInput.addEventListener("keydown", (e) => {
+  if (app.mode !== "comment") return;
+  if (e.key === "Escape") app.closeComment();
+  else if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
+    app.saveComment(commentInput.value);
+    if (e.ctrlKey) app.sendNow();
+  } else return;
+  e.preventDefault();
+  e.stopPropagation();
+  commentInput.value = "";
+  redraw();
+});
+
 input.addEventListener("input", () => { app.histPos = null; pathMenu.close(); view.drawPrompt(); });
 window.addEventListener("resize", () => pathMenu.position());
 input.addEventListener("focus", () => {

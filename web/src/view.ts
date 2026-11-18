@@ -80,6 +80,7 @@ export class View {
     this.drawTranscript();
     this.drawRail();
     this.drawQueue();
+    this.drawComment();
     this.drawSep();
     this.drawPrompt();
     this.drawStatus();
@@ -217,6 +218,28 @@ export class View {
     el.innerHTML = html;
   }
 
+  /** The review comment editor: what the comment is on, a quote of it, and the text box. */
+  private drawComment() {
+    const el = $("#comment");
+    const d = this.app.commentDraft();
+    const input = $("#comment-input") as HTMLTextAreaElement;
+    if (!d) {
+      if (!el.hidden) {
+        el.hidden = true;
+        input.blur();
+      }
+      return;
+    }
+    if (el.hidden) {
+      el.hidden = false;
+      input.value = d.body;
+      input.focus();
+    }
+    el.querySelector(".chead")!.textContent = `${d.title} — Enter saves · Shift-Enter newline · Ctrl-Enter saves and sends · Esc cancels`;
+    const lines = d.excerpt.split("\n");
+    el.querySelector(".cquote")!.textContent = lines.slice(0, 4).join("\n") + (lines.length > 4 ? `\n… +${lines.length - 4} lines` : "");
+  }
+
   /** Messages waiting for the running turn, oldest first, right above the prompt. */
   private drawQueue() {
     const a = this.app;
@@ -264,6 +287,8 @@ export class View {
       queue += a.mode === "insert" ? " · ↑ recall" : " · i then ↑ recall";
     }
     if (queue) queue += " ";
+    const nc = preview ? 0 : v.comments.length;
+    if (nc) queue += ` ● ${nc} comment${nc === 1 ? "" : "s"} queued (Q to review) `;
     if (!a.connected) {
       left = " disconnected from rdsh web — reconnecting… ";
       cls = "bad";
@@ -281,7 +306,7 @@ export class View {
 
   private drawStatus() {
     const a = this.app;
-    const label = { normal: "NORMAL", insert: "INSERT", visual: "VISUAL", vline: "V-LINE", command: "COMMAND", search: "SEARCH", diagram: "DIAGRAM", form: "FORM" }[a.mode];
+    const label = { normal: "NORMAL", insert: "INSERT", visual: "VISUAL", vline: "V-LINE", command: "COMMAND", search: "SEARCH", diagram: "DIAGRAM", form: "FORM", comment: "COMMENT" }[a.mode];
     // Classes, not style attributes: the page's CSP allows no inline styles.
     let left = `<span class="badge m-${a.mode}"> ${label} </span>`;
     if (a.mode === "command") left += ` :${esc(a.minibuf)}<span class="caret"> </span>`;
@@ -314,7 +339,9 @@ export class View {
       H("Moving") + K("h j k l  w b e  0 ^ $", "counts work: 5j, 3w") + K("gg G 12G", "top, bottom, row") +
       K("Ctrl-d Ctrl-u Ctrl-f Ctrl-b", "half page, page") + K("Ctrl-e Ctrl-y  zz zt zb", "scroll") + K("H M L", "top, middle, bottom of the screen") +
       K("{ }", "previous / next entry") + "\n" +
-      H("Transcript") + K("Tab  za  Enter", "fold or unfold tool output and reasoning") + K("/ ? n N", "search (smart case)") + K("gx", "open the link under the cursor in a new tab") + K("Enter on a task", "open the subagent's session; Ctrl-o or q comes back") +
+      H("Transcript") + K("Tab  za  Enter", "fold or unfold tool output and reasoning") + K("/ ? n N", "search (smart case)") + K("gx", "open the link under the cursor in a new tab") + K("Enter on a task", "open the subagent's session; Ctrl-o or q comes back") + "\n" +
+      H("Review") + K("c, or v/V then c", "comment on the line or selection (Enter in a file view); sent with your next message") +
+      K("Q", "the comment queue: j/k, e edit, dd delete, D clear, q back") +
       K("v V y yy", "select and copy") + K("Enter on a diagram", "interact: hjkl pan, +/- zoom, 0 reset, Esc leaves") +
       K("click in a diagram", "pick an item; it lands in the prompt as context") + "\n" +
       H("Sessions") + K("Ctrl-Space h / l", "focus the rail / back (the browser keeps Ctrl-w)") + K("j k 3j g G 5G", "move; the main view previews") +

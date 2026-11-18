@@ -65,6 +65,7 @@ export class Keys {
     switch (a.mode) {
       case "insert":
       case "form":
+      case "comment":
         return false;
       case "command":
       case "search":
@@ -149,6 +150,7 @@ export class Keys {
 
   private buffer(key: string): boolean {
     const a = this.app;
+    if (a.queueView) return this.queueKey(key);
     const c = a.cursor();
     const rows = a.rows;
     if (a.pending) {
@@ -183,6 +185,7 @@ export class Keys {
         return true;
       }
       if (key === "y") return this.yankSelection();
+      if (key === "c" || key === "Enter") return a.beginComment() || true;
     }
     if (key === "g" || key === "z" || (key === "y" && !visual)) {
       a.pending = key;
@@ -220,6 +223,7 @@ export class Keys {
         const task = r?.e.tool?.name === "task" ? r.e.tool.session : undefined;
         if (href) a.openHref(href);
         else if (task) a.openSubagent(task);
+        else if (a.file) a.beginComment();
         else if (r?.dia) this.enterDiagram(r.dia.key, true);
         else if (rows[c.row + 1]?.dia && rows[c.row + 1].diaRow === 0) this.enterDiagram(rows[c.row + 1].dia!.key, true);
         else if (!this.fold()) return false;
@@ -227,6 +231,8 @@ export class Keys {
       }
       case "S": a.railOpen = !a.railOpen; if (!a.railOpen) a.focusRail(false); break;
       case "C-o": if (!a.goBack()) a.setFlash("nothing to go back to"); break;
+      case "c": a.beginComment(); break;
+      case "Q": a.openQueue(); break;
       case "q": if (!a.cur.readOnly || !a.goBack()) return false; break;
       case "Escape": a.lastSearch = null; break;
       case "F1": a.help = true; break;
@@ -314,6 +320,33 @@ export class Keys {
     const href = ok(here) ? here : row?.segs.map((s) => s[2]).find(ok);
     if (!href) return a.setFlash(files ? "no file link on this line" : "no link on this line");
     a.openHref(href);
+  }
+
+  /** Keys of the comment queue (`Q`). */
+  private queueKey(key: string): boolean {
+    const a = this.app;
+    const q = a.queueView!;
+    const n = a.cur.comments.length;
+    if (a.pending === "d") {
+      a.pending = null;
+      if (key === "d" && n) a.deleteQueued();
+      return true;
+    }
+    switch (key) {
+      case "j": case "ArrowDown": q.sel = Math.min(Math.max(0, n - 1), q.sel + 1); break;
+      case "k": case "ArrowUp": q.sel = Math.max(0, q.sel - 1); break;
+      case "g": q.sel = 0; break;
+      case "G": q.sel = Math.max(0, n - 1); break;
+      case "d": a.pending = "d"; break;
+      case "x": case "Delete": if (n) a.deleteQueued(); break;
+      case "D": a.deleteQueued(true); break;
+      case "e": case "Enter": a.editQueued(); break;
+      case "i": a.closeQueue(); this.startInsert(); break;
+      case "q": case "Q": case "Escape": a.closeQueue(); break;
+      case ":": a.mode = "command"; a.minibuf = ""; break;
+      default: return false;
+    }
+    return true;
   }
 
   /** Keys of the file view; false for keys it leaves to the transcript's handling. */

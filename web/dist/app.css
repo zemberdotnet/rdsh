@@ -123,3 +123,10 @@ body {
 .choice-menu-label { min-width: 0; }
 .choice-menu-detail { flex: none; max-width: 50%; }
 .choice-menu-detail, .choice-menu-empty { color: var(--fg-dim); }
+.m-comment { background: var(--yellow); }
+/* The review comment editor, docked above the prompt like a form. */
+#comment { flex: none; border-top: 1px solid var(--yellow); background: var(--bg); padding: 0 1ch calc(var(--lh) / 2); }
+#comment .chead { color: var(--yellow); line-height: var(--lh); padding-top: calc(var(--lh) / 2); }
+#comment .cquote { color: var(--fg-dim); white-space: pre; overflow: hidden; max-height: calc(4 * var(--lh)); border-left: 2px solid var(--gray); padding-left: 1ch; margin: calc(var(--lh) / 4) 0; }
+#comment textarea { letter-spacing: inherit; font: inherit; line-height: var(--lh); color: var(--fg); background: var(--panel); border: 0; outline: 0;
+  padding: 0 1ch; width: min(100%, 100ch); box-sizing: border-box; resize: vertical; caret-color: var(--fg); }
