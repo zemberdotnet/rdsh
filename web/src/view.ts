@@ -92,7 +92,7 @@ export class View {
   /** Keeps the cursor inside the rows and the rows around it on screen. */
   clamp() {
     const a = this.app;
-    const c = a.shown().cur;
+    const c = a.cursor();
     const rows = a.rows;
     const vis = this.visibleRows();
     if (c.follow) c.row = Math.max(0, rows.length - 1);
@@ -107,7 +107,7 @@ export class View {
 
   private visual(i: number): { a: number; b: number; cls: string }[] {
     const app = this.app;
-    const c = app.shown().cur;
+    const c = app.cursor();
     const v = app.vAnchor;
     if (!v) return [];
     if (app.mode === "vline") {
@@ -126,7 +126,7 @@ export class View {
   private drawTranscript() {
     const a = this.app;
     this.clamp();
-    const c = a.shown().cur;
+    const c = a.cursor();
     const rows = a.rows;
     const vis = this.visibleRows();
     const q = a.mode === "search" ? a.minibuf : a.lastSearch;

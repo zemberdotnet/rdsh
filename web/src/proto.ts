@@ -74,9 +74,10 @@ export type Notice =
   | { type: "queue_edited"; session_id: string; turn_id: number; updated: boolean }
   | { type: "event"; session_id: string; event: AgentEvent }
   | { type: "trace"; session_id: string; cwd: string; history: Message[] }
-  | { type: "file"; file: unknown }
+  | { type: "file"; file: FileDiff }
   | { type: "changed_files"; cwd: string; files: [string, string][] }
   | { type: "path_completions"; request_id: number; paths: string[] }
+  | { type: "resolved_paths"; request_id: number; cwd: string; found: [string, string][] }
   | { type: "restarting" }
   | { type: "error"; session_id: string | null; message: string };
 
@@ -92,7 +93,8 @@ export type Request =
   | { type: "run_queued_now"; session_id: string }
   | { type: "complete_path"; session_id: string; request_id: number; prefix: string }
   | { type: "close"; session_id: string }
-  | { type: "read_file"; cwd: string; path: string }
+  | { type: "read_file"; cwd: string; path: string; base?: Base }
+  | { type: "resolve_paths"; cwd: string; request_id: number; paths: string[] }
   | { type: "changed_files"; cwd: string }
   | { type: "read_trace"; session_id: string }
   | { type: "restart" };
@@ -128,3 +130,24 @@ export type Answer =
   | { type: "form"; values: Record<string, Value> }
   | { type: "text"; text: string }
   | { type: "dismissed" };
+
+// Files (src/diff.rs): a file with its diff against HEAD or the default branch.
+
+export type Base = "head" | "default";
+export type DiffKind = "Meta" | "Hunk" | "Add" | "Del" | "Ctx";
+export interface DiffLine { kind: DiffKind; text: string; old: number | null; new: number | null }
+export interface FileDiff {
+  path: string;
+  /** Path relative to the session's directory when inside it. */
+  rel: string;
+  status: "Modified" | "Untracked" | "Clean" | "NoRepo";
+  diff: DiffLine[];
+  /** The whole file; lines added relative to the base are `Add`. */
+  full: DiffLine[];
+  added: number;
+  removed: number;
+  error: string | null;
+  head_source: string | null;
+  /** The default branch compared against (`origin/main`); absent means HEAD. */
+  base?: string | null;
+}

@@ -3,6 +3,7 @@
 import { App } from "./app.ts";
 import { ChoiceMenu } from "./choice-menu.ts";
 import { keyName, Keys } from "./keys.ts";
+import { linkAt } from "./layout.ts";
 import type { ClientMsg, ServerMsg } from "./proto.ts";
 import { GUTTER, View } from "./view.ts";
 
@@ -163,20 +164,22 @@ main.addEventListener("mousedown", (ev) => {
   if (app.mode !== "visual" && app.mode !== "vline") app.mode = "normal";
   app.relayout(view.cols());
   const rect = main.getBoundingClientRect();
-  const c = app.shown().cur;
+  const c = app.cursor();
   c.row = Math.min(app.rows.length - 1, c.top + Math.floor((ev.clientY - rect.top) / view.lh));
   const raw = Math.floor((ev.clientX - rect.left) / view.cw) - GUTTER;
   c.col = Math.max(0, raw);
   c.want = c.col;
   c.follow = false;
-  // A click on a gutter marker folds or unfolds, like Tab.
-  if (raw < 0 && app.rows[c.row]?.g[0].trim()) keys.fold();
+  // A click on a link opens it; one on a gutter marker folds or unfolds, like Tab.
+  const href = raw >= 0 ? linkAt(app.rows[c.row], raw) : undefined;
+  if (href) app.openHref(href);
+  else if (raw < 0 && app.rows[c.row]?.g[0].trim()) keys.fold();
   redraw();
 });
 
 main.addEventListener("wheel", (ev) => {
   ev.preventDefault();
-  const c = app.shown().cur;
+  const c = app.cursor();
   const vis = view.visibleRows();
   c.top = Math.max(0, Math.min(app.rows.length - vis, c.top + Math.sign(ev.deltaY) * 3));
   if (c.row < c.top) c.row = c.top;

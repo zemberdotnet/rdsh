@@ -61,6 +61,52 @@ function webUrl(dest: string): string | undefined {
   try { return new URL(dest).href; } catch { return; }
 }
 
+/**
+ * Looks up path-like words on the session's host while laying out, so only files that exist
+ * there become links (`something/else` stays text). The App keeps the answers per host and
+ * directory and asks the hub about new words after each layout.
+ */
+export interface PathLinks {
+  /** The file's absolute path; null when it is not a file; undefined while unknown (asked). */
+  lookup(path: string): string | null | undefined;
+  /** Bumped when answers arrive, so cached layouts that might hold new links are rebuilt. */
+  epoch: number;
+}
+
+/** Set by `layout` for the duration of one call. */
+let paths: PathLinks | null = null;
+
+/** Same shape as the TUI's candidates (src/links.rs): a path, then up to two `:N` parts. */
+const PATH = /[~\w./@+\-]+(?::\d+){0,2}/g;
+
+/** Splits `src/a.rs:12:5` into the path and its line. */
+export function splitLine(s: string): [string, number | undefined] {
+  const [p, l] = s.split(":");
+  const n = Number(l);
+  return [p, l && Number.isInteger(n) && n > 0 ? n : undefined];
+}
+
+/** Worth asking the host about: has a `/` or an extension, and is not just dots and slashes. */
+export function pathLike(p: string): boolean {
+  return p.length >= 2 && (p.includes("/") || /\.[A-Za-z]\w*$/.test(p)) && !/^[./]+$/.test(p) && !/^\w+:\/\//.test(p);
+}
+
+export const fileHref = (abs: string, line?: number) => `rdsh-file:${abs}${line ? `#L${line}` : ""}`;
+
+/** The file and line of a `fileHref` link, or null for any other link. */
+export function parseFileHref(href: string): { path: string; line?: number } | null {
+  if (!href.startsWith("rdsh-file:")) return null;
+  const m = href.slice(10).match(/^(.*?)(?:#L(\d+))?$/)!;
+  return { path: m[1], line: m[2] ? Number(m[2]) : undefined };
+}
+
+/** A path-like markdown link target that is a file on the host. */
+function fileTarget(dest: string): string | undefined {
+  const [p, line] = splitLine(dest);
+  const abs = paths && pathLike(p) ? paths.lookup(p) : null;
+  return abs ? fileHref(abs, line) : undefined;
+}
+
 /** Inline markdown: `code`, **bold**, *italic*, [links](url), and bare HTTP(S) URLs. */
 export function inline(text: string, base = ""): Seg[] {
   return linkedText(text, base, INLINE);
@@ -72,14 +118,29 @@ function linkedText(text: string, base = "", pattern = BARE_URL): Seg[] {
   const add = (t: string, href?: string) => {
     if (t) out.push(href ? [t, `${base} link`.trim(), href] : [t, base]);
   };
+  // Plain text: link the paths the host confirmed are files.
+  const plain = (t: string) => {
+    if (!paths) return add(t);
+    let at = 0;
+    for (const m of t.matchAll(PATH)) {
+      const raw = m[0].replace(/[.,:;]+$/, "");
+      const [p, line] = splitLine(raw);
+      const abs = pathLike(p) ? paths.lookup(p) : null;
+      if (!abs) continue;
+      add(t.slice(at, m.index));
+      add(raw, fileHref(abs, line));
+      at = m.index + raw.length;
+    }
+    add(t.slice(at));
+  };
   for (const m of text.matchAll(pattern)) {
     const { code, bold, italic, label, angle, dest, auto, bare } = m.groups!;
-    add(text.slice(last, m.index));
+    plain(text.slice(last, m.index));
     if (code) out.push(...linkedText(code.slice(1, -1), `${base} ic`.trim()));
     // Bold and italic text can hold code and links (`**`path`**`): parse inside them too.
     else if (bold) out.push(...inline(bold.slice(2, -2), `${base} b`.trim()));
     else if (italic) out.push(...inline(italic.slice(1, -1), `${base} i`.trim()));
-    else if (label) add(label, webUrl(angle ?? dest));
+    else if (label) add(label, webUrl(angle ?? dest) ?? fileTarget(angle ?? dest));
     else if (auto) {
       const href = webUrl(auto);
       add(href ? auto : m[0], href);
@@ -90,7 +151,7 @@ function linkedText(text: string, base = "", pattern = BARE_URL): Seg[] {
     }
     last = m.index + m[0].length;
   }
-  add(text.slice(last));
+  plain(text.slice(last));
   return out;
 }
 
@@ -305,15 +366,16 @@ export function markdown(text: string, W: number, key = "", streamSpin?: number)
   return out;
 }
 
-const cache = new WeakMap<Entry, { v: number; W: number; spin: number; lines: Line[] }>();
+const cache = new WeakMap<Entry, { v: number; W: number; spin: number; epoch: number; lines: Line[] }>();
 
 /** Rows of one entry (cached until the entry or the width changes), ending with a spacer. */
 export function entryLines(e: Entry, W: number, spin: number): Line[] {
   const animating = e.tool?.status === "run" || (e.k === "assistant" && e.streaming);
   const c = cache.get(e);
-  if (c && c.v === e.v && c.W === W && (!animating || c.spin === spin)) return c.lines;
+  const epoch = paths?.epoch ?? 0;
+  if (c && c.v === e.v && c.W === W && c.epoch === epoch && (!animating || c.spin === spin)) return c.lines;
   const lines = build(e, W, spin);
-  cache.set(e, { v: e.v, W, spin, lines });
+  cache.set(e, { v: e.v, W, spin, epoch, lines });
   return lines;
 }
 
@@ -365,10 +427,15 @@ function build(e: Entry, W: number, spin: number): Line[] {
 const COLLAPSED_OUTPUT = 4;
 
 /** All rows of a transcript, without the spacer after the last entry. */
-export function layout(entries: Entry[], W: number, spin: number): Row[] {
+export function layout(entries: Entry[], W: number, spin: number, links?: PathLinks): Row[] {
   const rows: Row[] = [];
-  for (const e of entries) {
-    for (const l of entryLines(e, W, spin)) rows.push({ ...l, g: l.g ?? ["  ", ""], e, text: segText(l.segs) });
+  paths = links ?? null;
+  try {
+    for (const e of entries) {
+      for (const l of entryLines(e, W, spin)) rows.push({ ...l, g: l.g ?? ["  ", ""], e, text: segText(l.segs) });
+    }
+  } finally {
+    paths = null;
   }
   if (rows.length) rows.pop();
   return rows;

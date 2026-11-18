@@ -9,6 +9,8 @@
 :root {
   --bg: #282828; --fg: #ebdbb2; --fg-dim: #a89984; --gray: #928374;
   --panel: #3c3836; --sel: #504945; --code: #32302f;
+  /* Diff rows, and the changed part within them. */
+  --add-bg: #2f3a1f; --del-bg: #45201d; --add-hi: #4a5c26; --del-hi: #6e2a24; --hunk-bg: #2a3533;
   --red: #fb4934; --green: #b8bb26; --yellow: #fabd2f; --blue: #83a598;
   --purple: #d3869b; --aqua: #8ec07c; --orange: #fe8019;
   --lh: 20px;
@@ -59,6 +61,8 @@ body {
 .ic { color: var(--orange); }
 .link { color: var(--blue); text-decoration: underline; }
 .code { background: var(--code); }
+.add { background: var(--add-bg); } .del { background: var(--del-bg); } .hunk { background: var(--hunk-bg); }
+.addw { background: var(--add-hi); } .delw { background: var(--del-hi); }
 .lang { color: var(--gray); }
 .kw { color: var(--red); } .str { color: var(--green); } .num { color: var(--purple); } .com { color: var(--gray); font-style: italic; } .ty { color: var(--yellow); }
 .ok { color: var(--green); } .bad { color: var(--red); } .run { color: var(--yellow); } .purple { color: var(--purple); } .aqua { color: var(--aqua); } .orange { color: var(--orange); } .blue { color: var(--blue); }

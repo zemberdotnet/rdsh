@@ -683,3 +683,19 @@ async fn running_the_queue_now_merges_it_and_interrupts_the_turn() {
     assert!(matches!(&evs[0], AgentEvent::TurnStarted { text } if text == "second\n\nthird"), "{evs:?}");
     assert!(matches!(evs.last(), Some(AgentEvent::TurnEnd { cancelled: false, .. })), "{evs:?}");
 }
+
+#[tokio::test]
+async fn only_paths_that_are_files_on_the_host_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+    let hub = hub(Arc::new(ScriptedProvider::new([])), dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0)));
+    let (tx, mut rx) = hub.connect();
+    let cwd = dir.path().display().to_string();
+    let paths = vec!["src/main.rs".into(), "something/else".into(), "src".into()];
+    tx.send(Request::ResolvePaths { cwd: cwd.clone(), request_id: 7, paths }).unwrap();
+    let Notice::ResolvedPaths { request_id, cwd: back, found } = next_non_list(&mut rx).await else { panic!() };
+    assert_eq!((request_id, back), (7, cwd));
+    let expected = dir.path().join("src/main.rs").display().to_string();
+    assert_eq!(found, vec![("src/main.rs".to_owned(), expected)], "directories and missing paths are not links");
+}

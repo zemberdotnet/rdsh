@@ -3,7 +3,7 @@
 // Ctrl-w still works where the browser lets the page have it (an app window).
 
 import type { App } from "./app.ts";
-import { linkAt, type Row } from "./layout.ts";
+import { linkAt, parseFileHref, type Row } from "./layout.ts";
 import { entryJump, find, wordBack, wordEnd, wordForward } from "./motion.ts";
 import type { View } from "./view.ts";
 
@@ -39,7 +39,9 @@ export class Keys {
       return true;
     }
     if (key === "S-Tab") {
-      a.cycleEffort();
+      // An open file switches its diff base instead.
+      if (a.file && ["normal", "visual", "vline"].includes(a.mode)) a.toggleFileBase();
+      else a.cycleEffort();
       return true;
     }
     if (a.help) {
@@ -147,8 +149,7 @@ export class Keys {
 
   private buffer(key: string): boolean {
     const a = this.app;
-    const v = a.shown();
-    const c = v.cur;
+    const c = a.cursor();
     const rows = a.rows;
     if (a.pending) {
       const p = a.pending;
@@ -157,6 +158,7 @@ export class Keys {
       a.count = null;
       if (p === "g" && key === "g") this.setRow(count != null ? count - 1 : 0);
       else if (p === "g" && key === "x") this.openLink(rows[c.row], c.col);
+      else if (p === "g" && key === "f") this.openLink(rows[c.row], c.col, true);
       else if (p === "z" && key === "a") this.fold();
       else if (p === "z" && /^[ztb]$/.test(key)) {
         const vis = this.view.visibleRows();
@@ -189,6 +191,7 @@ export class Keys {
     const count = a.count;
     a.count = null;
     if (this.motion(key, count)) return true;
+    if (a.file && this.fileKey(key)) return true;
     switch (key) {
       case "i": case "a": case "A": case "I": case "o":
         if (key !== "o" && this.view.form.open && !a.previewing()) {
@@ -213,7 +216,9 @@ export class Keys {
       case "Tab": if (!this.fold()) a.setFlash("nothing to fold here"); break;
       case "Enter": {
         const r = rows[c.row];
-        if (r?.dia) this.enterDiagram(r.dia.key, true);
+        const href = linkAt(r, c.col);
+        if (href) a.openHref(href);
+        else if (r?.dia) this.enterDiagram(r.dia.key, true);
         else if (rows[c.row + 1]?.dia && rows[c.row + 1].diaRow === 0) this.enterDiagram(rows[c.row + 1].dia!.key, true);
         else if (!this.fold()) return false;
         break;
@@ -228,7 +233,7 @@ export class Keys {
 
   private setRow(r: number) {
     const a = this.app;
-    const c = a.shown().cur;
+    const c = a.cursor();
     c.row = Math.max(0, Math.min(r, a.rows.length - 1));
     if (c.want != null) c.col = c.want;
     c.follow = c.row === a.rows.length - 1;
@@ -236,7 +241,7 @@ export class Keys {
 
   private motion(key: string, count: number | null): boolean {
     const a = this.app;
-    const c = a.shown().cur;
+    const c = a.cursor();
     const n = count ?? 1;
     const vis = this.view.visibleRows();
     const lines = a.rows.map((r) => r.text);
@@ -286,7 +291,7 @@ export class Keys {
     const a = this.app;
     const q = a.lastSearch;
     if (!q) return;
-    const c = a.shown().cur;
+    const c = a.cursor();
     const hit = find(a.rows.map((r) => r.text), q, c, forward);
     if (!hit) return a.setFlash(`not found: ${q}`, true);
     c.row = hit.pos.row;
@@ -297,17 +302,41 @@ export class Keys {
   }
 
   /** `gx`: opens the link under the cursor in a new tab, else the row's first link. */
-  private openLink(row: Row | undefined, col: number) {
+  /** `gx` (any link) or `gf` (files only): the link under the cursor, else the row's first. */
+  private openLink(row: Row | undefined, col: number, files = false) {
     const a = this.app;
-    const href = linkAt(row, col) ?? row?.segs.find((s) => s[2])?.[2];
-    if (!href) return a.setFlash("no link on this line");
-    a.openUrl(href);
-    a.setFlash(`opened ${href}`);
+    const ok = (h: string | undefined): h is string => !!h && (!files || !!parseFileHref(h));
+    const here = linkAt(row, col);
+    const href = ok(here) ? here : row?.segs.map((s) => s[2]).find(ok);
+    if (!href) return a.setFlash(files ? "no file link on this line" : "no link on this line");
+    a.openHref(href);
+  }
+
+  /** Keys of the file view; false for keys it leaves to the transcript's handling. */
+  private fileKey(key: string): boolean {
+    const a = this.app;
+    const f = a.file!;
+    switch (key) {
+      case "Tab": f.toggleFull(); break;
+      case "r": a.reloadFile(); a.setFlash("reloaded"); break;
+      case "q": case "Escape": a.closeFile(); break;
+      case "]": case "[": {
+        const bs = f.blocks();
+        const row = f.cur.row;
+        const to = key === "]" ? bs.find((b) => b > row) : [...bs].reverse().find((b) => b < row);
+        if (to == null) a.setFlash(key === "]" ? "last change" : "first change");
+        else f.cur.row = to;
+        break;
+      }
+      default: return false;
+    }
+    return true;
   }
 
   /** Folds or unfolds the tool output or reasoning under the cursor. */
   fold(): boolean {
     const a = this.app;
+    if (a.file) return false;
     const v = a.shown();
     const c = v.cur;
     const e = a.rows[c.row]?.e;
@@ -323,7 +352,7 @@ export class Keys {
 
   private yankSelection(): boolean {
     const a = this.app;
-    const c = a.shown().cur;
+    const c = a.cursor();
     const v = a.vAnchor!;
     const b = { row: c.row, col: c.col };
     const [s, t] = v.row < b.row || (v.row === b.row && v.col <= b.col) ? [v, b] : [b, v];
@@ -359,7 +388,7 @@ export class Keys {
     const d = a.rows[first].dia!;
     a.diagram = d;
     a.mode = "diagram";
-    const c = a.shown().cur;
+    const c = a.cursor();
     c.row = first;
     c.follow = false;
     if (scroll && (first < c.top || first + d.rows > c.top + this.view.visibleRows())) c.top = Math.max(0, first - 1);

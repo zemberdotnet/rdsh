@@ -65,6 +65,9 @@ pub enum Request {
     },
     /// Complete a workspace-relative path in a subscribed session on its host.
     CompletePath { session_id: String, request_id: u64, prefix: String },
+    /// Which of `paths` (as written in text, relative to `cwd`) are files on the host, so clients
+    /// link only real files; answered with `ResolvedPaths`.
+    ResolvePaths { cwd: String, request_id: u64, paths: Vec<String> },
     /// Files with uncommitted changes under `cwd` on the host; answered with `ChangedFiles`.
     ChangedFiles { cwd: String },
     /// Read a recorded session without running it (subagents, sessions owned elsewhere);
@@ -99,6 +102,8 @@ pub enum Notice {
     File { file: Box<FileDiff> },
     /// Reply to `CompletePath`, sent only to the requesting client.
     PathCompletions { request_id: u64, paths: Vec<String> },
+    /// Reply to `ResolvePaths`: each path that is a file, with its absolute path.
+    ResolvedPaths { request_id: u64, cwd: String, found: Vec<(String, String)> },
     /// Reply to `ChangedFiles`: `(git status, path relative to cwd)` pairs.
     ChangedFiles { cwd: String, files: Vec<(String, String)> },
     /// The hub is draining and about to exit (reply to `Restart`).

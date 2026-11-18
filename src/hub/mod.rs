@@ -31,6 +31,9 @@ use crate::{
     trace,
 };
 
+/// Paths checked per `ResolvePaths` request; the rest are left unlinked.
+const MAX_RESOLVE: usize = 500;
+
 /// How the hub asks for an agent.
 pub enum OpenKind {
     /// In this directory, or the factory's default when `None`.
@@ -323,6 +326,21 @@ impl Hub {
             }
             Request::CompletePath { session_id, request_id, prefix } => {
                 self.complete_path(client, session_id, request_id, prefix);
+            }
+            Request::ResolvePaths { cwd, request_id, paths } => {
+                let hub = self.clone();
+                tokio::task::spawn_blocking(move || {
+                    let base = PathBuf::from(&cwd);
+                    let found = paths
+                        .into_iter()
+                        .take(MAX_RESOLVE)
+                        .filter_map(|p| {
+                            let full = crate::tools::resolve_path(&base, &p);
+                            full.is_file().then(|| (p, full.to_string_lossy().into_owned()))
+                        })
+                        .collect();
+                    hub.notify(client, Notice::ResolvedPaths { request_id, cwd, found });
+                });
             }
             Request::ChangedFiles { cwd } => {
                 let files = crate::diff::changed_files(std::path::Path::new(&cwd));

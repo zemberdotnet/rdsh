@@ -593,6 +593,7 @@ impl App {
                 self.on_queue_edited(host, session_id, turn_id, updated);
             }
             Notice::PathCompletions { request_id, paths } => self.on_path_completions(host, request_id, paths),
+            Notice::ResolvedPaths { .. } => {}
             Notice::Error { message, .. } => {
                 self.pending_open = None;
                 self.pending_file = None;

@@ -1,7 +1,8 @@
 // Page state: hosts, sessions, the rail, modes. Handles messages from `rdsh web` the way
 // src/tui/app.rs handles hub notices, and turns user actions into requests.
 
-import { layout, type Diagram, type Row } from "./layout.ts";
+import { FileView } from "./fileview.ts";
+import { layout, parseFileHref, type Diagram, type PathLinks, type Row } from "./layout.ts";
 import { EFFORTS, millis, type Answer, type ClientMsg, type Effort, type HostSpec, type Notice, type Request, type ServerMsg, type SessionInfo, type Snapshot } from "./proto.ts";
 import { rail, type HostRail, type LiveSub, type RailRow } from "./rail.ts";
 import { SessionView, type Hooks } from "./session.ts";
@@ -261,9 +262,27 @@ export class App {
       case "path_completions":
         this.onPathCompletions(host, n.request_id, n.paths);
         break;
-      case "file":
+      case "resolved_paths":
+        this.onResolvedPaths(host, n.request_id, n.cwd, n.found);
+        break;
+      case "file": {
+        const want = this.pendingFile;
+        if (want && want.host === host) {
+          this.pendingFile = null;
+          this.file = new FileView(host, want.cwd, n.file, want.line);
+          this.mode = "normal";
+        } else if (this.file && this.file.host === host) {
+          // A reload, or the base switched.
+          this.file.replace(n.file);
+          if (this.file.base === "default" && !n.file.base) {
+            this.file.base = "head";
+            this.setFlash("no default branch (origin/HEAD, origin/main, origin/master); showing HEAD");
+          }
+        }
+        break;
+      }
       case "changed_files":
-        this.setFlash("file views come in the next step");
+        this.setFlash("the changed-files list is TUI only for now (F)");
         break;
       case "error":
         this.pendingOpen = null;
@@ -521,6 +540,105 @@ export class App {
   /** Tab completion in flight: its request id, where it was asked, and how to put a path in. */
   private completion: { id: number; host: number; session: string; token: string; apply: (path: string) => boolean } | null = null;
   private completionIds = 0;
+  // ------------------------------------------------------------------ files and links
+
+  /** The file open over the chat, if any. */
+  file: FileView | null = null;
+  private pendingFile: { host: number; cwd: string; line?: number } | null = null;
+
+  /** The cursor of what the main pane shows: the open file, else the session. */
+  cursor() {
+    return this.file?.cur ?? this.shown().cur;
+  }
+
+  /** Opens a link: a file from the chat in the file view, anything else in a new tab. */
+  openHref(href: string) {
+    const f = parseFileHref(href);
+    if (f) this.openFile(f.path, f.line);
+    else {
+      this.openUrl(href);
+      this.setFlash(`opened ${href}`);
+    }
+  }
+
+  /** Asks the session's host for `path` with its diff; the view opens when it arrives. */
+  openFile(path: string, line?: number) {
+    const v = this.shown();
+    if (this.request(v.host, { type: "read_file", cwd: v.cwd, path })) this.pendingFile = { host: v.host, cwd: v.cwd, line };
+  }
+
+  closeFile() {
+    this.file = null;
+  }
+
+  /** Re-reads the open file (against its current base). */
+  reloadFile() {
+    const f = this.file;
+    if (f) this.request(f.host, { type: "read_file", cwd: f.cwd, path: f.file.path, base: f.base });
+  }
+
+  /** Shift-Tab in a file: its uncommitted changes, or the branch's against the default branch. */
+  toggleFileBase() {
+    const f = this.file;
+    if (!f) return;
+    f.base = f.base === "head" ? "default" : "head";
+    this.setFlash(f.base === "head" ? "diff against HEAD" : "diff against the default branch");
+    this.reloadFile();
+  }
+
+  /** Files on each host and directory: absolute path, null for "not a file", absent if unknown. */
+  private pathCache = new Map<string, Map<string, string | null>>();
+  /** Paths layout asked about that have not been sent yet, per host and directory. */
+  private pathWanted = new Map<string, Set<string>>();
+  private pathRequests = new Map<number, { host: number; cwd: string; paths: string[] }>();
+  private pathIds = 0;
+  private pathEpoch = 0;
+
+  private pathLinks(host: number, cwd: string): PathLinks | undefined {
+    if (!cwd) return;
+    const k = key(host, cwd);
+    let known = this.pathCache.get(k);
+    if (!known) this.pathCache.set(k, (known = new Map()));
+    const cache = known;
+    return {
+      epoch: this.pathEpoch,
+      lookup: (p) => {
+        const hit = cache.get(p);
+        if (hit !== undefined) return hit;
+        let want = this.pathWanted.get(k);
+        if (!want) this.pathWanted.set(k, (want = new Set()));
+        want.add(p);
+        return undefined;
+      },
+    };
+  }
+
+  /** Sends what the last layout asked about; answers bump the epoch and redraw. */
+  private flushPaths() {
+    for (const [k, want] of this.pathWanted) {
+      const [hostStr, cwd] = k.split("\u0000");
+      const host = Number(hostStr);
+      const cache = this.pathCache.get(k)!;
+      const paths = [...want].slice(0, 200);
+      this.pathWanted.delete(k);
+      if (!this.hosts[host]?.connected) continue;
+      const id = ++this.pathIds;
+      for (const p of paths) cache.set(p, null); // asked; a file if the answer says so
+      this.pathRequests.set(id, { host, cwd, paths });
+      this.out({ type: "request", host, request: { type: "resolve_paths", cwd, request_id: id, paths } });
+    }
+  }
+
+  private onResolvedPaths(host: number, id: number, cwd: string, found: [string, string][]) {
+    const req = this.pathRequests.get(id);
+    if (!req || req.host !== host) return;
+    this.pathRequests.delete(id);
+    const cache = this.pathCache.get(key(host, cwd));
+    if (!cache || !found.length) return;
+    for (const [p, abs] of found) cache.set(p, abs);
+    this.pathEpoch++;
+  }
+
   /** Opens a link in a new tab (`gx`); tests stub it. */
   openUrl: (url: string) => void = (url) => { window.open(url, "_blank", "noopener"); };
   /** Offers several completions; the page shows a menu (tests can stub it). */
@@ -629,7 +747,13 @@ export class App {
 
   relayout(cols: number) {
     this.cols = cols;
-    this.rows = layout(this.shown().entries, Math.max(10, cols - 3), this.spin);
+    if (this.file) {
+      this.rows = this.file.rows(Math.max(10, cols - 3));
+      return;
+    }
+    const v = this.shown();
+    this.rows = layout(v.entries, Math.max(10, cols - 3), this.spin, this.pathLinks(v.host, v.cwd));
+    this.flushPaths();
   }
 
   busy(): boolean {
