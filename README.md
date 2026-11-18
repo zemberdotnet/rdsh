@@ -76,9 +76,10 @@ Messages sent during a turn wait in order, listed above the prompt (up to four, 
 | Enter on a `task` | open the subagent's session; `Ctrl-o`, or `q` in it, comes back |
 | Tab / `za` / Enter | expand or collapse tool output and reasoning |
 | `Q` | comment queue (`e` edit, `dd` delete, `D` clear) |
+| `F`, `:files` | files with uncommitted changes (`git status` on the session's host); Enter opens one, `q` in it comes back to the list |
 | `S`, `Ctrl-Space h` / `Ctrl-Space l` | show or hide the session rail; move focus into it and back (`j k g G` with counts like `3j`, `zh` shows subagents that finished over 5 minutes ago, Enter switches to the session, resuming it if needed; subagent rows open read-only; `y` copies the id) |
 | `:new` | start another session |
-| `:model`, `:model <id>` | next model in the list (`models` in the config, default: every logged-in provider's), or name any id; it applies from the next turn and a resumed session keeps it |
+| `:model`, `:model <id>` | pick this session's model from a list (`models` in the config, default: every logged-in provider's; the current one is marked, Enter picks, `q` backs out), or name any id; it applies from the next turn and a resumed session keeps it |
 | `:host user@box[:/dir]` | add a remote machine to the rail over SSH, start its rdsh hub if needed, and start a session there |
 | `:restart` | ask the current host's hub to drain and exit; the page reconnects to a new hub on the latest binary (also happens automatically when a newer client connects) |
 | `:e path[:line]`, `:help` | open a file; list the keys |

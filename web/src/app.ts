@@ -282,9 +282,20 @@ export class App {
         }
         break;
       }
-      case "changed_files":
-        this.setFlash("the changed-files list is not in the browser yet");
+      case "changed_files": {
+        const want = this.pendingFiles;
+        if (!want || want.host !== host || want.cwd !== n.cwd) break;
+        this.pendingFiles = null;
+        if (!n.files.length) {
+          this.setFlash("no uncommitted changes");
+          break;
+        }
+        this.openList(`Changed files — ${n.files.length}`, "Enter opens · j/k · q back", n.files.map(([st, p]) => ({ label: p, detail: st })), 0, (i) => {
+          this.openFile(n.files[i][1]);
+          return false;
+        });
         break;
+      }
       case "error":
         this.pendingOpen = null;
         this.setFlash(this.hosts.length > 1 ? `${h.name}: ${n.message}` : n.message, true);
@@ -586,7 +597,57 @@ export class App {
 
   /** The cursor of what the main pane shows: the open file, else the session. */
   cursor() {
-    return this.queueView?.cur ?? this.file?.cur ?? this.shown().cur;
+    return this.queueView?.cur ?? this.file?.cur ?? this.listView?.cur ?? this.shown().cur;
+  }
+
+  // ------------------------------------------------------------------ lists
+
+  /**
+   * A list to pick from in the main pane (changed files, models). `pick` returns true when the
+   * list should close; a file opened from it opens over the list, and `q` there comes back.
+   */
+  listView: {
+    title: string;
+    hint: string;
+    items: { label: string; detail?: string }[];
+    sel: number;
+    cur: { row: number; col: number; top: number; follow: boolean; want: number | null };
+    pick: (i: number) => boolean;
+  } | null = null;
+  private pendingFiles: { host: number; cwd: string } | null = null;
+
+  openList(title: string, hint: string, items: { label: string; detail?: string }[], sel: number, pick: (i: number) => boolean) {
+    this.listView = { title, hint, items, sel: Math.max(0, Math.min(sel, items.length - 1)), cur: { row: 0, col: 0, top: 0, follow: false, want: null }, pick };
+    this.mode = "normal";
+  }
+
+  closeList() {
+    this.listView = null;
+  }
+
+  pickListed() {
+    const l = this.listView;
+    if (l && l.items.length && l.pick(l.sel)) this.listView = null;
+  }
+
+  /** `F` or `:files`: the session's files with uncommitted changes, from its host. */
+  changedFiles() {
+    const v = this.shown();
+    if (!v.cwd) return this.setFlash("no session directory yet", true);
+    if (this.request(v.host, { type: "changed_files", cwd: v.cwd })) this.pendingFiles = { host: v.host, cwd: v.cwd };
+  }
+
+  /** `:model` without an id: the configured models, the session's marked, to pick one. */
+  pickModel() {
+    const v = this.cur;
+    const models = this.models.includes(v.model) || !v.model ? this.models : [v.model, ...this.models];
+    if (!models.length) return this.setFlash("no models configured; :model <id> names one", true);
+    const items = models.map((m) => ({ label: m, detail: m === v.model ? "current" : undefined }));
+    this.openList("Model", "applies from the next turn · Enter picks · j/k · q back", items, models.indexOf(v.model), (i) => {
+      v.model = models[i];
+      this.setFlash(`model ${v.model} from the next turn`);
+      return true;
+    });
   }
 
   // ------------------------------------------------------------------ review comments
@@ -883,9 +944,8 @@ export class App {
       case "new": this.newSession(); return;
       case "q": case "q!": case "qa": case "quit": this.setFlash("close the tab to leave; sessions keep running in the hub"); return;
       case "model": {
-        if (arg) this.cur.model = arg;
-        else if (this.models.length) this.cur.model = this.models[(this.models.indexOf(this.cur.model) + 1) % this.models.length];
-        else return this.setFlash("no models configured; :model <id> names one", true);
+        if (!arg) return this.pickModel();
+        this.cur.model = arg;
         return this.setFlash(`model ${this.cur.model} from the next turn`);
       }
       case "host":
@@ -902,7 +962,7 @@ export class App {
         this.openFile(path, line);
         return;
       }
-      case "files": this.setFlash("the changed-files list is not in the browser yet", true); return;
+      case "files": this.changedFiles(); return;
       case "now": this.sendNow(); return;
     }
     this.setFlash(`unknown command: ${name}`, true);
@@ -914,6 +974,10 @@ export class App {
     this.cols = cols;
     if (this.queueView) {
       this.rows = queueRows(this.cur.comments, this.queueView, Math.max(10, cols - 3));
+      return;
+    }
+    if (!this.file && this.listView) {
+      this.rows = listRows(this.listView, Math.max(10, cols - 3));
       return;
     }
     if (this.file) {
@@ -977,3 +1041,20 @@ function queueRows(comments: Comment[], q: NonNullable<App["queueView"]>, W: num
   return rows;
 }
 
+
+/** Rows of a pick list: a title, then one row per item with its detail on the right. */
+function listRows(l: NonNullable<App["listView"]>, W: number): Row[] {
+  const e = { id: -3, k: "info" as const, text: "", collapsed: false, streaming: false, v: 0 };
+  const rows: Row[] = [];
+  const push = (segs: Row["segs"], bg?: string) => rows.push({ g: ["  ", ""], segs, bg, e, text: segs.map((x) => x[0]).join("") });
+  push([[` ${l.title} `, "b"], [`  ${l.hint}`, "dim"]], "code");
+  push([]);
+  const width = Math.max(10, ...l.items.map((i) => i.label.length));
+  l.items.forEach((it, i) => {
+    const label = it.label.padEnd(Math.min(width, Math.max(10, W - 12)));
+    push([[label, i === l.sel ? "b" : ""], ...(it.detail ? [[`  ${it.detail}`, "dim"] as Row["segs"][number]] : [])], i === l.sel ? "user" : undefined);
+  });
+  l.cur.row = l.sel + 2;
+  l.cur.col = 0;
+  return rows;
+}

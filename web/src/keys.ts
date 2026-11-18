@@ -151,6 +151,7 @@ export class Keys {
   private buffer(key: string): boolean {
     const a = this.app;
     if (a.queueView) return this.queueKey(key);
+    if (a.listView && !a.file) return this.listKey(key);
     const c = a.cursor();
     const rows = a.rows;
     if (a.pending) {
@@ -233,6 +234,7 @@ export class Keys {
       case "C-o": if (!a.goBack()) a.setFlash("nothing to go back to"); break;
       case "c": a.beginComment(); break;
       case "Q": a.openQueue(); break;
+      case "F": a.changedFiles(); break;
       case "q": if (!a.cur.readOnly || !a.goBack()) return false; break;
       case "Escape": a.lastSearch = null; break;
       case "F1": a.help = true; break;
@@ -320,6 +322,25 @@ export class Keys {
     const href = ok(here) ? here : row?.segs.map((s) => s[2]).find(ok);
     if (!href) return a.setFlash(files ? "no file link on this line" : "no link on this line");
     a.openHref(href);
+  }
+
+  /** Keys of a pick list (changed files, models). */
+  private listKey(key: string): boolean {
+    const a = this.app;
+    const l = a.listView!;
+    const n = l.items.length;
+    switch (key) {
+      case "j": case "ArrowDown": l.sel = Math.min(n - 1, l.sel + 1); break;
+      case "k": case "ArrowUp": l.sel = Math.max(0, l.sel - 1); break;
+      case "g": case "Home": l.sel = 0; break;
+      case "G": case "End": l.sel = Math.max(0, n - 1); break;
+      case "Enter": case "l": a.pickListed(); break;
+      case "q": case "Escape": case "h": a.closeList(); break;
+      case "i": a.closeList(); this.startInsert(); break;
+      case ":": a.mode = "command"; a.minibuf = ""; break;
+      default: return false;
+    }
+    return true;
   }
 
   /** Keys of the comment queue (`Q`). */

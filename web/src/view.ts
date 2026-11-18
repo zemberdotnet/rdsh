@@ -342,6 +342,7 @@ export class View {
       H("Transcript") + K("Tab  za  Enter", "fold or unfold tool output and reasoning") + K("/ ? n N", "search (smart case)") + K("gx", "open the link under the cursor in a new tab") + K("Enter on a task", "open the subagent's session; Ctrl-o or q comes back") + "\n" +
       H("Review") + K("c, or v/V then c", "comment on the line or selection (Enter in a file view); sent with your next message") +
       K("Q", "the comment queue: j/k, e edit, dd delete, D clear, q back") +
+      K("F, :files", "files with uncommitted changes; Enter opens one, q comes back") +
       K("v V y yy", "select and copy") + K("Enter on a diagram", "interact: hjkl pan, +/- zoom, 0 reset, Esc leaves") +
       K("click in a diagram", "pick an item; it lands in the prompt as context") + "\n" +
       H("Sessions") + K("Ctrl-Space h / l", "focus the rail / back (the browser keeps Ctrl-w)") + K("j k 3j g G 5G", "move; the main view previews") +
@@ -353,7 +354,7 @@ export class View {
       K("Ctrl-Enter", "send now: every waiting message starts at once, as one") +
       K("Tab", "complete the path before the cursor; a menu offers several matches") +
       K("Shift-Tab", "thinking effort (the model name's color)") + K("Ctrl-c", "interrupt the running turn") + "\n" +
-      H("Commands") + K(":new  :model [id]  :host user@box[:/dir]", "new session, model, add an SSH host") + K(":restart  :rail  :help", "restart the hub, toggle rail, this") +
+      H("Commands") + K(":new  :model [id]  :host user@box[:/dir]", "new session, pick a model (or name one), add an SSH host") + K(":e path[:line]  :now", "open a file, send now") + K(":restart  :rail  :help", "restart the hub, toggle rail, this") +
       H("Questions") + K("i, when the agent asks", "answer its form: Tab fields, Enter next, Ctrl-Enter next form or submit") +
       K("o, or reply in words", "type an answer instead: your next message answers the form") + K("Esc", "back to the chat; the form waits") + "\n" +
       "\n" + H("Diagrams") + `  <span class="dim">Ask for a diagram: the model answers with a \`\`\`d3 block, drawn in a sandboxed frame.\n  It gets d3, svg, g (pan/zoom layer), W, H, C (palette), CH (char width) and pick(label).\n  "// rows: N" sets the height, "// title: ..." the caption.</span>\n\n` +
