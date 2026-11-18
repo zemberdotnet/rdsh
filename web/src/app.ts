@@ -332,7 +332,7 @@ export class App {
     if (this.mode !== "insert") this.mode = "normal";
     const name = this.hosts[v.host]?.name ?? "local";
     const hash = `#${encodeURIComponent(name)}/${encodeURIComponent(v.id)}${v.readOnly ? "/trace" : ""}`;
-    if (location.hash !== hash) history.replaceState(null, "", hash);
+    if (typeof location !== "undefined" && location.hash !== hash) history.replaceState(null, "", hash);
   }
 
   // ------------------------------------------------------------------ rail
@@ -387,6 +387,36 @@ export class App {
     if (this.views.has(k) || this.previews.has(k) || this.previewRequested.has(k)) return;
     this.previewRequested.add(k);
     this.request(s.host, { type: "read_trace", session_id: s.id });
+  }
+
+  /** Sessions left by opening a subagent from the chat; Ctrl-o (or q in the trace) returns. */
+  private back: SessionView[] = [];
+
+  /** Enter on a `task` in the chat: the subagent's session, read-only like its rail row. */
+  openSubagent(id: string) {
+    const host = this.cur.host;
+    const k = key(host, id);
+    const from = this.cur;
+    const ready = this.views.get(k) ?? this.previews.get(k)?.view;
+    if (ready) {
+      this.previews.delete(k);
+      this.views.set(k, ready);
+      this.show(ready);
+    } else {
+      this.pendingOpen = { host, id };
+      this.setFlash(`loading subagent ${id}… (Ctrl-o returns)`);
+      this.previewRequested.add(k);
+      this.request(host, { type: "read_trace", session_id: id });
+    }
+    if (this.back[this.back.length - 1] !== from) this.back.push(from);
+  }
+
+  /** Back to the session a subagent was opened from. */
+  goBack(): boolean {
+    const v = this.back.pop();
+    if (!v) return false;
+    this.show(v);
+    return true;
   }
 
   /** Enter on a rail row: show it, resuming it on its host if needed. */

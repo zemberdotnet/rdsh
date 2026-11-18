@@ -18,6 +18,8 @@ export interface Tool {
   output: string;
   children: string[];
   dur: number | null;
+  /** `task` calls: the subagent's session, which Enter opens. */
+  session?: string;
 }
 
 export type Kind = "user" | "assistant" | "reasoning" | "tool" | "info" | "error";
@@ -139,6 +141,8 @@ export class SessionView {
     t.status = failed ? "bad" : "ok";
     t.output = output;
     t.dur = dur;
+    // A finished task names its subagent's session on its first line (src/tools/task.rs).
+    t.session ??= t.name === "task" ? output.match(/\[subagent session ([^\]\s]+)\]/)?.[1] : undefined;
     e.collapsed = lineCount(output) > COLLAPSED_OUTPUT_LINES;
     this.touch(e);
   }
@@ -221,10 +225,16 @@ export class SessionView {
         this.activity = `running ${c.name}`;
         break;
       }
-      case "subagent_started":
+      case "subagent_started": {
         this.subagentCalls.set(ev.data.call_id, ev.data.session_id);
+        const e = this.toolEntries.get(ev.data.call_id);
+        if (e?.tool) {
+          e.tool.session = ev.data.session_id;
+          this.touch(e);
+        }
         hooks.subStarted(ev.data.session_id, this.id, ev.data.title);
         break;
+      }
       case "tool_end": {
         const { call_id, output, duration_ms } = ev.data;
         const e = this.toolEntries.get(call_id);

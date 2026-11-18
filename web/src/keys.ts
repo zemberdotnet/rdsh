@@ -217,13 +217,17 @@ export class Keys {
       case "Enter": {
         const r = rows[c.row];
         const href = linkAt(r, c.col);
+        const task = r?.e.tool?.name === "task" ? r.e.tool.session : undefined;
         if (href) a.openHref(href);
+        else if (task) a.openSubagent(task);
         else if (r?.dia) this.enterDiagram(r.dia.key, true);
         else if (rows[c.row + 1]?.dia && rows[c.row + 1].diaRow === 0) this.enterDiagram(rows[c.row + 1].dia!.key, true);
         else if (!this.fold()) return false;
         break;
       }
       case "S": a.railOpen = !a.railOpen; if (!a.railOpen) a.focusRail(false); break;
+      case "C-o": if (!a.goBack()) a.setFlash("nothing to go back to"); break;
+      case "q": if (!a.cur.readOnly || !a.goBack()) return false; break;
       case "Escape": a.lastSearch = null; break;
       case "F1": a.help = true; break;
       default: return false;

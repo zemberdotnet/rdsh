@@ -314,7 +314,7 @@ export class View {
       H("Moving") + K("h j k l  w b e  0 ^ $", "counts work: 5j, 3w") + K("gg G 12G", "top, bottom, row") +
       K("Ctrl-d Ctrl-u Ctrl-f Ctrl-b", "half page, page") + K("Ctrl-e Ctrl-y  zz zt zb", "scroll") + K("H M L", "top, middle, bottom of the screen") +
       K("{ }", "previous / next entry") + "\n" +
-      H("Transcript") + K("Tab  za  Enter", "fold or unfold tool output and reasoning") + K("/ ? n N", "search (smart case)") + K("gx", "open the link under the cursor in a new tab") +
+      H("Transcript") + K("Tab  za  Enter", "fold or unfold tool output and reasoning") + K("/ ? n N", "search (smart case)") + K("gx", "open the link under the cursor in a new tab") + K("Enter on a task", "open the subagent's session; Ctrl-o or q comes back") +
       K("v V y yy", "select and copy") + K("Enter on a diagram", "interact: hjkl pan, +/- zoom, 0 reset, Esc leaves") +
       K("click in a diagram", "pick an item; it lands in the prompt as context") + "\n" +
       H("Sessions") + K("Ctrl-Space h / l", "focus the rail / back (the browser keeps Ctrl-w)") + K("j k 3j g G 5G", "move; the main view previews") +

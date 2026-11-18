@@ -56,7 +56,8 @@ function setup() {
   requests.splice(0);
   const keys = new Keys(app, { visibleRows: () => 20, form: { open: false } } as never, null!);
   const press = (k: string) => keys.handle({ key: k, ctrlKey: false, shiftKey: k === "S-Tab", altKey: false });
-  return { app, requests, notice, press };
+  const ctrl = (k: string) => keys.handle({ key: k, ctrlKey: true, shiftKey: false, altKey: false });
+  return { app, requests, notice, press, ctrl };
 }
 
 test("the chat asks the host about paths, links the files, and Enter opens one", () => {
@@ -89,3 +90,34 @@ test("the chat asks the host about paths, links the files, and Enter opens one",
   app.relayout(80);
   assert.ok(app.rows.some((r) => r.text.includes("I changed")), "back to the chat");
 });
+
+test("Enter on a task opens its subagent's session, and Ctrl-o comes back", () => {
+  const { app, requests, notice, press, ctrl } = setup();
+  notice({ type: "opened", snapshot: {
+    session_id: "s2", model: "m", cwd: "/p", turn: [], running: false, usage: { prompt_tokens: 0, completion_tokens: 0 },
+    history: [
+      { role: "user", content: "go" },
+      { role: "assistant", content: "", tool_calls: [{ id: "c1", name: "task", arguments: JSON.stringify({ description: "survey files", prompt: "x" }) }] },
+      { role: "tool", call_id: "c1", name: "task", content: "[subagent session s2-sub1]\nfound three" },
+    ],
+  } });
+  const parent = app.views.get(`0\u0000s2`)!;
+  app.show(parent);
+  requests.splice(0);
+  app.relayout(80);
+  requests.splice(0);
+  app.cursor().row = app.rows.findIndex((r) => r.text.includes("survey files"));
+  press("Enter");
+  assert.deepEqual(requests.splice(0), [{ type: "read_trace", session_id: "s2-sub1" }]);
+  notice({ type: "trace", session_id: "s2-sub1", cwd: "/p", history: [{ role: "user", content: "x" }, { role: "assistant", content: "found three" }] });
+  assert.equal(app.cur.id, "s2-sub1");
+  assert.ok(app.cur.readOnly);
+  press("q");
+  assert.equal(app.cur.id, "s2", "q in the subagent's trace goes back");
+  press("Enter");
+  assert.equal(app.cur.id, "s2-sub1", "a loaded trace opens at once");
+  assert.deepEqual(requests, []);
+  ctrl("o");
+  assert.equal(app.cur.id, "s2");
+});
+
