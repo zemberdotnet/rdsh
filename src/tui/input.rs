@@ -42,6 +42,13 @@ impl Input {
         self.text = text;
     }
 
+    /// Replaces `range` (byte offsets) with `s` and puts the cursor after it.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, s: &str) {
+        let start = range.start;
+        self.text.replace_range(range, s);
+        self.cursor = start + s.len();
+    }
+
     pub fn insert_str(&mut self, s: &str) {
         let s = s.replace("\r\n", "\n").replace('\r', "\n");
         self.text.insert_str(self.cursor, &s);

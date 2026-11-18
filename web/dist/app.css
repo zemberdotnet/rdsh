@@ -35,6 +35,9 @@ body {
 #cursor { position: absolute; height: var(--lh); background: var(--fg); color: var(--bg); white-space: pre; pointer-events: none; }
 #cursor.dim { background: transparent; color: transparent; outline: 1px solid var(--gray); }
 #cursor.off { display: none; }
+#queue { background: var(--panel); white-space: pre; overflow: hidden; }
+#queue .q { height: var(--lh); overflow: hidden; text-overflow: ellipsis; }
+#queue .q.edit { color: var(--purple); font-weight: 700; }
 #sep { height: var(--lh); white-space: pre; color: var(--gray); overflow: hidden; }
 #prompt { display: flex; background: var(--bg); }
 #prompt .g { color: var(--aqua); font-weight: 700; white-space: pre; }
@@ -98,3 +101,21 @@ body {
 #form button.primary { background: var(--yellow); color: var(--bg); font-weight: 700; }
 #form button:focus { outline: 1px solid var(--yellow); }
 .m-form { background: var(--yellow); }
+
+/* Anchored choice popup, in the same cells and palette as the prompt. */
+.choice-menu {
+  position: fixed; z-index: 10; top: 0; left: 0;
+  width: max-content; min-width: min(18ch, var(--choice-menu-width, 100vw));
+  max-width: min(72ch, var(--choice-menu-width, 100vw));
+  max-height: min(calc(12 * var(--lh) + 2px), var(--choice-menu-height, 100vh));
+  overflow: hidden auto; overscroll-behavior: contain;
+  border: 1px solid var(--gray); background: var(--panel); color: var(--fg);
+  scrollbar-color: var(--gray) var(--panel); user-select: none;
+}
+.choice-menu-option, .choice-menu-empty { padding: 0 1ch; }
+.choice-menu-option { display: flex; justify-content: space-between; gap: 1.5ch; cursor: pointer; }
+.choice-menu-option[aria-selected="true"] { background: var(--sel); box-shadow: inset 2px 0 var(--aqua); }
+.choice-menu-label, .choice-menu-detail, .choice-menu-empty { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.choice-menu-label { min-width: 0; }
+.choice-menu-detail { flex: none; max-width: 50%; }
+.choice-menu-detail, .choice-menu-empty { color: var(--fg-dim); }

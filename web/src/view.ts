@@ -10,6 +10,8 @@ export const GUTTER = 2;
 export const RAIL_W = 28;
 
 const $ = (s: string) => document.querySelector(s) as HTMLElement;
+/** Queued messages listed above the prompt; more collapse into a "+N more" row. */
+const QUEUE_ROWS = 4;
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 
 export class View {
@@ -77,6 +79,7 @@ export class View {
     a.relayout(this.cols());
     this.drawTranscript();
     this.drawRail();
+    this.drawQueue();
     this.drawSep();
     this.drawPrompt();
     this.drawStatus();
@@ -214,30 +217,65 @@ export class View {
     el.innerHTML = html;
   }
 
+  /** Messages waiting for the running turn, oldest first, right above the prompt. */
+  private drawQueue() {
+    const a = this.app;
+    const el = $("#queue");
+    const v = a.shown();
+    const queued = a.previewing() ? [] : v.queued;
+    el.hidden = !queued.length;
+    if (!queued.length) {
+      el.innerHTML = "";
+      return;
+    }
+    const n = Math.floor(el.clientWidth / this.cw) || 80;
+    const shown = queued.length > QUEUE_ROWS ? QUEUE_ROWS - 1 : queued.length;
+    const editing = v.queueEdit?.id;
+    let html = "";
+    queued.slice(0, shown).forEach((t, i) => {
+      const first = t.text.split("\n").find((l) => l.trim())?.trim() ?? "";
+      const more = t.text.trim().includes("\n") ? " …" : "";
+      const head = ` ${t.id === editing ? "✎" : "○"} ${i + 1}. `;
+      const body = fit(first, Math.max(1, n - head.length - more.length));
+      html += `<div class="q${t.id === editing ? " edit" : ""}"><span class="purple">${esc(head)}</span>${esc(body)}<span class="dim">${more}</span></div>`;
+    });
+    if (queued.length > shown) html += `<div class="q dim">   +${queued.length - shown} more waiting</div>`;
+    el.innerHTML = html;
+  }
+
   private drawSep() {
     const a = this.app;
     const v = a.shown();
     const n = Math.floor($("#sep").clientWidth / this.cw);
     let left = "";
     let cls = "blue";
+    const preview = a.previewing();
     if (v.activity) {
       const secs = Math.floor((Date.now() - v.turnStarted) / 1000);
       left = ` ${SPIN[a.spin % SPIN.length]} ${v.activity} · ${secs}s `;
       cls = "run";
-    } else if (a.previewing()) left = v.readOnly ? " preview · Enter opens " : " preview · Enter switches ";
-    else if (v.waiting) left = ` ${v.waiting} queued `;
+    } else if (preview) left = v.readOnly ? " preview · Enter opens " : " preview · Enter switches ";
+    const edit = preview ? null : v.queueEdit;
+    let queue = v.queued.length ? ` ${v.queued.length} queued` : "";
+    if (edit) {
+      const hint = edit.submitted !== null ? "saving edit…" : a.mode === "insert" ? "editing · Enter saves · Esc discards" : "editing · i to resume";
+      queue += `${queue ? " · " : " "}${hint}`;
+    } else if (queue && !preview) {
+      queue += a.mode === "insert" ? " · ↑ recall" : " · i then ↑ recall";
+    }
+    if (queue) queue += " ";
     if (!a.connected) {
       left = " disconnected from rdsh web — reconnecting… ";
       cls = "bad";
     }
-    $("#sep").innerHTML = `<span class="dim">──</span>${left ? `<span class="${cls}">${esc(left)}</span>` : ""}<span class="dim">${"─".repeat(Math.max(0, n - 2 - left.length))}</span>`;
+    $("#sep").innerHTML = `<span class="dim">──</span>${queue ? `<span class="aqua">${esc(queue)}</span>` : ""}${left ? `<span class="${cls}">${esc(left)}</span>` : ""}<span class="dim">${"─".repeat(Math.max(0, n - 2 - left.length - queue.length))}</span>`;
   }
 
   drawPrompt() {
     const inp = $("#input") as HTMLTextAreaElement;
     const a = this.app;
     inp.classList.toggle("ro", a.previewing() || a.cur.readOnly);
-    inp.placeholder = a.cur.readOnly ? "read-only trace" : "i to type · :help for keys";
+    inp.placeholder = a.cur.readOnly ? "read-only trace" : "";
     inp.rows = Math.min(10, Math.max(1, inp.value.split("\n").length));
   }
 
@@ -276,13 +314,17 @@ export class View {
       H("Moving") + K("h j k l  w b e  0 ^ $", "counts work: 5j, 3w") + K("gg G 12G", "top, bottom, row") +
       K("Ctrl-d Ctrl-u Ctrl-f Ctrl-b", "half page, page") + K("Ctrl-e Ctrl-y  zz zt zb", "scroll") + K("H M L", "top, middle, bottom of the screen") +
       K("{ }", "previous / next entry") + "\n" +
-      H("Transcript") + K("Tab  za  Enter", "fold or unfold tool output and reasoning") + K("/ ? n N", "search (smart case)") +
+      H("Transcript") + K("Tab  za  Enter", "fold or unfold tool output and reasoning") + K("/ ? n N", "search (smart case)") + K("gx", "open the link under the cursor in a new tab") +
       K("v V y yy", "select and copy") + K("Enter on a diagram", "interact: hjkl pan, +/- zoom, 0 reset, Esc leaves") +
       K("click in a diagram", "pick an item; it lands in the prompt as context") + "\n" +
       H("Sessions") + K("Ctrl-Space h / l", "focus the rail / back (the browser keeps Ctrl-w)") + K("j k 3j g G 5G", "move; the main view previews") +
       K("Enter, double-click", "switch to the session (resuming it); a host heading starts one") + K("zh", "show or hide subagents finished over 5 min ago") +
       K("y  S  r", "copy id, hide rail, refresh") + "\n" +
-      H("Prompt") + K("i a", "type; Enter sends, Shift-Enter or Ctrl-j newline, Esc leaves") + K("↑ ↓ in an empty prompt", "earlier messages") +
+      H("Prompt") + K("i a", "type; Enter sends, Shift-Enter or Ctrl-j newline, Esc leaves") +
+      K("↑ ↓ in an empty prompt", "recall queued messages first, or browse history if none") +
+      K("Enter / Esc in queued edit", "save in place / discard changes") +
+      K("Ctrl-Enter", "send now: every waiting message starts at once, as one") +
+      K("Tab", "complete the path before the cursor; a menu offers several matches") +
       K("Shift-Tab", "thinking effort (the model name's color)") + K("Ctrl-c", "interrupt the running turn") + "\n" +
       H("Commands") + K(":new  :model [id]  :host user@box[:/dir]", "new session, model, add an SSH host") + K(":restart  :rail  :help", "restart the hub, toggle rail, this") +
       H("Questions") + K("i, when the agent asks", "answer its form: Tab fields, Enter next, Ctrl-Enter next form or submit") +

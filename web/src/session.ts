@@ -1,7 +1,7 @@
 // One session as the page shows it: transcript entries built from history and live agent
 // events. Ported from SessionView and App::on_agent / load_history in src/tui/app.rs.
 
-import type { AgentEvent, Ask, Message, Snapshot, Usage } from "./proto.ts";
+import type { AgentEvent, Ask, Message, QueuedTurn, Snapshot, Usage } from "./proto.ts";
 
 export const COLLAPSED_OUTPUT_LINES = 4;
 export const COLLAPSED_REASONING_LINES = 3;
@@ -35,6 +35,14 @@ export interface Entry {
 
 export interface Cursor { row: number; col: number; top: number; follow: boolean; want: number | null }
 
+export interface QueueEdit {
+  id: number;
+  original: string;
+  submitted: string | null;
+  /** Ctrl-Enter saved it: run the queue once the hub accepts the edit. */
+  now?: boolean;
+}
+
 /** Calls out of the session for state that lives elsewhere (the rail's live subagents). */
 export interface Hooks {
   subStarted(id: string, parent: string, title: string): void;
@@ -53,7 +61,8 @@ export class SessionView {
   readOnly = false;
   hasInput = false;
   draft = "";
-  waiting = 0;
+  queued: QueuedTurn[] = [];
+  queueEdit: QueueEdit | null = null;
   /** An `ask` call waiting for the user. */
   question: { callId: string; ask: Ask } | null = null;
   cur: Cursor = { row: 0, col: 0, top: 0, follow: true, want: null };
@@ -83,6 +92,7 @@ export class SessionView {
     for (const ev of s.turn) v.apply(ev, hooks);
     v.running = s.running;
     v.usage = { ...s.usage };
+    v.queued = s.queued ?? [];
     return v;
   }
 
@@ -172,7 +182,6 @@ export class SessionView {
         else {
           this.hasInput = true;
           this.push("user", text);
-          this.waiting = Math.max(0, this.waiting - 1);
         }
         this.running = true;
         this.cur.follow = true;

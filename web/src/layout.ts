@@ -3,8 +3,8 @@
 
 import { COLLAPSED_REASONING_LINES, type Entry } from "./session.ts";
 
-/** A run of text with CSS classes. */
-export type Seg = [text: string, cls: string];
+/** A run of text with CSS classes and an optional HTTP(S) link target. */
+export type Seg = [text: string, cls: string, href?: string];
 
 export interface Line {
   segs: Seg[];
@@ -38,23 +38,59 @@ export const SPIN = ["◴", "◷", "◶", "◵"];
 export const segText = (segs: Seg[]) => segs.map((s) => s[0]).join("");
 export const fit = (s: string, n: number) => ([...s].length <= n ? s : n <= 0 ? "" : [...s].slice(0, n - 1).join("") + "…");
 
-/** Inline markdown: `code`, **bold**, *italic*, [links](url). */
-export function inline(text: string, base = ""): Seg[] {
-  const out: Seg[] = [];
-  const re = /(`[^`]+`)|(\*\*[^*]+\*\*)|(\*[^*\s][^*]*\*)|(\[[^\]]+\]\([^)]+\))/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  const add = (t: string, c: string) => { if (t) out.push([t, `${base} ${c}`.trim()]); };
-  while ((m = re.exec(text))) {
-    add(text.slice(last, m.index), "");
-    if (m[1]) add(m[1].slice(1, -1), "ic");
-    // Bold and italic text can hold code and links (`**`path`**`): parse inside them too.
-    else if (m[2]) out.push(...inline(m[2].slice(2, -2), `${base} b`.trim()));
-    else if (m[3]) out.push(...inline(m[3].slice(1, -1), `${base} i`.trim()));
-    else add(m[4].replace(/^\[([^\]]+)\].*$/, "$1"), "link");
-    last = re.lastIndex;
+/** The link at a text column, excluding the gutter. */
+export function linkAt(line: Line | undefined, col: number): string | undefined {
+  if (col < 0) return;
+  for (const [text, , href] of line?.segs ?? []) {
+    if (col < text.length) return href;
+    col -= text.length;
   }
-  add(text.slice(last), "");
+}
+
+// Accept balanced brackets (e.g. IPv6) and parentheses (e.g. wiki paths) inside bare URLs.
+const BARE_URL = /(?<bare>(?<![\w/:@.-])https?:\/\/(?:[^\s<>"'`()\[\]{}]|\([^()\s<>"'`]*\)|\[[^\s<>"'`\[\]]*\])+)/gi;
+const INLINE = new RegExp([
+  /(?<code>`[^`]+`)|(?<bold>\*\*[^*]+\*\*)|(?<italic>\*[^*\s][^*]*\*)/.source,
+  /\[(?<label>[^\]\n]+)\]\(\s*(?:<(?<angle>[^<>\s]+)>|(?<dest>(?:[^\s<>()]|\([^()\s]*\))+))(?:\s+(?:"[^"]*"|'[^']*'|\([^()]*\)))?\s*\)/.source,
+  /<(?<auto>https?:\/\/[^<>\s]+)>/.source,
+  BARE_URL.source,
+].join("|"), "gi");
+
+function webUrl(dest: string): string | undefined {
+  if (!/^https?:\/\//i.test(dest)) return;
+  try { return new URL(dest).href; } catch { return; }
+}
+
+/** Inline markdown: `code`, **bold**, *italic*, [links](url), and bare HTTP(S) URLs. */
+export function inline(text: string, base = ""): Seg[] {
+  return linkedText(text, base, INLINE);
+}
+
+function linkedText(text: string, base = "", pattern = BARE_URL): Seg[] {
+  const out: Seg[] = [];
+  let last = 0;
+  const add = (t: string, href?: string) => {
+    if (t) out.push(href ? [t, `${base} link`.trim(), href] : [t, base]);
+  };
+  for (const m of text.matchAll(pattern)) {
+    const { code, bold, italic, label, angle, dest, auto, bare } = m.groups!;
+    add(text.slice(last, m.index));
+    if (code) out.push(...linkedText(code.slice(1, -1), `${base} ic`.trim()));
+    // Bold and italic text can hold code and links (`**`path`**`): parse inside them too.
+    else if (bold) out.push(...inline(bold.slice(2, -2), `${base} b`.trim()));
+    else if (italic) out.push(...inline(italic.slice(1, -1), `${base} i`.trim()));
+    else if (label) add(label, webUrl(angle ?? dest));
+    else if (auto) {
+      const href = webUrl(auto);
+      add(href ? auto : m[0], href);
+    } else {
+      const url = bare.replace(/[.,;:!?]+$/, "");
+      add(url, webUrl(url));
+      add(bare.slice(url.length));
+    }
+    last = m.index + m[0].length;
+  }
+  add(text.slice(last));
   return out;
 }
 
@@ -66,7 +102,7 @@ export function inline(text: string, base = ""): Seg[] {
  */
 export function wrap(segs: Seg[], W: number, first = "", rest = " ".repeat(first.length), pcls = "dim", bg?: string): Line[] {
   const toks: Seg[] = [];
-  for (const [t, c] of segs) for (const p of t.split(/(\s+)/)) if (p) toks.push([p, c]);
+  for (const [t, ...style] of segs) for (const p of t.split(/(\s+)/)) if (p) toks.push([p, ...style]);
   const lines: Line[] = [];
   let cur: Seg[] = first ? [[first, pcls]] : [];
   let w = first.length;
@@ -77,25 +113,25 @@ export function wrap(segs: Seg[], W: number, first = "", rest = " ".repeat(first
     cur = rest ? [[rest, pcls]] : [];
     w = base = rest.length;
   };
-  for (let [t, c] of toks) {
+  for (let [t, ...style] of toks) {
     if (/^\s+$/.test(t)) {
       if (w === base && lines.length) continue;
       if (w + 1 > W) { push(); continue; }
-      cur.push([" ", c]);
+      cur.push([" ", ...style]);
       w += 1;
       continue;
     }
     const room = Math.max(1, W - base);
     while (t.length > room) {
       if (w > base) push();
-      cur.push([t.slice(0, room), c]);
+      cur.push([t.slice(0, room), ...style]);
       t = t.slice(room);
       w = W;
       push();
     }
     if (!t) continue;
     if (w + t.length > W) push();
-    cur.push([t, c]);
+    cur.push([t, ...style]);
     w += t.length;
   }
   if (cur.length > (rest && lines.length ? 1 : 0) || !lines.length) push();
@@ -132,6 +168,26 @@ export function chunks(s: string, n: number): string[] {
   return out;
 }
 
+/** Fixed-width wrapping that preserves spaces and link targets in tool output. */
+function* chunkSegs(segs: Seg[], width: number): Generator<Seg[]> {
+  let row: Seg[] = [];
+  let col = 0;
+  for (const [text, ...style] of segs) {
+    for (let i = 0; i < text.length;) {
+      const n = Math.min(width - col, text.length - i);
+      row.push([text.slice(i, i + n), ...style]);
+      i += n;
+      col += n;
+      if (col === width) {
+        yield row;
+        row = [];
+        col = 0;
+      }
+    }
+  }
+  if (row.length || !segs.length) yield row;
+}
+
 export function table(lines: string[], W: number): Line[] {
   const cells = lines
     .filter((l) => !/^\s*\|?\s*:?-{2,}/.test(l))
@@ -145,14 +201,16 @@ export function table(lines: string[], W: number): Line[] {
     const segs: Seg[] = [["│", "dim"]];
     widths.forEach((w, i) => {
       const c = r[i] ?? [];
-      const txt = segText(c);
+      const truncated = segText(c).length > w;
+      let left = w;
       segs.push([" ", ""]);
-      if (txt.length > w) segs.push([fit(txt, w), ri === 0 ? "b" : c[0]?.[1] ?? ""]);
-      else {
-        for (const s of c) segs.push([s[0], ri === 0 ? `${s[1]} b`.trim() : s[1]]);
-        segs.push([" ".repeat(w - txt.length), ""]);
+      for (const [t, cls, ...link] of c) {
+        if (!left) break;
+        const visible = truncated && t.length >= left ? t.slice(0, left - 1) + "…" : t;
+        segs.push([visible, ri === 0 ? `${cls} b`.trim() : cls, ...link]);
+        left -= visible.length;
       }
-      segs.push([" ", ""], ["│", "dim"]);
+      segs.push([" ".repeat(left), ""], [" ", ""], ["│", "dim"]);
     });
     out.push({ segs });
     if (ri === 0 && cells.length > 1) out.push(bar("├", "┼", "┤"));
@@ -164,11 +222,11 @@ export function table(lines: string[], W: number): Line[] {
 const DEFAULT_DIAGRAM_ROWS = 18;
 
 /**
- * Markdown to lines. A closed ```d3 block becomes a diagram (`// rows: N` on its first line
- * sets the height, `// title: …` the caption); while the block is still streaming, its source
- * shows as code.
+ * Markdown to lines. A closed ```d3 block becomes a diagram (`// rows: N` sets the height,
+ * `// title: …` the caption). An open one shows a placeholder, animated when `streamSpin`
+ * is supplied for a live response.
  */
-export function markdown(text: string, W: number, key = ""): Line[] {
+export function markdown(text: string, W: number, key = "", streamSpin?: number): Line[] {
   const L = text.split("\n");
   const out: Line[] = [];
   let diagrams = 0;
@@ -178,12 +236,18 @@ export function markdown(text: string, W: number, key = ""): Line[] {
     if (fence) {
       const close = fence[2];
       const lang = fence[3];
-      const code: string[] = [];
-      for (i++; i < L.length && !L[i].trimStart().startsWith(close); i++) code.push(L[i]);
-      const closed = i < L.length;
-      i++;
-      if (lang === "d3" && closed) {
-        const src = code.join("\n");
+      const start = ++i;
+      while (i < L.length && !L[i].trimStart().startsWith(close)) i++;
+      const end = i++;
+      if (lang === "d3") {
+        if (end === L.length) {
+          const segs: Seg[] = streamSpin === undefined
+            ? [[fit("Diagram incomplete", W), "dim i"]]
+            : [[SPIN[streamSpin % SPIN.length] + " ", "purple"], [fit("Generating diagram…", W - 2), "dim"]];
+          out.push({ segs });
+          continue;
+        }
+        const src = L.slice(start, end).join("\n");
         const rows = Number(src.match(/\/\/\s*rows:\s*(\d+)/)?.[1] ?? DEFAULT_DIAGRAM_ROWS);
         const title = src.match(/\/\/\s*title:\s*(.+)/)?.[1]?.trim() ?? "diagram";
         const d: Diagram = { key: `${key}#${diagrams++}`, script: src, rows: Math.max(4, Math.min(60, rows)), title };
@@ -192,7 +256,9 @@ export function markdown(text: string, W: number, key = ""): Line[] {
         continue;
       }
       out.push({ segs: [[` ${lang || "code"} `, "lang"]], bg: "code" });
-      for (const c of code) for (const p of chunks(c, Math.max(1, W - 1))) out.push({ segs: [[" ", ""], ...highlight(p, lang)], bg: "code" });
+      for (let j = start; j < end; j++) {
+        for (const p of chunks(L[j], Math.max(1, W - 1))) out.push({ segs: [[" ", ""], ...highlight(p, lang)], bg: "code" });
+      }
       continue;
     }
     if (/^\s*\|/.test(l)) {
@@ -243,9 +309,9 @@ const cache = new WeakMap<Entry, { v: number; W: number; spin: number; lines: Li
 
 /** Rows of one entry (cached until the entry or the width changes), ending with a spacer. */
 export function entryLines(e: Entry, W: number, spin: number): Line[] {
-  const running = e.tool?.status === "run";
+  const animating = e.tool?.status === "run" || (e.k === "assistant" && e.streaming);
   const c = cache.get(e);
-  if (c && c.v === e.v && c.W === W && (!running || c.spin === spin)) return c.lines;
+  if (c && c.v === e.v && c.W === W && (!animating || c.spin === spin)) return c.lines;
   const lines = build(e, W, spin);
   cache.set(e, { v: e.v, W, spin, lines });
   return lines;
@@ -259,7 +325,7 @@ function build(e: Entry, W: number, spin: number): Line[] {
         wrap([[l, ""]], W, "", "", "", "user").forEach((x, j) => out.push({ ...x, g: [i === 0 && j === 0 ? "› " : "  ", "ug user"] })));
       break;
     case "assistant":
-      out = markdown(e.text, W, String(e.id));
+      out = markdown(e.text, W, String(e.id), e.streaming ? spin : undefined);
       if (out[0]) out[0].g = ["● ", ""];
       break;
     case "reasoning": {
@@ -279,7 +345,8 @@ function build(e: Entry, W: number, spin: number): Line[] {
       for (const c of t.children) out.push({ segs: [["  " + fit(c, W - 2), "dim"]] });
       const ls = t.output ? t.output.split("\n") : [];
       const shown = e.collapsed ? Math.min(COLLAPSED_OUTPUT, ls.length) : ls.length;
-      for (const l of ls.slice(0, shown)) for (const p of chunks(l, Math.max(1, W - 2))) out.push({ g: ["│ ", "dim"], segs: [[p, t.status === "bad" ? "err" : "fgdim"]] });
+      const cls = t.status === "bad" ? "err" : "fgdim";
+      for (const l of ls.slice(0, shown)) for (const p of chunkSegs(linkedText(l, cls), Math.max(1, W - 2))) out.push({ g: ["│ ", "dim"], segs: p });
       if (shown < ls.length) out.push({ g: ["│ ", "dim"], segs: [[`… +${ls.length - shown} lines (Tab to expand)`, "dim"]] });
       break;
     }

@@ -3,6 +3,7 @@
 // Ctrl-w still works where the browser lets the page have it (an app window).
 
 import type { App } from "./app.ts";
+import { linkAt, type Row } from "./layout.ts";
 import { entryJump, find, wordBack, wordEnd, wordForward } from "./motion.ts";
 import type { View } from "./view.ts";
 
@@ -33,6 +34,10 @@ export class Keys {
     const key = keyName(e);
     if (["Shift", "Control", "Alt", "Meta", "CapsLock", "Dead"].includes(key) || e.metaKey) return false;
     if (key === "C-c" && a.cancel()) return true;
+    if (key === "Enter" && e.ctrlKey && !this.view.form.open) {
+      a.sendNow();
+      return true;
+    }
     if (key === "S-Tab") {
       a.cycleEffort();
       return true;
@@ -151,6 +156,7 @@ export class Keys {
       const count = a.count;
       a.count = null;
       if (p === "g" && key === "g") this.setRow(count != null ? count - 1 : 0);
+      else if (p === "g" && key === "x") this.openLink(rows[c.row], c.col);
       else if (p === "z" && key === "a") this.fold();
       else if (p === "z" && /^[ztb]$/.test(key)) {
         const vis = this.view.visibleRows();
@@ -290,6 +296,15 @@ export class Keys {
     if (hit.wrapped) a.setFlash(forward ? "search hit bottom, continuing at top" : "search hit top, continuing at bottom");
   }
 
+  /** `gx`: opens the link under the cursor in a new tab, else the row's first link. */
+  private openLink(row: Row | undefined, col: number) {
+    const a = this.app;
+    const href = linkAt(row, col) ?? row?.segs.find((s) => s[2])?.[2];
+    if (!href) return a.setFlash("no link on this line");
+    a.openUrl(href);
+    a.setFlash(`opened ${href}`);
+  }
+
   /** Folds or unfolds the tool output or reasoning under the cursor. */
   fold(): boolean {
     const a = this.app;
@@ -364,6 +379,7 @@ export class Keys {
     const t = this.input;
     switch (key) {
       case "Escape":
+        a.discardQueueEdit();
         a.mode = "normal";
         t.blur();
         return true;
@@ -372,21 +388,42 @@ export class Keys {
         return true;
       case "Enter":
         if (e.shiftKey || e.altKey) return false;
-        a.submit();
+        if (e.ctrlKey) a.sendNow();
+        else a.submit();
         return true;
       case "C-j":
         t.setRangeText("\n", t.selectionStart, t.selectionEnd, "end");
         return true;
+      case "Tab": {
+        // Complete the path before the cursor on the session's host.
+        if (e.ctrlKey || e.altKey || e.metaKey || t.selectionStart !== t.selectionEnd) return false;
+        const end = t.selectionStart;
+        const token = t.value.slice(0, end).match(/[^\s'"`()<>[\]{},;]*$/)![0];
+        const start = end - token.length;
+        let current = token;
+        return a.completePath(token, (path) => {
+          // Typing since the request moved or changed the token: leave the prompt alone.
+          if (t.value.slice(start, start + current.length) !== current) return false;
+          t.setRangeText(path, start, start + current.length, "end");
+          current = path;
+          return true;
+        });
+      }
       case "C-c":
-        if (a.cancel()) return true;
+        if (a.cancel() || a.discardQueueEdit()) return true;
         t.value = "";
         return true;
       case "ArrowUp":
       case "ArrowDown": {
-        // History only from an empty prompt or while already walking it.
-        if (t.value && a.histPos == null) return false;
-        if (!a.history.length) return false;
-        if (key === "ArrowUp") a.histPos = a.histPos == null ? a.history.length - 1 : Math.max(0, a.histPos - 1);
+        if (e.altKey || e.ctrlKey || e.shiftKey || e.metaKey || t.selectionStart !== t.selectionEnd) return false;
+        const up = key === "ArrowUp";
+        // Move the cursor within multiline text before entering queue or history navigation.
+        const side = up ? t.value.slice(0, t.selectionStart) : t.value.slice(t.selectionEnd);
+        if (side.includes("\n")) return false;
+        if (a.recallQueued(up)) return true;
+        // History only from an empty prompt or while already walking it, never while editing.
+        if (a.cur.queueEdit || (t.value && a.histPos == null) || !a.history.length) return false;
+        if (up) a.histPos = a.histPos == null ? a.history.length - 1 : Math.max(0, a.histPos - 1);
         else if (a.histPos == null) return false;
         else a.histPos = a.histPos + 1 < a.history.length ? a.histPos + 1 : null;
         t.value = a.histPos == null ? "" : a.history[a.histPos];

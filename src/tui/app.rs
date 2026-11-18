@@ -11,7 +11,7 @@ use std::{
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::{
     fileview::FileView,
@@ -26,7 +26,7 @@ use crate::{
     comments::{Anchor, Comment, compose_message},
     config::HostConfig,
     diff,
-    hub::{net, Notice, Request, Snapshot},
+    hub::{net, Notice, QueuedTurn, Request, Snapshot},
     length::Routing,
     llm::{Effort, Message, Usage},
     tools::{jobs, resolve_path, summarize},
@@ -82,11 +82,13 @@ pub struct SessionView {
     pub(crate) follow: bool,
     /// Draft in the prompt for this session.
     pub(crate) prompt: Input,
+    hist_pos: Option<usize>,
     /// Review comments queued for this session's next message.
     pub(crate) queue: Vec<Comment>,
     pub(crate) running: bool,
-    /// Messages sent while a turn was running that have not started yet.
-    pub(crate) waiting: usize,
+    /// The hub's queue, oldest first, not including the running turn.
+    pub(crate) queued: Vec<QueuedTurn>,
+    pub(crate) queue_edit: Option<QueueEdit>,
     pub(crate) usage: Usage,
     /// The last turn's response-length pick, shown in the status line.
     pub(crate) length: Option<String>,
@@ -101,6 +103,14 @@ pub struct SessionView {
     pub(crate) read_only: bool,
     /// Tool call id of an `ask` waiting for the user; the next message answers it.
     pub(crate) question: Option<String>,
+}
+
+pub(crate) struct QueueEdit {
+    pub(crate) turn_id: u64,
+    original: String,
+    pub(crate) submitted: Option<String>,
+    /// The turn Ctrl-Enter meant to interrupt, if still current when the edit is acknowledged.
+    interrupt: Option<Instant>,
 }
 
 impl SessionView {
@@ -118,9 +128,11 @@ impl SessionView {
             chat_scroll: 0,
             follow: true,
             prompt: Input::default(),
+            hist_pos: None,
             queue: Vec::new(),
             running: false,
-            waiting: 0,
+            queued: Vec::new(),
+            queue_edit: None,
             usage: Usage::default(),
             length: None,
             activity: None,
@@ -143,6 +155,73 @@ enum PendingOpen {
     Id(usize, String),
 }
 
+/// Tab completion of the path before the prompt cursor.
+#[derive(Debug)]
+pub(crate) struct Completion {
+    /// Awaiting the hub's answer to this request id.
+    request: Option<u64>,
+    host: usize,
+    session_id: String,
+    /// Byte offset where the path starts in the prompt.
+    start: usize,
+    /// The text there now: what was typed, then the completion put in.
+    current: String,
+    /// Matches Tab cycles through once the answer has several; `next` is the one Tab puts in.
+    choices: Vec<String>,
+    next: usize,
+}
+
+/// What a host's connection task reports to the event loop.
+#[derive(Debug)]
+pub enum HostEvent {
+    Notice(Notice),
+    /// The connection ended.
+    Closed,
+    /// A reconnect succeeded: requests go to this sender from now on.
+    Linked(UnboundedSender<Request>),
+    /// Reconnecting failed for long enough to stop trying.
+    GaveUp(String),
+}
+
+/// Feeds `notices` from `host` into the event loop, then reports the connection closed.
+pub fn forward(host: usize, mut notices: UnboundedReceiver<Notice>, tx: UnboundedSender<(usize, HostEvent)>) {
+    tokio::spawn(async move {
+        while let Some(n) = notices.recv().await {
+            if tx.send((host, HostEvent::Notice(n))).is_err() {
+                return;
+            }
+        }
+        let _ = tx.send((host, HostEvent::Closed));
+    });
+}
+
+/// Delays between reconnect attempts: quick at first, for a `:restart`, then every two
+/// seconds for about a minute.
+const RECONNECT_DELAYS_MS: [u64; 4] = [200, 500, 1000, 2000];
+const RECONNECT_ATTEMPTS: usize = 32;
+
+/// Retries `relink` until it answers, then hands the new connection to the event loop.
+fn spawn_reconnect(host: usize, relink: net::Relink, tx: UnboundedSender<(usize, HostEvent)>) {
+    tokio::spawn(async move {
+        let mut last = String::new();
+        for attempt in 0..RECONNECT_ATTEMPTS {
+            let delay = RECONNECT_DELAYS_MS[attempt.min(RECONNECT_DELAYS_MS.len() - 1)];
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            match relink.connect().await {
+                Ok((req_tx, first, rest)) => {
+                    if tx.send((host, HostEvent::Linked(req_tx))).is_err() {
+                        return;
+                    }
+                    let _ = tx.send((host, HostEvent::Notice(first)));
+                    return forward(host, rest, tx);
+                }
+                Err(e) => last = format!("{e:#}"),
+            }
+        }
+        let _ = tx.send((host, HostEvent::GaveUp(last)));
+    });
+}
+
 /// One attached hub: this machine's or a remote one.
 pub struct Host {
     pub name: String,
@@ -152,6 +231,12 @@ pub struct Host {
     pub dir: Option<PathBuf>,
     req_tx: UnboundedSender<Request>,
     pub connected: bool,
+    /// How to reach the hub again when the connection ends; `None` for an in-process hub.
+    pub relink: Option<net::Relink>,
+    /// A reconnect task is running.
+    reconnecting: bool,
+    /// Reopen subscribed sessions once this new connection sends `Hello`.
+    reopen_on_hello: bool,
     /// Hub version from its `Hello` notice, once seen.
     pub version: Option<String>,
     /// The hub version we already asked to restart; avoids a restart loop on reconnect.
@@ -172,6 +257,9 @@ impl Host {
             dir,
             req_tx,
             connected: true,
+            relink: None,
+            reconnecting: false,
+            reopen_on_hello: false,
             version: None,
             restart_requested: None,
             recorded: Vec::new(),
@@ -235,7 +323,6 @@ pub struct App {
     pub(crate) previewing: bool,
     /// Prompt history across sessions.
     history: Vec<String>,
-    hist_pos: Option<usize>,
     pub spinner: usize,
     drag_anchor: Option<Pos>,
     /// Text written to the terminal outside ratatui (OSC 52 clipboard) on the next draw.
@@ -249,7 +336,12 @@ pub struct App {
     /// Command run on a remote host to reach its hub (usually `rdsh connect`).
     pub remote_command: Vec<String>,
     /// Where this TUI's merged notice stream is fed; set by the event loop.
-    pub merged_tx: Option<UnboundedSender<(usize, Option<Notice>)>>,
+    pub merged_tx: Option<UnboundedSender<(usize, HostEvent)>>,
+    /// Opens a URL or local file outside the TUI (`gx`); tests replace it.
+    pub(crate) open_url: Box<dyn Fn(&str)>,
+    /// Tab completion: the request in flight, then the matches Tab cycles through.
+    completion: Option<Completion>,
+    completion_ids: u64,
 }
 
 impl App {
@@ -292,15 +384,17 @@ impl App {
             preview_loading: false,
             previewing: false,
             history: Vec::new(),
-            hist_pos: None,
             spinner: 0,
             drag_anchor: None,
             osc_out: None,
             effort: Effort::default(),
-            models: crate::config::Config::default().models,
+            models: crate::providers::DEEPSEEK_MODELS.map(String::from).to_vec(),
             ssh_program: "ssh".into(),
             remote_command: vec!["rdsh".into(), "connect".into()],
             merged_tx: None,
+            completion: None,
+            completion_ids: 0,
+            open_url: Box::new(crate::util::open_browser),
         }
     }
 
@@ -310,12 +404,14 @@ impl App {
     }
 
     /// Sends a request to `host`; a closed connection is reported in the status line.
-    fn request(&mut self, host: usize, req: Request) {
-        let Some(h) = self.hosts.get(host) else { return };
-        if !h.connected || h.req_tx.send(req).is_err() {
-            let name = h.name.clone();
-            self.set_flash(format!("not connected to {name}"));
+    fn request(&mut self, host: usize, req: Request) -> bool {
+        let Some(h) = self.hosts.get(host) else { return false };
+        if h.connected && h.req_tx.send(req).is_ok() {
+            return true;
         }
+        let name = h.name.clone();
+        self.set_flash(format!("not connected to {name}"));
+        false
     }
 
     /// The default directory for new sessions on `host`.
@@ -328,18 +424,70 @@ impl App {
         }
     }
 
-    /// The hub on `host` went away: its views stay readable, nothing more can be sent there.
+    /// Applies one event from `host`'s connection.
+    pub fn on_host_event(&mut self, host: usize, ev: HostEvent) {
+        match ev {
+            HostEvent::Notice(n) => self.on_notice(host, n),
+            HostEvent::Closed => self.on_disconnect(host),
+            HostEvent::Linked(tx) => self.on_relinked(host, tx),
+            HostEvent::GaveUp(e) => {
+                let Some(h) = self.hosts.get_mut(host) else { return };
+                h.reconnecting = false;
+                let name = h.name.clone();
+                self.set_flash(format!("could not reconnect to {name}: {e}"));
+            }
+        }
+    }
+
+    /// The hub on `host` went away: its views stay readable and the connection is retried in
+    /// the background (a `:restart` ends it this way).
     pub fn on_disconnect(&mut self, host: usize) {
         let Some(h) = self.hosts.get_mut(host) else { return };
         h.connected = false;
+        h.reopen_on_hello = false;
         h.running.clear();
         let name = h.name.clone();
         for v in std::iter::once(&mut self.cur).chain(self.others.iter_mut()) {
             if v.host == host {
                 v.running = false;
+                v.queued.clear();
+                // Queue IDs may be reused by a restarted hub; keep only the draft text.
+                v.queue_edit = None;
             }
         }
-        self.set_flash(format!("lost the connection to {name}"));
+        let h = &mut self.hosts[host];
+        match (&h.relink, &self.merged_tx) {
+            (Some(relink), Some(tx)) if !h.reconnecting => {
+                h.reconnecting = true;
+                spawn_reconnect(host, relink.clone(), tx.clone());
+                self.set_flash(format!("lost the connection to {name} — reconnecting…"));
+            }
+            _ => self.set_flash(format!("lost the connection to {name}")),
+        }
+        self.refresh_sidebar();
+    }
+
+    /// A reconnect to `host` succeeded. Wait for its Hello before re-subscribing to sessions.
+    fn on_relinked(&mut self, host: usize, tx: UnboundedSender<Request>) {
+        let Some(h) = self.hosts.get_mut(host) else { return };
+        h.req_tx = tx;
+        h.connected = true;
+        h.reconnecting = false;
+        h.reopen_on_hello = true;
+    }
+
+    fn reopen_sessions(&mut self, host: usize) {
+        let name = self.hosts[host].name.clone();
+        self.request(host, Request::List);
+        let ids: Vec<String> = std::iter::once(&self.cur)
+            .chain(self.others.iter())
+            .filter(|v| v.host == host && !v.read_only && !v.session_id.is_empty())
+            .map(|v| v.session_id.clone())
+            .collect();
+        for session_id in ids {
+            self.request(host, Request::Open { session_id });
+        }
+        self.set_flash(format!("reconnected to {name}"));
         self.refresh_sidebar();
     }
 
@@ -350,6 +498,10 @@ impl App {
         }
         match n {
             Notice::Hello { version } => {
+                self.request(host, Request::WatchQueue);
+                if std::mem::take(&mut self.hosts[host].reopen_on_hello) {
+                    self.reopen_sessions(host);
+                }
                 // The connecting TUI is assumed to be the latest binary. A hub whose version is
                 // strictly older is asked to drain and restart; an equal or newer hub is left alone.
                 let client_version = env!("CARGO_PKG_VERSION");
@@ -390,12 +542,14 @@ impl App {
                     history,
                     turn: Vec::new(),
                     running: false,
+                    queued: Vec::new(),
                     usage: Usage::default(),
                 };
                 if current {
                     self.previews.remove(&(host, session_id));
                     self.install(host, snapshot, true);
                     self.cur.read_only = true;
+                    self.cur.queue_edit = None;
                 } else {
                     // Answer to a preview request: cache it, stamped with the trace's age.
                     self.preview_loading = true;
@@ -430,6 +584,15 @@ impl App {
                 }
             }
             Notice::Event { session_id, event } => self.on_session_event(host, &session_id, event),
+            Notice::Queue { session_id, queued } => {
+                if let Some(v) = self.session_view_mut(host, &session_id) {
+                    v.queued = queued;
+                }
+            }
+            Notice::QueueEdited { session_id, turn_id, updated } => {
+                self.on_queue_edited(host, session_id, turn_id, updated);
+            }
+            Notice::PathCompletions { request_id, paths } => self.on_path_completions(host, request_id, paths),
             Notice::Error { message, .. } => {
                 self.pending_open = None;
                 self.pending_file = None;
@@ -469,6 +632,7 @@ impl App {
             self.on_agent(ev);
         }
         self.cur.running = snapshot.running;
+        self.cur.queued = snapshot.queued;
         self.cur.usage = snapshot.usage;
         self.background = was_background;
         std::mem::replace(&mut self.cur, previous)
@@ -528,17 +692,17 @@ impl App {
 
     fn install(&mut self, host: usize, snapshot: Snapshot, make_current: bool) {
         let id = snapshot.session_id.clone();
-        self.others.retain(|v| !(v.host == host && v.session_id == id));
         let same = self.cur.host == host && self.cur.session_id == id;
-        // Keep the draft and queued comments of a view being refreshed.
-        let carried = same.then(|| {
-            (std::mem::take(&mut self.cur.prompt), std::mem::take(&mut self.cur.queue), self.cur.has_input)
-        });
         let mut fresh = self.build_view(host, snapshot);
-        if let Some((prompt, queue, has_input)) = carried {
-            fresh.prompt = prompt;
-            fresh.queue = queue;
-            fresh.has_input |= has_input;
+        let mut previous_other = self.other_index(host, &id).map(|i| self.others.remove(i));
+        // Refresh server state, but retain the local draft, edit and comments even in the background.
+        let previous_view = if same { Some(&mut self.cur) } else { previous_other.as_mut() };
+        if let Some(v) = previous_view {
+            fresh.prompt = std::mem::take(&mut v.prompt);
+            fresh.hist_pos = v.hist_pos;
+            fresh.queue = std::mem::take(&mut v.queue);
+            fresh.queue_edit = v.queue_edit.take();
+            fresh.has_input |= v.has_input;
         }
         let previous = std::mem::replace(&mut self.cur, fresh);
         let keep_previous = !previous.session_id.is_empty() && !same;
@@ -554,6 +718,39 @@ impl App {
         self.refresh_sidebar();
         if make_current {
             self.sidebar_sel = self.sidebar.index_of(host, &id).unwrap_or(self.sidebar_sel);
+        }
+    }
+
+    fn session_view_mut(&mut self, host: usize, id: &str) -> Option<&mut SessionView> {
+        if self.cur.host == host && self.cur.session_id == id {
+            Some(&mut self.cur)
+        } else {
+            self.others.iter_mut().find(|v| v.host == host && v.session_id == id)
+        }
+    }
+
+    fn on_queue_edited(&mut self, host: usize, session_id: String, turn_id: u64, updated: bool) {
+        let current = self.cur.host == host && self.cur.session_id == session_id;
+        let Some(v) = self.session_view_mut(host, &session_id) else { return };
+        if !v.queue_edit.as_ref().is_some_and(|e| e.turn_id == turn_id && e.submitted.is_some()) {
+            return;
+        }
+        let edit = v.queue_edit.take().unwrap();
+        if updated {
+            if edit.submitted.as_deref() == Some(v.prompt.text.as_str()) {
+                v.prompt.take();
+            }
+            // Do not interrupt another turn that started while waiting for the edit ack.
+            if v.running && edit.interrupt == Some(v.turn_started) && v.queued.iter().any(|t| t.id == turn_id) {
+                self.interrupt_for_queue(host, session_id);
+            }
+        } else {
+            let message = "queued turn already started — edit kept as an unsent draft";
+            if current {
+                self.set_flash(message);
+            } else {
+                self.set_flash(format!("{session_id}: {message}"));
+            }
         }
     }
 
@@ -604,24 +801,18 @@ impl App {
         }
         let mut ssh_args = vec!["-T".to_owned(), h.ssh.clone()];
         ssh_args.extend(self.remote_command.iter().cloned());
-        let (req_tx, mut notices) = match net::connect_command(&self.ssh_program, &ssh_args) {
+        let (req_tx, notices) = match net::connect_command(&self.ssh_program, &ssh_args) {
             Ok(pair) => pair,
             Err(e) => return self.set_flash(format!(":host {} — {e:#}", h.name)),
         };
         let host = self.hosts.len();
         if let Some(tx) = &self.merged_tx {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                while let Some(n) = notices.recv().await {
-                    if tx.send((host, Some(n))).is_err() {
-                        return;
-                    }
-                }
-                let _ = tx.send((host, None));
-            });
+            forward(host, notices, tx.clone());
         }
         let _ = req_tx.send(Request::List);
-        self.hosts.push(Host::new(h.name.clone(), false, h.dir.clone().map(PathBuf::from), req_tx));
+        let mut added = Host::new(h.name.clone(), false, h.dir.clone().map(PathBuf::from), req_tx);
+        added.relink = Some(net::Relink::Command { program: self.ssh_program.clone(), args: ssh_args });
+        self.hosts.push(added);
         self.refresh_sidebar();
         self.set_flash(format!("added {} — starting a session…", h.name));
         self.new_session(host);
@@ -704,7 +895,7 @@ impl App {
                         self.history.push(content.clone());
                     }
                 }
-                Message::Assistant { content, reasoning, tool_calls } => {
+                Message::Assistant { content, reasoning, tool_calls, .. } => {
                     if let Some(r) = reasoning {
                         self.cur.transcript.push(Kind::Reasoning, r.clone());
                     }
@@ -888,6 +1079,7 @@ impl App {
                 _ => {
                     self.mode = Mode::Insert;
                     self.cur.prompt.insert_str(&s);
+                    self.cur.hist_pos = None;
                 }
             },
             _ => {}
@@ -940,8 +1132,8 @@ impl App {
             return;
         }
         let cleared = match self.mode {
-            Mode::Insert if !self.cur.prompt.text.is_empty() => {
-                self.cur.prompt.take();
+            Mode::Insert if self.cur.queue_edit.is_some() || !self.cur.prompt.text.is_empty() => {
+                self.discard_prompt();
                 true
             }
             Mode::Comment | Mode::Search { .. } | Mode::Command | Mode::Visual { .. } => {
@@ -966,33 +1158,177 @@ impl App {
         }
     }
 
+    fn discard_prompt(&mut self) {
+        if self.cur.queue_edit.as_ref().is_some_and(|e| e.submitted.is_some()) {
+            self.set_flash("edit already sent — waiting for the hub");
+            return;
+        }
+        self.cur.queue_edit = None;
+        self.cur.hist_pos = None;
+        self.cur.prompt.take();
+    }
+
+    /// Tab in the prompt: cycle the matches of the last completion, or ask the session's host
+    /// to complete the path before the cursor (relative to the session's directory).
+    fn complete_path(&mut self) {
+        let p = &self.cur.prompt;
+        if let Some(c) = &mut self.completion
+            && !c.choices.is_empty()
+            && p.text.get(c.start..p.cursor) == Some(c.current.as_str())
+        {
+            let pick = c.choices[c.next].clone();
+            c.next = (c.next + 1) % c.choices.len();
+            let (start, old) = (c.start, std::mem::replace(&mut c.current, pick.clone()));
+            self.cur.prompt.replace_range(start..start + old.len(), &pick);
+            return;
+        }
+        if self.cur.read_only || self.cur.session_id.is_empty() {
+            return self.set_flash("no session to complete paths in");
+        }
+        let before = &p.text[..p.cursor];
+        let start = before
+            .rfind(|c: char| c.is_whitespace() || "'\"`()<>[]{},;".contains(c))
+            .map_or(0, |i| i + before[i..].chars().next().map_or(1, char::len_utf8));
+        let token = before[start..].to_owned();
+        self.completion_ids += 1;
+        let id = self.completion_ids;
+        let (host, session_id) = (self.cur.host, self.cur.session_id.clone());
+        let req = Request::CompletePath { session_id: session_id.clone(), request_id: id, prefix: token.clone() };
+        self.completion = self.request(host, req).then(|| Completion {
+            request: Some(id),
+            host,
+            session_id,
+            start,
+            current: token,
+            choices: Vec::new(),
+            next: 0,
+        });
+    }
+
+    fn on_path_completions(&mut self, host: usize, request_id: u64, paths: Vec<String>) {
+        let Some(c) = &mut self.completion else { return };
+        if c.request != Some(request_id) || c.host != host {
+            return;
+        }
+        let p = &self.cur.prompt;
+        let same = self.cur.host == host && self.cur.session_id == c.session_id;
+        // Typing since the request moved or changed the path: leave the prompt alone.
+        if !same || p.text.get(c.start..p.cursor) != Some(c.current.as_str()) {
+            self.completion = None;
+            return;
+        }
+        c.request = None;
+        let (start, typed) = (c.start, c.current.clone());
+        let put = match paths.len() {
+            0 => {
+                self.completion = None;
+                return self.set_flash(if typed.is_empty() { "no files here".to_owned() } else { format!("no paths start with {typed}") });
+            }
+            1 => paths[0].clone(),
+            _ => paths.iter().skip(1).fold(paths[0].clone(), |acc, s| {
+                let n = acc.chars().zip(s.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a.len_utf8()).sum();
+                acc[..n].to_owned()
+            }),
+        };
+        if paths.len() > 1 {
+            let shown: Vec<&str> = paths.iter().take(6).map(String::as_str).collect();
+            let more = if paths.len() > 6 { format!(" +{}", paths.len() - 6) } else { String::new() };
+            let flash = format!("{} matches: {}{more} — Tab cycles", paths.len(), shown.join("  "));
+            c.choices = paths;
+            self.set_flash(flash);
+        } else {
+            self.completion = None;
+        }
+        if put.len() > typed.len() {
+            self.cur.prompt.replace_range(start..start + typed.len(), &put);
+            if let Some(c) = &mut self.completion {
+                c.current = put;
+            }
+        }
+    }
+
     fn insert_key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Tab && k.modifiers.is_empty() {
+            return self.complete_path();
+        }
+        if self.completion.as_ref().is_some_and(|c| c.request.is_none()) {
+            self.completion = None;
+        }
         match self.cur.prompt.handle(k) {
             InputAction::Submit => self.submit(),
-            InputAction::Cancel => self.mode = Mode::Normal,
-            InputAction::HistoryPrev if !self.history.is_empty() => {
-                let i = self.hist_pos.map_or(self.history.len() - 1, |i| i.saturating_sub(1));
-                self.hist_pos = Some(i);
-                self.cur.prompt.set(self.history[i].clone());
+            InputAction::Cancel => {
+                if self.cur.queue_edit.is_some() {
+                    self.discard_prompt();
+                }
+                self.mode = Mode::Normal;
+            }
+            // Input only returns these actions at the first/last logical line.
+            InputAction::HistoryPrev => {
+                if self.recall_queued(true) {
+                    return;
+                }
+                if !self.history.is_empty() && (self.cur.prompt.text.is_empty() || self.cur.hist_pos.is_some()) {
+                    let i = self.cur.hist_pos.map_or(self.history.len() - 1, |i| i.saturating_sub(1));
+                    self.cur.hist_pos = Some(i);
+                    self.cur.prompt.set(self.history[i].clone());
+                }
             }
             InputAction::HistoryNext => {
-                if let Some(i) = self.hist_pos {
+                if self.recall_queued(false) {
+                    return;
+                }
+                if let Some(i) = self.cur.hist_pos {
                     if i + 1 < self.history.len() {
-                        self.hist_pos = Some(i + 1);
+                        self.cur.hist_pos = Some(i + 1);
                         self.cur.prompt.set(self.history[i + 1].clone());
                     } else {
-                        self.hist_pos = None;
+                        self.cur.hist_pos = None;
                         self.cur.prompt.take();
                     }
                 }
             }
-            InputAction::Edited => self.hist_pos = None,
+            InputAction::Edited => self.cur.hist_pos = None,
             _ => {}
         }
     }
 
-    /// Ctrl-Enter from any mode (and `:now`): finish the comment being written, send the queue
-    /// and prompt, and interrupt the running turn so waiting messages start at once.
+    /// Navigate the server's queue by ID, never replacing a separate draft or a changed recall.
+    /// Returns true if this arrow belongs to queue navigation rather than history.
+    fn recall_queued(&mut self, older: bool) -> bool {
+        let i = if let Some(edit) = &self.cur.queue_edit {
+            if edit.submitted.is_some() || self.cur.prompt.text != edit.original {
+                return true;
+            }
+            let pos = self.cur.queued.iter().position(|t| t.id == edit.turn_id);
+            if older {
+                let Some(i) = pos else { return true };
+                i.saturating_sub(1)
+            } else {
+                // If the recalled turn started already, anything still pending is newer.
+                let i = pos.map_or(0, |i| i + 1);
+                if i == self.cur.queued.len() {
+                    self.discard_prompt();
+                    return true;
+                }
+                i
+            }
+        } else if older && self.cur.prompt.text.is_empty() && !self.cur.queued.is_empty() {
+            self.cur.queued.len() - 1
+        } else {
+            return false;
+        };
+        let turn = &self.cur.queued[i];
+        if self.cur.queue_edit.as_ref().is_some_and(|e| e.turn_id == turn.id) {
+            return true;
+        }
+        self.cur.hist_pos = None;
+        self.cur.prompt.set(turn.text.clone());
+        self.cur.queue_edit = Some(QueueEdit { turn_id: turn.id, original: turn.text.clone(), submitted: None, interrupt: None });
+        true
+    }
+
+    /// Ctrl-Enter from any mode (and `:now`): send the prompt or save its queued edit, and
+    /// interrupt the running turn so the next queued message can start.
     fn send_now(&mut self) {
         self.ctrl_c_armed = false;
         self.flash = None;
@@ -1001,56 +1337,98 @@ impl App {
             Mode::Visual { .. } | Mode::Search { .. } | Mode::Command => self.mode = Mode::Normal,
             Mode::Normal | Mode::Insert => {}
         }
+        if self.cur.queue_edit.is_some() {
+            self.submit_queue_edit(true);
+            return;
+        }
         let typed = !self.cur.queue.is_empty() || !self.cur.prompt.is_blank();
-        if !typed && self.cur.waiting == 0 {
+        if !typed && self.cur.queued.is_empty() {
             self.set_flash("nothing to send — comment with c or type with i");
             return;
         }
-        if typed {
-            self.submit();
+        // Text typed for an `ask` form answers it; interrupting would end the turn it serves.
+        let answering = typed && self.cur.question.is_some();
+        if typed && !self.submit_new() {
+            return;
         }
-        if self.cur.running {
-            let session_id = self.cur.session_id.clone();
-            self.request(self.cur.host, Request::Cancel { session_id });
-            self.set_flash("interrupting — the waiting message starts next");
+        if self.cur.running && !answering {
+            self.interrupt_for_queue(self.cur.host, self.cur.session_id.clone());
         }
     }
 
-    /// Sends the prompt plus all queued comments as the next user message.
+    /// Merges the queue into one message and interrupts the running turn, so every waiting
+    /// message starts now.
+    fn interrupt_for_queue(&mut self, host: usize, session_id: String) {
+        let current = self.cur.host == host && self.cur.session_id == session_id;
+        let n = if current { self.cur.queued.len() } else { 0 };
+        if self.request(host, Request::RunQueuedNow { session_id }) && current {
+            self.set_flash(match n {
+                0 | 1 => "interrupting — the waiting message starts now".to_owned(),
+                n => format!("interrupting — the {n} waiting messages start now, as one"),
+            });
+        }
+    }
+
     pub(crate) fn submit(&mut self) {
+        if self.cur.queue_edit.is_some() {
+            self.submit_queue_edit(false);
+        } else {
+            self.submit_new();
+        }
+    }
+
+    fn submit_queue_edit(&mut self, now: bool) {
+        let Some(edit) = &self.cur.queue_edit else { return };
+        if edit.submitted.is_some() {
+            self.set_flash("edit already sent — waiting for the hub");
+            return;
+        }
+        if self.cur.prompt.is_blank() {
+            self.set_flash("queued turn cannot be empty — Esc discards the edit");
+            return;
+        }
+        let turn_id = edit.turn_id;
+        let text = self.cur.prompt.text.clone();
+        let session_id = self.cur.session_id.clone();
+        if self.request(self.cur.host, Request::EditQueued { session_id, turn_id, text: text.clone() }) {
+            let edit = self.cur.queue_edit.as_mut().unwrap();
+            edit.submitted = Some(text);
+            edit.interrupt = (now && self.cur.running).then_some(self.cur.turn_started);
+        }
+    }
+
+    /// Sends the prompt plus all queued comments as the next user message (or ask answer).
+    fn submit_new(&mut self) -> bool {
         let text = self.cur.prompt.text.trim().to_owned();
         if text.is_empty() && self.cur.queue.is_empty() {
-            return;
+            return false;
         }
         if self.cur.read_only || self.cur.session_id.is_empty() {
             self.set_flash(if self.cur.read_only { "read-only trace — open a session to send" } else { "no session yet" });
-            return;
+            return false;
+        }
+        let msg = compose_message(&self.cur.queue, &text);
+        let session_id = self.cur.session_id.clone();
+        let req = if let Some(question_id) = self.cur.question.clone() {
+            let answer = crate::tools::ask::Answer::Text { text: msg };
+            Request::Answer { session_id, question_id, answer }
+        } else {
+            // The user entry appears when the hub starts the turn, not when it is queued.
+            Request::Send { session_id, text: msg, effort: self.effort, model: Some(self.cur.model.clone()).filter(|m| !m.is_empty()), diagrams: false }
+        };
+        if !self.request(self.cur.host, req) {
+            return false;
         }
         self.cur.prompt.take();
         self.cur.has_input = true;
         if !text.is_empty() {
-            self.history.push(text.clone());
+            self.history.push(text);
         }
-        self.hist_pos = None;
-        let msg = compose_message(&self.cur.queue, &text);
+        self.cur.hist_pos = None;
         self.cur.queue.clear();
-        if let Some(question_id) = self.cur.question.take() {
-            // The agent is waiting on `ask`: this message is the answer, not a new turn.
-            let session_id = self.cur.session_id.clone();
-            let answer = crate::tools::ask::Answer::Text { text: msg };
-            self.request(self.cur.host, Request::Answer { session_id, question_id, answer });
-            self.view = View::Chat;
-            return;
-        }
-        // The hub queues turns; the user entry appears when the turn starts (`TurnStarted`),
-        // the same way for every client viewing this session.
-        if self.cur.running {
-            self.cur.waiting += 1;
-            self.set_flash("queued — sends when the current turn finishes");
-        }
-        let session_id = self.cur.session_id.clone();
-        self.request(self.cur.host, Request::Send { session_id, text: msg, effort: self.effort, model: Some(self.cur.model.clone()).filter(|m| !m.is_empty()), diagrams: false });
+        self.cur.question = None;
         self.view = View::Chat;
+        true
     }
 
     // --------------------------------------------------------- normal/visual
@@ -1249,6 +1627,7 @@ impl App {
                     self.set_flash("no file link on this line");
                 }
             }
+            ('g', KeyCode::Char('x')) => self.open_external(),
             (']', KeyCode::Char(']' | 'c')) => self.motion(Motion::NextBlock),
             ('[', KeyCode::Char('[' | 'c')) => self.motion(Motion::PrevBlock),
             ('z', KeyCode::Char('a')) => {
@@ -1488,7 +1867,8 @@ impl App {
     fn open_files(&mut self) {
         let (host, cwd) = (self.cur.host, self.cur.cwd.clone());
         if !self.host_is_local(host) {
-            return self.request(host, Request::ChangedFiles { cwd: cwd.display().to_string() });
+            self.request(host, Request::ChangedFiles { cwd: cwd.display().to_string() });
+            return;
         }
         let items = diff::changed_files(&cwd);
         if items.is_empty() {
@@ -1571,7 +1951,8 @@ impl App {
         if !self.host_is_local(host) {
             self.pending_file = Some(line);
             let req = Request::ReadFile { cwd: cwd.display().to_string(), path: path.display().to_string(), base: diff::Base::Head };
-            return self.request(host, req);
+            self.request(host, req);
+            return;
         }
         let file = diff::load(&cwd, &path);
         self.view = View::File(Box::new(FileView::new(file, line)));
@@ -1599,6 +1980,69 @@ impl App {
             }
             None => false,
         }
+    }
+
+    /// `gx`: opens the URL under the cursor in the browser, or a file link with the system's
+    /// default app. Off any link, the line's first URL (then file link) is used, like `gf`.
+    fn open_external(&mut self) {
+        if !matches!(self.view, View::Chat) || self.cur.transcript.total() == 0 {
+            return self.set_flash("gx opens links in the chat");
+        }
+        let pos = self.cur.chat_cursor.pos;
+        let (line, col) = self.logical_line_at(pos.row, pos.col);
+        let urls = crate::util::find_urls(&line);
+        let row = self.cur.transcript.row(pos.row);
+        let file = row.links.iter().find(|l| l.start <= pos.col && pos.col < l.end).map(|l| l.path.clone());
+        let url = urls.iter().find(|(s, e, _)| *s <= col && col < *e).map(|(_, _, u)| u.clone());
+        let target = match (url, file) {
+            (Some(u), _) => Ok(u),
+            (None, Some(p)) => Err(p),
+            (None, None) => match (urls.first(), row.links.first()) {
+                (Some((_, _, u)), _) => Ok(u.clone()),
+                (None, Some(l)) => Err(l.path.clone()),
+                (None, None) => return self.set_flash("no link on this line"),
+            },
+        };
+        match target {
+            Ok(url) => {
+                (self.open_url)(&url);
+                self.set_flash(format!("opened {url}"));
+            }
+            Err(_) if !self.host_is_local(self.cur.host) => {
+                let name = self.hosts[self.cur.host].name.clone();
+                self.set_flash(format!("that file is on {name} — gf shows it here"));
+            }
+            Err(path) => {
+                (self.open_url)(&path.display().to_string());
+                self.set_flash(format!("opened {}", path.display()));
+            }
+        }
+    }
+
+    /// The whole logical line under chat row `row` (a wrapped line's rows joined), and `col`
+    /// translated to a char offset in it.
+    fn logical_line_at(&self, row: usize, col: usize) -> (String, usize) {
+        let t = &self.cur.transcript;
+        let here = t.row(row);
+        let same = |r: usize| {
+            let x = t.row(r);
+            x.entry == here.entry && x.logical == here.logical
+        };
+        let mut first = row;
+        while first > 0 && t.row(first).offset > 0 && same(first - 1) {
+            first -= 1;
+        }
+        let mut line = String::new();
+        let mut r = first;
+        while r < t.total() && (r == first || (same(r) && t.row(r).offset > 0)) {
+            let x = t.row(r);
+            // Wrapping may drop the spaces it breaks at; put them back so offsets line up.
+            let have = line.chars().count();
+            line.extend(std::iter::repeat_n(' ', x.offset.saturating_sub(have)));
+            line.push_str(&x.text);
+            r += 1;
+        }
+        (line, here.offset + col)
     }
 
     fn toggle_collapse(&mut self) -> bool {
@@ -1857,7 +2301,6 @@ impl App {
                 } else {
                     self.cur.has_input = true;
                     self.cur.transcript.push(Kind::User, text);
-                    self.cur.waiting = self.cur.waiting.saturating_sub(1);
                 }
                 self.cur.running = true;
                 self.cur.follow = true;

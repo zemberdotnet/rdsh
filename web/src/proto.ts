@@ -53,6 +53,8 @@ export type AgentEvent =
   | { type: "warning"; data: string }
   | { type: "turn_end"; data: { cancelled: boolean; error: string | null } };
 
+export interface QueuedTurn { id: number; text: string }
+
 export interface Snapshot {
   session_id: string;
   model: string;
@@ -61,16 +63,20 @@ export interface Snapshot {
   turn: AgentEvent[];
   running: boolean;
   usage: Usage;
+  queued?: QueuedTurn[];
 }
 
 export type Notice =
   | { type: "hello"; version: string }
   | { type: "sessions"; recorded: SessionInfo[]; open: string[]; running: string[] }
   | { type: "opened"; snapshot: Snapshot }
+  | { type: "queue"; session_id: string; queued: QueuedTurn[] }
+  | { type: "queue_edited"; session_id: string; turn_id: number; updated: boolean }
   | { type: "event"; session_id: string; event: AgentEvent }
   | { type: "trace"; session_id: string; cwd: string; history: Message[] }
   | { type: "file"; file: unknown }
   | { type: "changed_files"; cwd: string; files: [string, string][] }
+  | { type: "path_completions"; request_id: number; paths: string[] }
   | { type: "restarting" }
   | { type: "error"; session_id: string | null; message: string };
 
@@ -79,8 +85,12 @@ export type Request =
   | { type: "new"; cwd?: string | null }
   | { type: "open"; session_id: string }
   | { type: "send"; session_id: string; text: string; effort: Effort; model?: string; diagrams?: boolean }
+  | { type: "watch_queue" }
+  | { type: "edit_queued"; session_id: string; turn_id: number; text: string }
   | { type: "answer"; session_id: string; question_id: string; answer: Answer }
   | { type: "cancel"; session_id: string }
+  | { type: "run_queued_now"; session_id: string }
+  | { type: "complete_path"; session_id: string; request_id: number; prefix: string }
   | { type: "close"; session_id: string }
   | { type: "read_file"; cwd: string; path: string }
   | { type: "changed_files"; cwd: string }

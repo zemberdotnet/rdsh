@@ -9,11 +9,11 @@ use std::{
 
 use rdsh::{
     agent::{Agent, AgentEvent, AgentOptions},
-    hub::{Factory, Hub, Notice, OpenKind, Request},
-    llm::{Effort, Message, Provider, ScriptedProvider},
+    hub::{Factory, Hub, Notice, OpenKind, QueuedTurn, Request, Snapshot},
+    llm::{self, Effort, Message, Provider, ScriptedProvider},
     tools, trace,
 };
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{Semaphore, mpsc::UnboundedReceiver};
 
 fn options(provider: Arc<dyn Provider>, cwd: &Path, t: trace::Trace) -> AgentOptions {
     AgentOptions {
@@ -31,12 +31,12 @@ fn options(provider: Arc<dyn Provider>, cwd: &Path, t: trace::Trace) -> AgentOpt
 }
 
 /// A hub whose agents answer from `provider`, with traces in `dir`. Counts factory calls.
-fn hub(provider: Arc<ScriptedProvider>, dir: PathBuf, builds: Arc<AtomicUsize>) -> Hub {
+fn hub(provider: Arc<dyn Provider>, dir: PathBuf, builds: Arc<AtomicUsize>) -> Hub {
     let n = Arc::new(AtomicUsize::new(0));
     let d = dir.clone();
     let factory: Factory = Arc::new(move |kind| {
         builds.fetch_add(1, Ordering::SeqCst);
-        let p: Arc<dyn Provider> = provider.clone();
+        let p = provider.clone();
         Ok(match kind {
             OpenKind::New(_) => {
                 let id = format!("s{}", n.fetch_add(1, Ordering::SeqCst) + 1);
@@ -320,6 +320,33 @@ fn protocol_messages_roundtrip_as_json() {
     assert!(text.contains(r#""type":"event""#));
 }
 
+#[test]
+fn queue_protocol_defaults_to_empty_for_old_snapshots() {
+    let old = serde_json::json!({
+        "session_id": "s1", "model": "scripted", "cwd": "/tmp", "history": [], "turn": [],
+        "running": false, "usage": llm::Usage::default(),
+    });
+    let mut snapshot: Snapshot = serde_json::from_value(old.clone()).unwrap();
+    assert!(snapshot.queued.is_empty());
+    assert_eq!(serde_json::to_value(&snapshot).unwrap(), old);
+
+    snapshot.queued.push(QueuedTurn { id: 7, text: "hi".into() });
+    let opened = serde_json::to_value(Notice::Opened { snapshot }).unwrap();
+    assert_eq!(opened["snapshot"]["queued"], serde_json::json!([{"id": 7, "text": "hi"}]));
+    assert_eq!(serde_json::to_value(serde_json::from_value::<Notice>(opened.clone()).unwrap()).unwrap(), opened);
+
+    for (request, json) in [
+        (Request::WatchQueue, serde_json::json!({"type": "watch_queue"})),
+        (
+            Request::EditQueued { session_id: "s1".into(), turn_id: 7, text: "hello".into() },
+            serde_json::json!({"type": "edit_queued", "session_id": "s1", "turn_id": 7, "text": "hello"}),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&request).unwrap(), json);
+        assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+    }
+}
+
 #[tokio::test]
 async fn a_job_finishing_while_idle_starts_a_turn_and_keeps_the_hub_busy() {
     let dir = tempfile::tempdir().unwrap();
@@ -438,4 +465,221 @@ async fn ask_waits_for_a_client_and_the_first_answer_wins() {
     });
     let result = result.expect("the answer reached the model");
     assert!(result.contains("title: \"Fix rail counts\"") && result.contains("draft: false"), "{result}");
+}
+
+/// Holds each model response until the test explicitly releases the active turn.
+struct GatedProvider {
+    scripted: Arc<ScriptedProvider>,
+    permits: Semaphore,
+}
+
+impl Provider for GatedProvider {
+    fn model(&self) -> &str {
+        self.scripted.model()
+    }
+
+    fn complete<'a>(&'a self, req: llm::Request<'a>, on_delta: llm::DeltaSink<'a>) -> llm::BoxFuture<'a, anyhow::Result<llm::Completion>> {
+        Box::pin(async move {
+            self.permits.acquire().await.unwrap().forget();
+            self.scripted.complete(req, on_delta).await
+        })
+    }
+}
+
+async fn queue_notice(rx: &mut UnboundedReceiver<Notice>, id: &str) -> Vec<QueuedTurn> {
+    let notice = next_non_list(rx).await;
+    let Notice::Queue { session_id, queued } = notice else { panic!("expected Queue, got {notice:?}") };
+    assert_eq!(session_id, id);
+    queued
+}
+
+async fn assert_edit_reply(rx: &mut UnboundedReceiver<Notice>, id: &str, turn: u64, accepted: bool) {
+    let notice = next_non_list(rx).await;
+    let Notice::QueueEdited { session_id, turn_id, updated } = notice else { panic!("expected QueueEdited, got {notice:?}") };
+    assert_eq!((session_id.as_str(), turn_id, updated), (id, turn, accepted));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clients_share_queue_edits_and_pending_turns_drain_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripted = Arc::new(ScriptedProvider::new((0..3).map(|_| Message::assistant("ok", vec![]))));
+    let provider = Arc::new(GatedProvider { scripted: scripted.clone(), permits: Semaphore::new(0) });
+    let hub = hub(provider.clone(), dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0)));
+    let (a, mut a_rx) = hub.connect();
+    assert!(matches!(next(&mut a_rx).await, Notice::Hello { .. }));
+    a.send(Request::WatchQueue).unwrap();
+    a.send(Request::New { cwd: None }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut a_rx).await else { panic!("opened") };
+    assert!(snapshot.queued.is_empty());
+    let id = snapshot.session_id;
+    let (legacy, mut legacy_rx) = hub.connect();
+    legacy.send(Request::Open { session_id: id.clone() }).unwrap();
+    assert!(matches!(next_non_list(&mut legacy_rx).await, Notice::Opened { .. }));
+
+    let send = |text: &str, effort: Effort, model: Option<&str>, diagrams: bool| Request::Send {
+        session_id: id.clone(),
+        text: text.into(),
+        effort,
+        model: model.map(str::to_owned),
+        diagrams,
+    };
+    a.send(send("active", Effort::High, None, false)).unwrap();
+    let first = queue_notice(&mut a_rx, &id).await;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].text, "active");
+    assert!(queue_notice(&mut a_rx, &id).await.is_empty());
+    assert!(matches!(next_non_list(&mut a_rx).await, Notice::Event { event: AgentEvent::TurnStarted { .. }, .. }));
+
+    a.send(send("draft", Effort::Low, Some("pro"), true)).unwrap();
+    let second = queue_notice(&mut a_rx, &id).await;
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].text, "draft");
+    a.send(send("last", Effort::Off, None, false)).unwrap();
+    let mut pending = queue_notice(&mut a_rx, &id).await;
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0], second[0]);
+    assert_eq!(pending[1].text, "last");
+    assert!(first[0].id < pending[0].id && pending[0].id < pending[1].id);
+
+    let (b, mut b_rx) = hub.connect();
+    assert!(matches!(next(&mut b_rx).await, Notice::Hello { .. }));
+    b.send(Request::Open { session_id: id.clone() }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut b_rx).await else { panic!("opened") };
+    assert!(snapshot.running);
+    assert_eq!(snapshot.queued, pending);
+    b.send(Request::WatchQueue).unwrap();
+    assert_eq!(queue_notice(&mut b_rx, &id).await, pending, "late opt-in refreshes the queue");
+
+    let edit = |turn_id, text: &str| Request::EditQueued { session_id: id.clone(), turn_id, text: text.into() };
+    let edited_id = pending[0].id;
+    b.send(edit(edited_id, " \n\t")).unwrap();
+    assert_edit_reply(&mut b_rx, &id, edited_id, false).await;
+    b.send(Request::Close { session_id: id.clone() }).unwrap();
+    b.send(edit(edited_id, "not subscribed")).unwrap();
+    assert_edit_reply(&mut b_rx, &id, edited_id, false).await;
+    b.send(Request::Open { session_id: id.clone() }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut b_rx).await else { panic!("reopened") };
+    assert_eq!(snapshot.queued, pending);
+
+    pending[0].text = "edited".into();
+    for _ in 0..2 {
+        // An identical replacement is accepted too. Only B gets the reply, both get the queue.
+        b.send(edit(edited_id, "edited")).unwrap();
+        assert_edit_reply(&mut b_rx, &id, edited_id, true).await;
+        assert_eq!(queue_notice(&mut a_rx, &id).await, pending);
+        assert_eq!(queue_notice(&mut b_rx, &id).await, pending);
+    }
+
+    a.send(Request::Restart).unwrap();
+    assert!(matches!(next_non_list(&mut a_rx).await, Notice::Restarting));
+    assert!(matches!(next_non_list(&mut b_rx).await, Notice::Restarting));
+    assert!(hub.busy());
+    provider.permits.add_permits(1);
+    turn_events(&mut a_rx).await;
+    turn_events(&mut b_rx).await;
+    assert_eq!(queue_notice(&mut a_rx, &id).await, &pending[1..]);
+    assert_eq!(queue_notice(&mut b_rx, &id).await, &pending[1..]);
+    for rx in [&mut a_rx, &mut b_rx] {
+        assert!(matches!(next_non_list(rx).await, Notice::Event { event: AgentEvent::TurnStarted { text }, .. } if text == "edited"));
+    }
+    b.send(edit(edited_id, "too late")).unwrap();
+    assert_edit_reply(&mut b_rx, &id, edited_id, false).await;
+    assert!(hub.busy());
+
+    provider.permits.add_permits(1);
+    turn_events(&mut a_rx).await;
+    turn_events(&mut b_rx).await;
+    assert!(queue_notice(&mut a_rx, &id).await.is_empty());
+    assert!(queue_notice(&mut b_rx, &id).await.is_empty());
+    provider.permits.add_permits(1);
+    let last = turn_events(&mut a_rx).await;
+    assert!(matches!(last.first(), Some(AgentEvent::TurnStarted { text }) if text == "last"));
+    // `TurnEnd` is published just before the slot is marked idle. Wait for that report.
+    loop {
+        if let Notice::Sessions { running, .. } = next(&mut a_rx).await
+            && !running.contains(&id)
+        {
+            break;
+        }
+    }
+    assert!(!hub.busy());
+
+    let mut starts = Vec::new();
+    loop {
+        match next_non_list(&mut legacy_rx).await {
+            Notice::Event { event: AgentEvent::TurnStarted { text }, .. } => starts.push(text),
+            Notice::Event { event: AgentEvent::TurnEnd { .. }, .. } if starts.len() == 3 => break,
+            Notice::Event { .. } | Notice::Restarting => {}
+            notice => panic!("legacy client received {notice:?}"),
+        }
+    }
+    assert_eq!(starts, ["active", "edited", "last"]);
+    assert_eq!(scripted.efforts(), [Effort::High, Effort::Low, Effort::Off]);
+    assert_eq!(scripted.models(), [None, Some("pro".into()), Some("pro".into())]);
+    let diagrams = rdsh::prompt::diagrams_note(&[], true).unwrap();
+    assert!(scripted.requests()[1].contains(&Message::Directive { content: diagrams }));
+}
+
+#[tokio::test]
+async fn queued_turn_ids_increase_across_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([Message::assistant("ok", vec![]), Message::assistant("ok", vec![])]));
+    let hub = hub(provider, dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0)));
+    let (tx, mut rx) = hub.connect();
+    tx.send(Request::WatchQueue).unwrap();
+
+    let mut ids = Vec::new();
+    for session_id in ["s1", "s2"] {
+        tx.send(Request::New { cwd: None }).unwrap();
+        let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!("opened") };
+        assert_eq!(snapshot.session_id, session_id);
+        tx.send(Request::Send { session_id: session_id.into(), text: "hi".into(), effort: Effort::High, model: None, diagrams: false }).unwrap();
+        let queued = queue_notice(&mut rx, session_id).await;
+        assert_eq!(queued.len(), 1);
+        ids.push(queued[0].id);
+        turn_events(&mut rx).await;
+    }
+    assert!(ids[0] < ids[1]);
+}
+
+#[tokio::test]
+async fn a_draining_hub_refuses_new_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new([Message::assistant("never", vec![])]));
+    let hub = hub(provider.clone(), dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0)));
+    let (tx, mut rx) = hub.connect();
+    tx.send(Request::New { cwd: None }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
+    tx.send(Request::Restart).unwrap();
+    assert!(matches!(next_non_list(&mut rx).await, Notice::Restarting));
+    let send = Request::Send { session_id: snapshot.session_id, text: "more".into(), effort: Effort::High, model: None, diagrams: false };
+    tx.send(send).unwrap();
+    let Notice::Error { message, .. } = next_non_list(&mut rx).await else { panic!() };
+    assert!(message.contains("restarting"), "{message}");
+    assert!(!hub.busy(), "nothing started, so the hub can exit");
+    assert!(provider.requests().is_empty());
+}
+
+#[tokio::test]
+async fn running_the_queue_now_merges_it_and_interrupts_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let slow = Message::assistant("slow", vec![]);
+    let provider = Arc::new(ScriptedProvider::new([slow, Message::assistant("merged", vec![])]).with_delay(Duration::from_millis(300)));
+    let hub = hub(provider.clone(), dir.path().to_path_buf(), Arc::new(AtomicUsize::new(0)));
+    let (tx, mut rx) = hub.connect();
+    tx.send(Request::New { cwd: None }).unwrap();
+    let Notice::Opened { snapshot } = next_non_list(&mut rx).await else { panic!() };
+    let id = snapshot.session_id;
+    let send = |text: &str| Request::Send { session_id: id.clone(), text: text.into(), effort: Effort::High, model: None, diagrams: false };
+    tx.send(send("first")).unwrap();
+    let Notice::Event { event: AgentEvent::TurnStarted { .. }, .. } = next_non_list(&mut rx).await else { panic!() };
+    tx.send(send("second")).unwrap();
+    tx.send(send("third")).unwrap();
+    tx.send(Request::RunQueuedNow { session_id: id.clone() }).unwrap();
+    // The first turn ends interrupted, then one turn carries both waiting messages.
+    let evs = turn_events(&mut rx).await;
+    assert!(matches!(evs.last(), Some(AgentEvent::TurnEnd { cancelled: true, .. })), "{evs:?}");
+    let evs = turn_events(&mut rx).await;
+    assert!(matches!(&evs[0], AgentEvent::TurnStarted { text } if text == "second\n\nthird"), "{evs:?}");
+    assert!(matches!(evs.last(), Some(AgentEvent::TurnEnd { cancelled: false, .. })), "{evs:?}");
 }

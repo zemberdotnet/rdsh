@@ -4,17 +4,25 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, Mous
 use ratatui::{Terminal, backend::TestBackend};
 use tokio::sync::mpsc;
 
-use super::app::{App, Host, Mode, View};
+use super::app::{App, Host, HostEvent, Mode, View};
 use crate::{
     agent::AgentEvent,
-    hub::{Notice, Request, Snapshot},
+    hub::{Notice, QueuedTurn, Request, Snapshot},
     llm::{Effort, Usage},
     llm::{Message, ToolCall},
     tools::ToolOutput,
 };
 
 fn snapshot(id: &str) -> Snapshot {
-    Snapshot { session_id: id.into(), model: "test-model".into(), cwd: String::new(), history: Vec::new(), turn: Vec::new(), running: false, usage: Usage::default() }
+    Snapshot { session_id: id.into(), model: "test-model".into(), cwd: String::new(), history: Vec::new(), turn: Vec::new(), running: false, usage: Usage::default(), queued: Vec::new() }
+}
+
+fn queued(turns: &[(u64, &str)]) -> Vec<QueuedTurn> {
+    turns.iter().map(|&(id, text)| QueuedTurn { id, text: text.into() }).collect()
+}
+
+fn hello() -> Notice {
+    Notice::Hello { version: env!("CARGO_PKG_VERSION").into() }
 }
 
 struct Harness {
@@ -42,9 +50,11 @@ impl Harness {
         git(&["add", "."]);
         git(&["commit", "-qm", "init"]);
         std::fs::write(root.join("src/lib.rs"), "fn a() {}\nfn b2() {}\nfn c() {}\nfn d() {}\n").unwrap();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let mut app = App::new(root.to_path_buf(), vec![Host::new("local", true, None, tx)]);
         app.expect_open(0);
+        app.on_notice(0, hello());
+        assert_eq!(rx.try_recv().unwrap(), Request::WatchQueue);
         app.on_notice(0, Notice::Opened { snapshot: snapshot("s1") });
         let term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut h = Self { app, term, rx, _dir: dir };
@@ -104,6 +114,14 @@ impl Harness {
         self.draw();
     }
 
+    fn queue(&mut self, session_id: &str, turns: &[(u64, &str)]) {
+        self.notice(Notice::Queue { session_id: session_id.into(), queued: queued(turns) });
+    }
+
+    fn edit_ack(&mut self, session_id: &str, turn_id: u64, updated: bool) {
+        self.notice(Notice::QueueEdited { session_id: session_id.into(), turn_id, updated });
+    }
+
     /// Feeds the rail the sessions recorded in `dir`, as the hub would.
     fn sessions(&mut self, dir: &std::path::Path, running: &[&str]) {
         let recorded = crate::trace::list_sessions(dir);
@@ -120,6 +138,7 @@ impl Harness {
             content: "I changed src/lib.rs:2 and renamed b to b2.\nSecond line here.".into(),
             reasoning: None,
             tool_calls: vec![ToolCall { id: "c1".into(), name: "bash".into(), arguments: r#"{"command":"cargo test"}"#.into() }],
+            replay: vec![],
         };
         self.agent(AgentEvent::Assistant { message: msg, usage: None });
         self.agent(AgentEvent::ToolStart {
@@ -281,15 +300,22 @@ fn messages_typed_during_a_turn_wait_for_it() {
     h.keys("first");
     h.key(KeyCode::Enter);
     h.sent();
-    // The hub queues turns, so the second message goes out right away and waits there.
+    // The message goes out right away, but the server alone reports what is pending.
     h.keys("second");
     h.key(KeyCode::Enter);
-    assert!(h.screen().contains("message waiting"));
+    assert!(!h.screen().contains("1 queued"));
+    assert!(matches!(h.request(), Request::Send { text, .. } if text == "second"));
+    h.queue("s1", &[(7, "second"), (8, "from another client")]);
+    let screen = h.screen();
+    assert!(screen.contains("2 queued · ↑ recall · Ctrl-Enter sends now"), "{screen}");
     h.agent(AgentEvent::TurnEnd { cancelled: false, error: None });
-    assert!(h.screen().contains("message waiting"), "still waiting until the hub starts it");
-    assert_eq!(h.sent(), "second");
-    assert!(!h.screen().contains("message waiting"));
+    assert!(h.screen().contains("2 queued"), "still pending until a Queue notice");
+    h.queue("s1", &[(8, "from another client")]);
+    h.agent(AgentEvent::TurnStarted { text: "second".into() });
+    assert!(h.screen().contains("1 queued"), "the running turn is not counted");
     assert!(h.screen().contains("› second"));
+    h.queue("s1", &[]);
+    assert!(!h.screen().contains("1 queued"));
 }
 
 #[test]
@@ -299,11 +325,11 @@ fn ctrl_enter_during_a_turn_interrupts_it_for_the_new_message() {
     h.keys("first");
     h.key(KeyCode::Enter);
     h.sent();
-    // Ctrl-Enter sends the prompt, then interrupts the running turn so it starts at once.
+    // Ctrl-Enter sends the prompt, then merges the queue and interrupts the running turn so it starts at once.
     h.keys("second");
     h.app.on_event(ctrl_enter());
     assert!(matches!(h.rx.try_recv(), Ok(Request::Send { text, .. }) if text == "second"));
-    assert!(matches!(h.rx.try_recv(), Ok(Request::Cancel { session_id }) if session_id == "s1"));
+    assert!(matches!(h.rx.try_recv(), Ok(Request::RunQueuedNow { session_id }) if session_id == "s1"));
     h.agent(AgentEvent::TurnEnd { cancelled: true, error: None });
     h.agent(AgentEvent::TurnStarted { text: "second".into() });
     // A message sent with Enter waits; Ctrl-Enter with an empty prompt (or :now) hurries it.
@@ -311,15 +337,166 @@ fn ctrl_enter_during_a_turn_interrupts_it_for_the_new_message() {
     h.key(KeyCode::Enter);
     assert!(matches!(h.rx.try_recv(), Ok(Request::Send { text, .. }) if text == "third"));
     assert!(h.rx.try_recv().is_err());
+    h.queue("s1", &[(3, "third")]);
     h.key(KeyCode::Esc);
     h.keys(":now");
     h.key(KeyCode::Enter);
-    assert!(matches!(h.rx.try_recv(), Ok(Request::Cancel { .. })));
+    assert!(matches!(h.rx.try_recv(), Ok(Request::RunQueuedNow { .. })));
     h.agent(AgentEvent::TurnEnd { cancelled: true, error: None });
+    h.queue("s1", &[]);
     h.agent(AgentEvent::TurnStarted { text: "third".into() });
     // Nothing typed or waiting: nothing is sent or interrupted.
     h.app.on_event(ctrl_enter());
     assert!(h.rx.try_recv().is_err());
+}
+
+#[test]
+fn up_recalls_queued_turns_before_history_without_overwriting_drafts() {
+    let mut h = Harness::new();
+    let mut snap = snapshot("s1");
+    snap.history.push(Message::user("history"));
+    snap.queued = queued(&[(1, "oldest"), (2, "middle"), (3, "latest\nsecond line")]);
+    h.notice(Notice::Opened { snapshot: snap });
+    h.keys("independent draft");
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "independent draft");
+    h.ctrl('u');
+
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "latest\nsecond line");
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.cursor, "latest".len(), "within a multiline recall, Up moves the cursor first");
+    h.key(KeyCode::Down);
+    assert_eq!(h.app.cur.prompt.cursor, "latest\nsecond".len());
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "middle");
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "oldest");
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "oldest");
+    h.key(KeyCode::Down);
+    assert_eq!(h.app.cur.prompt.text, "middle");
+    h.key(KeyCode::Down);
+    assert_eq!(h.app.cur.prompt.text, "latest\nsecond line");
+    h.key(KeyCode::Down);
+    assert!(h.app.cur.prompt.text.is_empty());
+    h.queue("s1", &[]);
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "history");
+    assert!(h.rx.try_recv().is_err());
+}
+
+#[test]
+fn a_queued_edit_submits_the_same_id_not_an_ask_answer_or_review_comments() {
+    let mut h = Harness::new();
+    h.keys("first");
+    h.key(KeyCode::Enter);
+    h.sent();
+    h.agent(AgentEvent::TextDelta("reviewable reply".into()));
+    h.key(KeyCode::Esc);
+    h.keys("gg}c");
+    assert_eq!(h.app.mode, Mode::Comment, "{}", h.screen());
+    h.keys("review this later");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.cur.queue.len(), 1);
+    h.queue("s1", &[(9, "older"), (10, "pending")]);
+    h.keys("i");
+    h.key(KeyCode::Up);
+    assert!(h.screen().contains("Editing queued turn · Enter save · Esc discard"));
+    h.keys(" edited");
+    h.key(KeyCode::Up);
+    h.key(KeyCode::Down);
+    assert_eq!(h.app.cur.prompt.text, "pending edited", "arrows do not abandon a changed recall");
+    h.agent(AgentEvent::Question { call_id: "ask1".into(), ask: crate::tools::ask::Ask { title: None, forms: vec![] } });
+    h.key(KeyCode::Enter);
+    assert_eq!(h.request(), Request::EditQueued { session_id: "s1".into(), turn_id: 10, text: "pending edited".into() });
+    assert_eq!(h.app.cur.prompt.text, "pending edited");
+    assert!(h.screen().contains("Saving edit"));
+    h.key(KeyCode::Enter);
+    assert!(h.rx.try_recv().is_err(), "do not submit again until ack");
+    h.edit_ack("s1", 9, true);
+    assert_eq!(h.app.cur.prompt.text, "pending edited", "ignore an ack for another turn");
+    h.edit_ack("s1", 10, true);
+    assert!(h.app.cur.prompt.text.is_empty());
+    assert_eq!(h.app.cur.question.as_deref(), Some("ask1"));
+    assert_eq!(h.app.cur.queue[0].body, "review this later");
+    h.queue("s1", &[(9, "older"), (10, "pending edited")]);
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "pending edited");
+}
+
+#[test]
+fn escape_discards_a_queued_edit_without_sending_it() {
+    let mut h = Harness::new();
+    h.queue("s1", &[(30, "original")]);
+    h.key(KeyCode::Up);
+    h.keys(" changed");
+    h.key(KeyCode::Esc);
+    assert_eq!(h.app.mode, Mode::Normal);
+    assert!(h.app.cur.prompt.text.is_empty());
+    assert!(h.rx.try_recv().is_err());
+    h.keys("i");
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "original");
+}
+
+#[test]
+fn queued_edit_ack_success_keeps_new_typing_and_failure_keeps_an_unsent_draft() {
+    let mut h = Harness::new();
+    h.queue("s1", &[(12, "original")]);
+    h.key(KeyCode::Up);
+    h.keys(" changed");
+    h.key(KeyCode::Enter);
+    assert!(matches!(h.request(), Request::EditQueued { turn_id: 12, .. }));
+    h.key(KeyCode::Esc);
+    assert_eq!(h.app.cur.prompt.text, "original changed", "Esc cannot retract a pending edit");
+    h.keys("i again");
+    h.edit_ack("s1", 12, true);
+    assert_eq!(h.app.cur.prompt.text, "original changed again");
+    h.queue("s1", &[]);
+    h.key(KeyCode::Enter);
+    assert_eq!(h.sent(), "original changed again");
+
+    h.queue("s1", &[(13, "next")]);
+    h.key(KeyCode::Up);
+    h.keys(" changed");
+    // A queue update can arrive before Enter. It must not turn the edit into a Send.
+    h.queue("s1", &[]);
+    h.key(KeyCode::Enter);
+    assert_eq!(h.request(), Request::EditQueued { session_id: "s1".into(), turn_id: 13, text: "next changed".into() });
+    h.edit_ack("s1", 13, false);
+    assert_eq!(h.app.cur.prompt.text, "next changed");
+    assert!(h.screen().contains("already started — edit kept as an unsent draft"));
+    assert!(h.rx.try_recv().is_err(), "do not resend automatically");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.sent(), "next changed");
+}
+
+#[test]
+fn ctrl_enter_saves_a_queued_edit_before_interrupting_the_running_turn() {
+    let mut h = Harness::new();
+    h.agent(AgentEvent::TurnStarted { text: "running".into() });
+    h.queue("s1", &[(4, "pending")]);
+    h.key(KeyCode::Up);
+    h.keys(" edited");
+    h.app.on_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)));
+    assert_eq!(h.request(), Request::EditQueued { session_id: "s1".into(), turn_id: 4, text: "pending edited".into() });
+    assert!(h.rx.try_recv().is_err(), "wait for the edit to land before interrupting");
+    h.edit_ack("s1", 4, true);
+    assert_eq!(h.request(), Request::RunQueuedNow { session_id: "s1".into() });
+    assert!(h.app.cur.prompt.text.is_empty());
+
+    h.queue("s1", &[(4, "pending edited"), (5, "following")]);
+    h.key(KeyCode::Up);
+    h.keys(" edited");
+    h.app.on_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)));
+    assert!(matches!(h.request(), Request::EditQueued { turn_id: 5, .. }));
+    h.agent(AgentEvent::TurnEnd { cancelled: true, error: None });
+    h.queue("s1", &[(5, "following")]);
+    h.agent(AgentEvent::TurnStarted { text: "pending edited".into() });
+    h.edit_ack("s1", 5, true);
+    assert!(h.rx.try_recv().is_err(), "do not interrupt a different running turn after the ack");
 }
 
 #[test]
@@ -1133,4 +1310,166 @@ fn shift_tab_in_a_file_diffs_against_the_default_branch() {
     h.key(KeyCode::BackTab);
     assert!(h.screen().contains("src/lib.rs — no changes"), "{}", h.screen());
     assert_eq!(h.app.effort, effort);
+}
+
+#[test]
+fn queue_edits_and_notices_follow_the_session_through_switches_and_refreshes() {
+    let mut h = harness_with_session();
+    h.queue("s1", &[(21, "s1 pending")]);
+    h.key(KeyCode::Up);
+    h.keys(" edited");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.request(), Request::EditQueued { session_id: "s1".into(), turn_id: 21, text: "s1 pending edited".into() });
+    h.key(KeyCode::Esc);
+    h.app.expect_open(0);
+    h.notice(Notice::Opened { snapshot: snapshot("s0") });
+    h.queue("s0", &[(21, "s0 pending")]);
+    h.keys("i");
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "s0 pending");
+    h.keys(" draft");
+    let mut refreshed = snapshot("s1");
+    refreshed.queued = queued(&[(21, "s1 pending")]);
+    h.notice(Notice::Opened { snapshot: refreshed });
+    assert_eq!(h.app.others.iter().find(|v| v.session_id == "s1").unwrap().prompt.text, "s1 pending edited");
+    h.edit_ack("s1", 21, true);
+    h.queue("s1", &[(21, "s1 pending edited"), (22, "s1 latest")]);
+    assert_eq!(h.app.cur.prompt.text, "s0 pending draft", "background ack must not touch the current edit");
+    assert!(h.screen().contains("1 queued"));
+    h.key(KeyCode::Esc);
+    h.ctrl('w');
+    h.keys("hg");
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.cur.session_id, "s1");
+    assert!(h.app.cur.prompt.text.is_empty(), "the ack cleared s1's draft off screen");
+    assert!(h.screen().contains("2 queued"));
+    h.keys("i");
+    h.key(KeyCode::Up);
+    assert_eq!(h.app.cur.prompt.text, "s1 latest");
+}
+
+#[test]
+fn a_reconnected_hub_gets_queue_opt_in_before_open_and_keeps_drafts_not_edit_ids() {
+    let mut h = Harness::new();
+    let id = h.app.cur.session_id.clone();
+    h.queue("s1", &[(1, "old")]);
+    h.key(KeyCode::Up);
+    h.keys(" draft");
+    h.key(KeyCode::Enter);
+    assert!(matches!(h.request(), Request::EditQueued { turn_id: 1, .. }));
+    h.app.on_host_event(0, HostEvent::Closed);
+    assert!(!h.app.hosts[0].connected);
+    assert!(h.app.flash.as_deref().is_some_and(|f| f.contains("lost the connection")));
+    assert!(h.app.cur.queued.is_empty());
+    assert!(h.app.cur.queue_edit.is_none());
+    h.key(KeyCode::Enter);
+    assert_eq!(h.app.cur.prompt.text, "old draft", "submitting while disconnected preserves the draft");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    h.app.on_host_event(0, HostEvent::Linked(tx));
+    assert!(h.app.hosts[0].connected);
+    assert!(rx.try_recv().is_err());
+    h.notice(hello());
+    let sent: Vec<Request> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(sent, vec![Request::WatchQueue, Request::List, Request::Open { session_id: id.clone() }]);
+    assert_eq!(h.app.flash.as_deref(), Some("reconnected to local"));
+    let mut fresh = snapshot(&id);
+    fresh.queued = queued(&[(1, "new turn with a reused id")]);
+    h.notice(Notice::Opened { snapshot: fresh });
+    assert_eq!(h.app.cur.session_id, id);
+    assert_eq!(h.app.cur.prompt.text, "old draft");
+    h.key(KeyCode::Enter);
+    assert!(matches!(rx.try_recv(), Ok(Request::Send { text, .. }) if text == "old draft"));
+}
+
+#[test]
+fn waiting_messages_are_listed_above_the_prompt() {
+    let mut h = Harness::new();
+    h.keys("first");
+    h.key(KeyCode::Enter);
+    h.sent();
+    h.queue("s1", &[(2, "second message"), (3, "third\nwith two lines")]);
+    let screen = h.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let prompt = lines.iter().rposition(|l| l.starts_with('›')).unwrap_or_else(|| panic!("{screen}"));
+    assert!(lines[prompt - 3].contains("○ 1. second message"), "{screen}");
+    assert!(lines[prompt - 2].contains("○ 2. third …"), "{screen}");
+    assert!(lines[prompt - 1].contains("2 queued"), "the separator sits between list and prompt:\n{screen}");
+    // Recalling one for editing marks it.
+    h.key(KeyCode::Up);
+    assert!(h.screen().contains("✎ 2. third"), "{}", h.screen());
+    // Six waiting: four rows, the last counting the rest.
+    h.queue("s1", &[(2, "a"), (3, "b"), (4, "c"), (5, "d"), (6, "e"), (7, "f")]);
+    let screen = h.screen();
+    assert!(screen.contains("○ 3. c") && !screen.contains("○ 4. d"), "{screen}");
+    assert!(screen.contains("+3 more waiting"), "{screen}");
+    // Once the queue drains, the list goes away.
+    h.queue("s1", &[]);
+    assert!(!h.screen().contains("○ 1."), "{}", h.screen());
+}
+
+#[test]
+fn tab_completes_paths_on_the_sessions_host_and_cycles_matches() {
+    let mut h = Harness::new();
+    let completions = |h: &mut Harness| loop {
+        match h.rx.try_recv() {
+            Ok(Request::CompletePath { request_id, prefix, .. }) => break (request_id, prefix),
+            Ok(_) => continue,
+            Err(e) => panic!("no completion request: {e}"),
+        }
+    };
+    h.keys("look at src/m");
+    h.key(KeyCode::Tab);
+    let (id, prefix) = completions(&mut h);
+    assert_eq!(prefix, "src/m");
+    h.notice(Notice::PathCompletions { request_id: id, paths: vec!["src/main.rs".into()] });
+    assert_eq!(h.app.cur.prompt.text, "look at src/main.rs");
+
+    // Several matches: the shared part goes in, then Tab cycles through them.
+    h.keys(" and (sr");
+    h.key(KeyCode::Tab);
+    let (id, prefix) = completions(&mut h);
+    assert_eq!(prefix, "sr", "the path starts after the parenthesis");
+    h.notice(Notice::PathCompletions { request_id: id, paths: vec!["src/tui/app.rs".into(), "src/tui/mod.rs".into()] });
+    assert_eq!(h.app.cur.prompt.text, "look at src/main.rs and (src/tui/");
+    assert!(h.app.flash.as_deref().is_some_and(|f| f.starts_with("2 matches")), "{:?}", h.app.flash);
+    h.key(KeyCode::Tab);
+    assert_eq!(h.app.cur.prompt.text, "look at src/main.rs and (src/tui/app.rs");
+    h.key(KeyCode::Tab);
+    assert_eq!(h.app.cur.prompt.text, "look at src/main.rs and (src/tui/mod.rs");
+    assert!(h.rx.try_recv().is_err(), "cycling asks the hub nothing");
+
+    // An answer that arrives after more typing changes nothing.
+    h.keys(" x/");
+    h.key(KeyCode::Tab);
+    let (id, _) = completions(&mut h);
+    h.keys("y");
+    h.notice(Notice::PathCompletions { request_id: id, paths: vec!["x/zzz".into()] });
+    assert!(h.app.cur.prompt.text.ends_with(" x/y"), "{}", h.app.cur.prompt.text);
+}
+
+#[test]
+fn gx_opens_the_url_under_the_cursor_even_when_it_wraps() {
+    let mut h = Harness::new();
+    let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let sink = opened.clone();
+    h.app.open_url = Box::new(move |u| sink.borrow_mut().push(u.to_owned()));
+    let long = format!("https://example.com/{}", "segment/".repeat(12));
+    h.keys("start");
+    h.key(KeyCode::Enter);
+    h.sent();
+    h.agent(AgentEvent::TextDelta(format!("Docs: {long} and src/lib.rs")));
+    h.agent(AgentEvent::TurnEnd { cancelled: false, error: None });
+    h.key(KeyCode::Esc);
+    // On the answer's second row (inside the wrapped URL).
+    h.keys("gg}j");
+    h.keys("gx");
+    assert_eq!(opened.borrow().as_slice(), std::slice::from_ref(&long), "{:?}", h.app.flash);
+    // At the line start, off any link, gx falls back to the line's first URL.
+    h.keys("k0gx");
+    assert_eq!(opened.borrow().len(), 2);
+    // On the file link, it opens the file itself.
+    h.keys("/lib.rs");
+    h.key(KeyCode::Enter);
+    h.keys("gx");
+    assert!(opened.borrow()[2].ends_with("src/lib.rs"), "{:?}", opened.borrow());
 }

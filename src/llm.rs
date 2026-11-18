@@ -42,6 +42,10 @@ pub enum Message {
         reasoning: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        /// Provider output items sent back verbatim later in the same turn (OpenAI's encrypted
+        /// reasoning, which `store: false` requests cannot reference by id).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replay: Vec<Value>,
     },
     Tool {
         call_id: String,
@@ -56,7 +60,7 @@ impl Message {
     }
 
     pub fn assistant(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Message::Assistant { content: content.into(), reasoning: None, tool_calls }
+        Message::Assistant { content: content.into(), reasoning: None, tool_calls, replay: Vec::new() }
     }
 }
 
@@ -138,6 +142,8 @@ pub struct Request<'a> {
     pub effort: Effort,
     /// Model id for this request; `None` uses the provider's own.
     pub model: Option<&'a str>,
+    /// Stable id for the conversation (the session id), so providers can reuse cached prefixes.
+    pub cache_key: Option<&'a str>,
 }
 
 pub type DeltaSink<'a> = &'a (dyn Fn(Delta) + Send + Sync);
@@ -171,7 +177,7 @@ pub fn wire_messages(messages: &[Message]) -> Vec<Value> {
             Message::Context { content } | Message::Directive { content } => {
                 json!({"role": "user", "content": content})
             }
-            Message::Assistant { content, reasoning, tool_calls } => {
+            Message::Assistant { content, reasoning, tool_calls, .. } => {
                 let mut v = json!({"role": "assistant", "content": content});
                 if !tool_calls.is_empty() {
                     v["tool_calls"] = tool_calls
@@ -297,12 +303,13 @@ mod tests {
     fn wire_format_includes_tool_calls_and_recent_reasoning() {
         let msgs = vec![
             Message::System { content: "s".into() },
-            Message::Assistant { content: "old".into(), reasoning: Some("r0".into()), tool_calls: vec![] },
+            Message::Assistant { content: "old".into(), reasoning: Some("r0".into()), tool_calls: vec![], replay: vec![] },
             Message::user("u"),
             Message::Assistant {
                 content: String::new(),
                 reasoning: Some("r1".into()),
                 tool_calls: vec![ToolCall { id: "c1".into(), name: "bash".into(), arguments: "{}".into() }],
+                replay: vec![],
             },
             Message::Tool { call_id: "c1".into(), name: "bash".into(), content: "ok".into() },
         ];

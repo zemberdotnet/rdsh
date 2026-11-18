@@ -29,10 +29,10 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::{
-    hub::{Notice, Request},
+    hub::{Notice, Request, net},
     llm::Effort,
 };
-use app::{App, Host};
+use app::{App, Host, HostEvent, forward};
 
 /// One hub connection for the TUI.
 pub struct HostLink {
@@ -43,6 +43,8 @@ pub struct HostLink {
     pub dir: Option<PathBuf>,
     pub req_tx: UnboundedSender<Request>,
     pub notices: UnboundedReceiver<Notice>,
+    /// How to reconnect when the hub goes away; `None` for an in-process hub.
+    pub relink: Option<net::Relink>,
 }
 
 /// Runs the TUI until the user quits.
@@ -63,8 +65,8 @@ pub async fn run(
     ssh_program: String,
     remote_command: Vec<String>,
 ) -> Result<()> {
-    // One stream for all hosts; `None` marks a host whose connection ended.
-    let (merged_tx, mut notices) = mpsc::unbounded_channel::<(usize, Option<Notice>)>();
+    // One stream for all hosts: their notices, closed connections and reconnects.
+    let (merged_tx, mut notices) = mpsc::unbounded_channel::<(usize, HostEvent)>();
     let mut hosts = Vec::new();
     for (i, link) in links.into_iter().enumerate() {
         // A closed hub surfaces when its notices end (below) and as a flash on later requests.
@@ -72,17 +74,10 @@ pub async fn run(
         if i == 0 {
             let _ = link.req_tx.send(first.clone());
         }
-        let tx = merged_tx.clone();
-        let mut rx = link.notices;
-        tokio::spawn(async move {
-            while let Some(n) = rx.recv().await {
-                if tx.send((i, Some(n))).is_err() {
-                    return;
-                }
-            }
-            let _ = tx.send((i, None));
-        });
-        hosts.push(Host::new(link.name, link.local, link.dir, link.req_tx));
+        forward(i, link.notices, merged_tx.clone());
+        let mut host = Host::new(link.name, link.local, link.dir, link.req_tx);
+        host.relink = link.relink;
+        hosts.push(host);
     }
     let mut app = App::new(cwd, hosts);
     app.effort = effort;
@@ -126,7 +121,7 @@ pub async fn run(
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    notices: &mut UnboundedReceiver<(usize, Option<Notice>)>,
+    notices: &mut UnboundedReceiver<(usize, HostEvent)>,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -169,11 +164,8 @@ async fn event_loop(
         }
     }
 }
-fn deliver(app: &mut App, host: usize, n: Option<Notice>) {
-    match n {
-        Some(n) => app.on_notice(host, n),
-        None => app.on_disconnect(host),
-    }
+fn deliver(app: &mut App, host: usize, ev: HostEvent) {
+    app.on_host_event(host, ev);
 }
 
 #[cfg(test)]

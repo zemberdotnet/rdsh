@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod auth;
+pub mod chatgpt;
 pub mod comments;
 pub mod config;
 pub mod decision;
@@ -12,7 +13,9 @@ pub mod hub;
 pub mod length;
 pub mod links;
 pub mod llm;
+pub mod openai;
 pub mod prompt;
+pub mod providers;
 pub mod session;
 pub mod title;
 pub mod tools;

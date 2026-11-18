@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { markdown, segText, table, wrap } from "../src/layout.ts";
+import { layout, markdown, segText, table, wrap } from "../src/layout.ts";
+import { SessionView } from "../src/session.ts";
 
 const texts = (lines: { segs: [string, string][] }[]) => lines.map((l) => segText(l.segs));
 
@@ -19,15 +20,40 @@ test("markdown: headings, lists, code, inline styles", () => {
   assert.ok(para.some(([t, c]) => t === "bold" && c.includes("b")));
 });
 
-test("markdown: a closed d3 block reserves rows for a diagram; an open one shows as code", () => {
-  const closed = markdown("Look:\n```d3\n// rows: 6\n// title: deps\nsvg.append('g')\n```", 40, "e1");
+test("a streaming d3 block hides its source and animates until its fence closes", () => {
+  const v = new SessionView(0, "s1", "/p", "m");
+  const hooks = { subStarted() {}, subState() {} };
+  const src = "// rows: 6\n// title: deps\nsvg.append('g')";
+  v.apply({ type: "text_delta", data: `Look:\n\n\`\`\`d3\n${src}` }, hooks);
+  const first = layout(v.entries, 40, 0);
+  assert.deepEqual(texts(first), ["Look:", "", "◴ Generating diagram…"]);
+  assert.ok(!first.some((l) => l.dia));
+  assert.deepEqual(texts(layout(v.entries, 40, 1)), ["Look:", "", "◷ Generating diagram…"]);
+
+  v.apply({ type: "text_delta", data: "\n```\n\nDone." }, hooks);
+  assert.ok(v.entries[0].streaming);
+  const closed = layout(v.entries, 40, 2);
   const dia = closed.filter((l) => l.dia);
   assert.equal(dia.length, 6);
   assert.equal(dia[0].dia!.title, "deps");
-  assert.equal(dia[0].dia!.key, "e1#0");
-  const open = markdown("Look:\n```d3\nsvg.append('g')", 40, "e1");
-  assert.ok(!open.some((l) => l.dia));
-  assert.ok(texts(open).includes(" svg.append('g')"));
+  assert.equal(dia[0].dia!.key, `${v.entries[0].id}#0`);
+  assert.equal(dia[0].dia!.script, src);
+  assert.deepEqual(texts(closed).slice(-1), ["Done."]);
+  assert.ok(!texts(closed).some((text) => text.includes("Generating diagram")));
+});
+
+test("an interrupted diagram stops animating without showing its source", () => {
+  const v = new SessionView(0, "s1", "/p", "m");
+  const hooks = { subStarted() {}, subState() {} };
+  v.apply({ type: "text_delta", data: "```d3\nsvg.append('g')" }, hooks);
+  assert.deepEqual(texts(layout(v.entries, 40, 0)), ["◴ Generating diagram…"]);
+  v.apply({ type: "turn_end", data: { cancelled: true, error: null } }, hooks);
+  assert.deepEqual(texts(layout(v.entries, 40, 0)), ["Diagram incomplete", "", "interrupted"]);
+});
+
+test("ordinary code still shows as it streams", () => {
+  const open = markdown("```js\nconst value = 42;", 40, "e1", 0);
+  assert.deepEqual(texts(open), [" js ", " const value = 42;"]);
 });
 
 test("tables line up and shrink to fit", () => {

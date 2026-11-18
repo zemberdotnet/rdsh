@@ -1886,8 +1886,10 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "crossterm",
  "futures-util",
+ "getrandom 0.3.4",
  "globset",
  "ignore",
  "libc",
@@ -1896,6 +1898,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

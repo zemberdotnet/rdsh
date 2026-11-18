@@ -6,10 +6,11 @@
 //! while no client is looking at it.
 
 pub mod net;
+mod path_completion;
 pub mod proto;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -21,7 +22,7 @@ use anyhow::Result;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
-pub use proto::{Notice, Request, Snapshot};
+pub use proto::{Notice, QueuedTurn, Request, Snapshot};
 
 use crate::{
     agent::{Agent, AgentEvent, EventSink},
@@ -59,17 +60,33 @@ struct State {
     sessions: HashMap<String, Slot>,
     clients: Vec<Client>,
     next_client: u64,
+    next_turn: u64,
+}
+
+impl State {
+    /// Called under the state lock so updates cannot overtake each other or `Opened`.
+    fn broadcast_queue(&self, id: &str) {
+        let mut watchers = self.clients.iter().filter(|c| c.watch_queue && c.subscribed.contains(id)).peekable();
+        if watchers.peek().is_some() {
+            let notice = Notice::Queue { session_id: id.to_owned(), queued: self.sessions[id].queued() };
+            for c in watchers {
+                let _ = c.tx.send(notice.clone());
+            }
+        }
+    }
 }
 
 struct Client {
     id: u64,
     tx: UnboundedSender<Notice>,
     subscribed: HashSet<String>,
+    watch_queue: bool,
+    completing_path: bool,
 }
 
-/// A queued user turn.
+/// A queued user turn and its original settings.
 struct Turn {
-    text: String,
+    queued: QueuedTurn,
     effort: Effort,
     model: Option<String>,
     diagrams: bool,
@@ -77,10 +94,12 @@ struct Turn {
 
 /// Hub-side record of one running agent.
 struct Slot {
-    cmd_tx: UnboundedSender<Turn>,
+    pending: VecDeque<Turn>,
+    // Carries one wake per enqueued turn; the editable payload stays under the state lock.
+    wake_tx: UnboundedSender<()>,
     cancel: Option<CancellationToken>,
     model: String,
-    cwd: String,
+    cwd: PathBuf,
     /// History as of the start of the current turn (or the end of the last one).
     history: Vec<Message>,
     /// Events of the current turn, with consecutive text deltas merged.
@@ -103,12 +122,27 @@ impl Slot {
         Snapshot {
             session_id: session_id.to_owned(),
             model: self.model.clone(),
-            cwd: self.cwd.clone(),
+            cwd: self.cwd.display().to_string(),
             history: self.history.clone(),
             turn: self.turn.clone(),
             running: self.running,
             usage: self.usage,
+            queued: self.queued(),
         }
+    }
+
+    fn queued(&self) -> Vec<QueuedTurn> {
+        self.pending.iter().map(|t| t.queued.clone()).collect()
+    }
+
+    /// Records the agent's state at the start (`cancel` set) or end of a turn.
+    fn turn_boundary(&mut self, agent: &Agent, cancel: Option<CancellationToken>) {
+        self.history = agent.history().to_vec();
+        self.turn.clear();
+        self.running = cancel.is_some();
+        self.cancel = cancel;
+        self.usage = agent.usage;
+        self.model = agent.model().to_owned();
     }
 
     fn record(&mut self, ev: &AgentEvent) {
@@ -168,7 +202,7 @@ impl Hub {
             let mut st = self.state();
             st.next_client += 1;
             let id = st.next_client;
-            st.clients.push(Client { id, tx: ntx, subscribed: HashSet::new() });
+            st.clients.push(Client { id, tx: ntx, subscribed: HashSet::new(), watch_queue: false, completing_path: false });
             id
         };
         let hub = self.clone();
@@ -186,9 +220,9 @@ impl Hub {
         self.state().clients.len()
     }
 
-    /// Whether any session is mid-turn or has background jobs running.
+    /// Whether any session has active or pending turns or has background jobs running.
     pub fn busy(&self) -> bool {
-        self.state().sessions.values().any(|s| s.running || s.jobs.as_ref().is_some_and(|j| j.any_running()))
+        self.state().sessions.values().any(|s| s.running || !s.pending.is_empty() || s.jobs.as_ref().is_some_and(|j| j.any_running()))
     }
 
     /// Whether `Request::Restart` has been received.
@@ -238,29 +272,28 @@ impl Hub {
                 self.subscribe(client, &id);
             }
             Request::Send { session_id, text, effort, model, diagrams } => {
-                let hint = title_hint(&text);
-                let (sent, newly_input, open) = {
-                    let mut st = self.state();
-                    match st.sessions.get_mut(&session_id) {
-                        Some(s) => {
-                            let newly_input = !s.has_input;
-                            s.has_input = true;
-                            s.title_hint.get_or_insert(hint);
-                            (s.cmd_tx.send(Turn { text, effort, model, diagrams }).is_ok(), newly_input, true)
-                        }
-                        None => (false, false, false),
-                    }
-                };
-                match (sent, open) {
-                    (true, _) => {
-                        // The first message turns the session into a rail row right away.
-                        if newly_input {
-                            self.broadcast_sessions();
-                        }
-                    }
-                    (false, true) => self.error(client, Some(session_id), "the session's agent has stopped".into()),
-                    (false, false) => self.error(client, Some(session_id), "session is not open".into()),
+                match self.enqueue(&session_id, text, effort, model, diagrams) {
+                    // The first message turns the session into a rail row right away.
+                    Ok(true) => self.broadcast_sessions(),
+                    Ok(false) => {}
+                    Err(message) => self.error(client, Some(session_id), message.into()),
                 }
+            }
+            Request::WatchQueue => {
+                let mut st = self.state();
+                let State { clients, sessions, .. } = &mut *st;
+                if let Some(c) = clients.iter_mut().find(|c| c.id == client && !c.watch_queue) {
+                    c.watch_queue = true;
+                    // An older startup path may have subscribed before opting in.
+                    for id in &c.subscribed {
+                        if let Some(slot) = sessions.get(id) {
+                            let _ = c.tx.send(Notice::Queue { session_id: id.clone(), queued: slot.queued() });
+                        }
+                    }
+                }
+            }
+            Request::EditQueued { session_id, turn_id, text } => {
+                self.edit_queued(client, session_id, turn_id, text);
             }
             Request::Answer { session_id, question_id, answer } => {
                 let questions = self.state().sessions.get(&session_id).map(|s| s.questions.clone());
@@ -273,6 +306,7 @@ impl Hub {
                     c.cancel();
                 }
             }
+            Request::RunQueuedNow { session_id } => self.run_queued_now(&session_id),
             Request::Close { session_id } => {
                 if let Some(c) = self.state().clients.iter_mut().find(|c| c.id == client) {
                     c.subscribed.remove(&session_id);
@@ -286,6 +320,9 @@ impl Hub {
                 } else {
                     self.error(client, None, format!("no such file on this host: {}", full.display()));
                 }
+            }
+            Request::CompletePath { session_id, request_id, prefix } => {
+                self.complete_path(client, session_id, request_id, prefix);
             }
             Request::ChangedFiles { cwd } => {
                 let files = crate::diff::changed_files(std::path::Path::new(&cwd));
@@ -305,13 +342,103 @@ impl Hub {
             }
             Request::Restart => {
                 // Draining happens in the serve loop: it stops accepting new clients and exits
-                // once no session is busy. Tell the requesting client now.
+                // once no session is busy. Serialize the restart flag with enqueueing so
+                // every accepted turn is visible to the drain check.
+                let st = self.state();
                 self.inner.restart.store(true, Ordering::SeqCst);
                 let n = Notice::Restarting;
-                for c in self.state().clients.iter() {
+                for c in &st.clients {
                     let _ = c.tx.send(n.clone());
                 }
             }
+        }
+    }
+
+    fn complete_path(&self, client: u64, session_id: String, request_id: u64, prefix: String) {
+        let cwd = {
+            let mut st = self.state();
+            let State { clients, sessions, .. } = &mut *st;
+            let Some(c) = clients.iter_mut().find(|c| c.id == client) else { return };
+            // At most one filesystem job per client; don't queue stale Tab presses.
+            let Some(slot) = sessions.get(&session_id).filter(|_| !c.completing_path && c.subscribed.contains(&session_id)) else {
+                let _ = c.tx.send(Notice::PathCompletions { request_id, paths: Vec::new() });
+                return;
+            };
+            c.completing_path = true;
+            slot.cwd.clone()
+        };
+        let task = tokio::task::spawn_blocking(move || path_completion::complete(&cwd, &prefix));
+        let hub = self.clone();
+        tokio::spawn(async move {
+            let mut paths = task.await.unwrap_or_default();
+            if let Some(c) = hub.state().clients.iter_mut().find(|c| c.id == client) {
+                c.completing_path = false;
+                if !c.subscribed.contains(&session_id) {
+                    paths.clear();
+                }
+                let _ = c.tx.send(Notice::PathCompletions { request_id, paths });
+            }
+        });
+    }
+
+    fn enqueue(&self, id: &str, text: String, effort: Effort, model: Option<String>, diagrams: bool) -> Result<bool, &'static str> {
+        let mut st = self.state();
+        // New turns would keep a draining hub alive; clients reconnect to its successor.
+        if self.restart_requested() {
+            return Err("the hub is restarting; send again once it is back");
+        }
+        let State { sessions, next_turn, .. } = &mut *st;
+        let slot = sessions.get_mut(id).ok_or("session is not open")?;
+        let turn_id = next_turn.checked_add(1).expect("turn ids exhausted");
+        // The task takes the same lock before popping, so it sees the payload after this wake.
+        slot.wake_tx.send(()).map_err(|_| "the session's agent has stopped")?;
+        *next_turn = turn_id;
+        let newly_input = !slot.has_input;
+        slot.has_input = true;
+        slot.title_hint.get_or_insert_with(|| title_hint(&text));
+        slot.pending.push_back(Turn { queued: QueuedTurn { id: turn_id, text }, effort, model, diagrams });
+        st.broadcast_queue(id);
+        Ok(newly_input)
+    }
+
+    /// Folds the queue into its first turn (texts joined in order; the newest turn's settings
+    /// win) and interrupts the running turn, so the merged message starts next.
+    fn run_queued_now(&self, id: &str) {
+        let mut st = self.state();
+        let Some(slot) = st.sessions.get_mut(id) else { return };
+        if slot.pending.len() > 1 {
+            let mut rest = slot.pending.split_off(1);
+            let first = slot.pending.front_mut().expect("two or more pending");
+            for t in rest.drain(..) {
+                first.queued.text.push_str("\n\n");
+                first.queued.text.push_str(&t.queued.text);
+                first.effort = t.effort;
+                first.model = t.model.or(first.model.take());
+                first.diagrams |= t.diagrams;
+            }
+        }
+        if let Some(c) = &slot.cancel {
+            c.cancel();
+        }
+        st.broadcast_queue(id);
+    }
+
+    fn edit_queued(&self, client: u64, session_id: String, turn_id: u64, text: String) {
+        let mut st = self.state();
+        let State { clients, sessions, .. } = &mut *st;
+        let Some(c) = clients.iter().find(|c| c.id == client) else { return };
+        let updated = if c.subscribed.contains(&session_id)
+            && !text.trim().is_empty()
+            && let Some(turn) = sessions.get_mut(&session_id).and_then(|s| s.pending.iter_mut().find(|t| t.queued.id == turn_id))
+        {
+            turn.queued.text = text;
+            true
+        } else {
+            false
+        };
+        let _ = c.tx.send(Notice::QueueEdited { session_id: session_id.clone(), turn_id, updated });
+        if updated {
+            st.broadcast_queue(&session_id);
         }
     }
 
@@ -389,14 +516,19 @@ impl Hub {
         // Clients of the hub can answer forms, so the agent may ask.
         let questions = Arc::new(crate::tools::ask::Questions::default());
         agent.enable_questions(questions.clone());
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Turn>();
-        self.state().sessions.insert(
-            id.clone(),
-            Slot {
-                cmd_tx,
+        let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<()>();
+        {
+            let mut st = self.state();
+            // Two clients can build the same resumed session concurrently. Keep the first
+            // slot and its task together; replacing it would lose pending turns and let a
+            // wake from the old task pop a turn belonging to the new one.
+            let Entry::Vacant(entry) = st.sessions.entry(id.clone()) else { return id };
+            entry.insert(Slot {
+                pending: VecDeque::new(),
+                wake_tx,
                 cancel: None,
                 model: agent.model().to_owned(),
-                cwd: agent.cwd().display().to_string(),
+                cwd: agent.cwd().to_owned(),
                 history: agent.history().to_vec(),
                 turn: Vec::new(),
                 running: false,
@@ -405,59 +537,59 @@ impl Hub {
                 questions,
                 has_input,
                 title_hint: None,
-            },
-        );
+            });
+        }
         let hub = self.clone();
         let sid = id.clone();
         let jobs = agent.jobs().cloned();
         tokio::spawn(async move {
             loop {
                 // A job that finishes while the session is idle gets a turn of its own.
-                let turn = tokio::select! {
-                    t = cmd_rx.recv() => match t {
-                        Some(t) => Some(t),
+                let from_queue = tokio::select! {
+                    wake = wake_rx.recv() => match wake {
+                        Some(()) => true,
                         None => break,
                     },
-                    _ = job_finished(jobs.as_deref()) => None,
+                    _ = job_finished(jobs.as_deref()) => false,
                 };
-                if let Some(Turn { effort, model, diagrams, .. }) = &turn {
-                    agent.effort = *effort;
-                    agent.diagrams = *diagrams;
-                    if model.is_some() {
-                        agent.model = model.clone();
-                    }
-                } else if !jobs.as_ref().is_some_and(|j| j.has_news()) {
+                if !from_queue && !jobs.as_ref().is_some_and(|j| j.has_news()) {
                     // Already reported mid-turn.
                     continue;
                 }
                 let cancel = CancellationToken::new();
-                hub.turn_boundary(&sid, &agent, Some(cancel.clone()));
+                let turn = {
+                    let mut st = hub.state();
+                    let slot = st.sessions.get_mut(&sid).expect("agent has a slot");
+                    let turn = if from_queue {
+                        let Some(t) = slot.pending.pop_front() else { continue };
+                        agent.effort = t.effort;
+                        agent.diagrams = t.diagrams;
+                        if t.model.is_some() {
+                            agent.model = t.model;
+                        }
+                        Some(t.queued.text)
+                    } else {
+                        None
+                    };
+                    // Popping and marking the turn active are atomic with edits and `busy`.
+                    slot.turn_boundary(&agent, Some(cancel.clone()));
+                    if from_queue {
+                        st.broadcast_queue(&sid);
+                    }
+                    turn
+                };
+                hub.broadcast_sessions();
                 let (h, s) = (hub.clone(), sid.clone());
                 let sink: EventSink = Arc::new(move |ev| h.publish(&s, ev));
                 match turn {
-                    Some(t) => drop(agent.run_turn(t.text, sink, cancel).await),
+                    Some(text) => drop(agent.run_turn(text, sink, cancel).await),
                     None => drop(agent.run_job_turn(sink, cancel).await),
                 }
-                hub.turn_boundary(&sid, &agent, None);
+                hub.state().sessions.get_mut(&sid).expect("agent has a slot").turn_boundary(&agent, None);
+                hub.broadcast_sessions();
             }
         });
         id
-    }
-
-    /// Records the agent's state at the start (`cancel` set) or end of a turn.
-    fn turn_boundary(&self, id: &str, agent: &Agent, cancel: Option<CancellationToken>) {
-        {
-            let mut st = self.state();
-            if let Some(slot) = st.sessions.get_mut(id) {
-                slot.history = agent.history().to_vec();
-                slot.turn.clear();
-                slot.running = cancel.is_some();
-                slot.cancel = cancel;
-                slot.usage = agent.usage;
-                slot.model = agent.model().to_owned();
-            }
-        }
-        self.broadcast_sessions();
     }
 }
 

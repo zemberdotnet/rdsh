@@ -14,6 +14,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -336,36 +337,71 @@ async fn relay(socket: WebSocket, s: Arc<Shared>) {
 }
 
 /// Connects host `i` and forwards its notices until the connection ends.
+/// Delays between reconnect attempts after a hub connection ends (a `:restart`, a crash).
+const RECONNECT_DELAYS_MS: [u64; 4] = [200, 500, 1000, 2000];
+const RECONNECT_ATTEMPTS: usize = 32;
+
 async fn link_host(i: usize, spec: HostSpec, connector: Connector, links: Links, out: UnboundedSender<String>) {
-    let (tx, mut notices) = match connector(spec.clone()).await {
+    let (mut tx, mut notices) = match connector(spec.clone()).await {
         Ok(link) => link,
         Err(e) => {
             let _ = out.send(encode(&Out::Disconnected { host: i, reason: Some(format!("{e:#}")) }));
             return;
         }
     };
-    let _ = tx.send(Request::List);
-    if let Some(slot) = links.lock().unwrap().get_mut(i) {
-        *slot = Some(tx.clone());
-    }
     let mut restart_asked = false;
-    while let Some(n) = notices.recv().await {
-        // Same rule as the TUI: a hub older than this binary is asked to drain and restart.
-        if let Notice::Hello { version } = &n
-            && !restart_asked
-            && crate::util::compare_versions(version, env!("CARGO_PKG_VERSION")).is_lt()
-        {
-            restart_asked = true;
-            let _ = tx.send(Request::Restart);
+    loop {
+        let _ = tx.send(Request::List);
+        if let Some(slot) = links.lock().unwrap().get_mut(i) {
+            *slot = Some(tx.clone());
         }
-        if out.send(encode(&Out::Notice { host: i, notice: &n })).is_err() {
+        while let Some(n) = notices.recv().await {
+            // Same rule as the TUI: a hub older than this binary is asked to drain and restart.
+            if let Notice::Hello { version } = &n
+                && !restart_asked
+                && crate::util::compare_versions(version, env!("CARGO_PKG_VERSION")).is_lt()
+            {
+                restart_asked = true;
+                let _ = tx.send(Request::Restart);
+            }
+            if out.send(encode(&Out::Notice { host: i, notice: &n })).is_err() {
+                return;
+            }
+        }
+        if let Some(slot) = links.lock().unwrap().get_mut(i) {
+            *slot = None;
+        }
+        let _ = out.send(encode(&Out::Disconnected { host: i, reason: None }));
+        // Reconnect; the browser reopens its sessions when the new hub says hello.
+        let mut last = String::new();
+        let mut relinked = None;
+        for attempt in 0..RECONNECT_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(RECONNECT_DELAYS_MS[attempt.min(RECONNECT_DELAYS_MS.len() - 1)])).await;
+            if out.is_closed() {
+                return;
+            }
+            match connector(spec.clone()).await {
+                // A command that starts but never reaches a hub closes without a notice.
+                Ok((t, mut n)) => match tokio::time::timeout(Duration::from_secs(15), n.recv()).await {
+                    Ok(Some(first)) => {
+                        relinked = Some((t, n, first));
+                        break;
+                    }
+                    Ok(None) => last = "the hub closed the connection".into(),
+                    Err(_) => last = "no answer from the hub".into(),
+                },
+                Err(e) => last = format!("{e:#}"),
+            }
+        }
+        let Some((t, n, first)) = relinked else {
+            let _ = out.send(encode(&Out::Disconnected { host: i, reason: Some(format!("could not reconnect: {last}")) }));
+            return;
+        };
+        if out.send(encode(&Out::Notice { host: i, notice: &first })).is_err() {
             return;
         }
+        (tx, notices) = (t, n);
     }
-    if let Some(slot) = links.lock().unwrap().get_mut(i) {
-        *slot = None;
-    }
-    let _ = out.send(encode(&Out::Disconnected { host: i, reason: None }));
 }
 
 /// The page: its own scripts and styles, the fonts, its WebSocket, and diagram frames.

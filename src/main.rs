@@ -4,22 +4,23 @@ use anyhow::{Context, Result, bail};
 use rdsh::{
     config::{Config, HostConfig},
     hub::{Factory, Hub, OpenKind, Request, net},
-    deepseek::DeepSeek,
     headless,
     llm::{Message, Provider},
+    providers,
     session::{self, Start},
     trace, tui,
     webview::{self, Connector, HostSpec, Settings},
 };
 
 const HELP: &str = "\
-rdsh — terminal coding agent for DeepSeek models
+rdsh — terminal coding agent for DeepSeek and OpenAI models
 
 USAGE:
     rdsh [OPTIONS]                 interactive TUI
     rdsh run [OPTIONS] <PROMPT>    run one turn headless (stdout: answer, stderr: progress)
-    rdsh login                     store a DeepSeek API key (~/.config/rdsh/credentials.json)
-    rdsh logout                    remove the stored key
+    rdsh login [PROVIDER]          log in: chatgpt (subscription; --device for a code), openai
+                                   (API key) or deepseek (API key); asks when PROVIDER is omitted
+    rdsh logout [PROVIDER]         remove one provider's login, or all of them
     rdsh web [--port N]            browser UI: serves it on 127.0.0.1 and opens it
     rdsh serve [--socket PATH]     run the session hub in the foreground (rdsh starts it on demand)
     rdsh connect [--socket PATH]   relay stdin/stdout to the local hub (used over SSH)
@@ -27,7 +28,7 @@ USAGE:
     rdsh trace [ID|last]           print a session trace as readable text
 
 OPTIONS:
-    -m, --model <MODEL>    model id (default: deepseek-flash, env RDSH_MODEL)
+    -m, --model <MODEL>    model id (default: the last login's, env RDSH_MODEL)
     -r, --resume <ID>      resume a session by id, prefix, or `last`
     -C, --cwd <DIR>        working directory (default: current)
         --host <DEST[:DIR]>  also attach to the hub on an SSH host (repeatable; or a config host name)
@@ -35,12 +36,15 @@ OPTIONS:
         --socket <PATH>    hub socket (default $XDG_RUNTIME_DIR/rdsh/hub.sock)
         --port <N>         `rdsh web` port (default 7357; another free one when taken)
         --no-open          `rdsh web`: print the URL instead of opening a browser
+        --device           `rdsh login chatgpt`: sign in with a code instead of a redirect
     -h, --help             show this help
     -V, --version          show version
 
 ENVIRONMENT:
     DEEPSEEK_API_KEY       API key; overrides `rdsh login` (also read from ./.env)
     DEEPSEEK_BASE_URL      API base URL (default https://api.deepseek.com)
+    OPENAI_API_KEY         OpenAI API key; overrides `rdsh login chatgpt|openai`
+    OPENAI_BASE_URL        OpenAI API base URL (default https://api.openai.com/v1)
     KAGI_API_KEY           enables the web_search and web_fetch tools (also read from ./.env)
 
 Config file: ~/.config/rdsh/config.json (see README).";
@@ -57,6 +61,7 @@ struct Args {
     socket: Option<PathBuf>,
     port: Option<u16>,
     no_open: bool,
+    device: bool,
 }
 
 fn parse_args() -> Result<Option<Args>> {
@@ -72,6 +77,7 @@ fn parse_args() -> Result<Option<Args>> {
         socket: None,
         port: None,
         no_open: false,
+        device: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -94,6 +100,7 @@ fn parse_args() -> Result<Option<Args>> {
             "--socket" => a.socket = Some(PathBuf::from(value("--socket")?)),
             "--port" => a.port = Some(value("--port")?.parse().context("--port needs a number")?),
             "--no-open" => a.no_open = true,
+            "--device" => a.device = true,
             "--" => a.positional.extend(it.by_ref()),
             s if s.starts_with('-') && s.len() > 1 => bail!("unknown option {s} (see --help)"),
             "run" | "sessions" | "trace" | "login" | "logout" | "serve" | "connect" | "web" if a.command.is_none() && a.positional.is_empty() => {
@@ -126,10 +133,21 @@ fn real_main() -> Result<i32> {
         cfg.model = m.clone();
     }
     match args.command.as_deref() {
-        Some("login") => runtime()?.block_on(rdsh::auth::login(&cfg.base_url)),
+        Some("login") => {
+            let provider = args.positional.first().map(String::as_str);
+            let socket = args.socket.clone().unwrap_or_else(net::default_socket);
+            runtime()?.block_on(async {
+                let code = rdsh::auth::login(&cfg, provider, args.device).await?;
+                // A running hub keeps the default model it started with.
+                if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                    eprintln!("The session hub is running with its old default model; `:restart` in the TUI picks up this login.");
+                }
+                Ok(code)
+            })
+        }
         Some("logout") => {
-            if rdsh::auth::logout()? {
-                eprintln!("removed {}", rdsh::auth::credentials_path().display());
+            if rdsh::auth::logout(args.positional.first().map(String::as_str))? {
+                eprintln!("logged out ({})", rdsh::auth::credentials_path().display());
             } else {
                 eprintln!("not logged in");
             }
@@ -157,7 +175,7 @@ fn real_main() -> Result<i32> {
             // Headless output usually feeds a script or another agent: no length routing.
             cfg.length_routing = false;
             runtime()?.block_on(async {
-                let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
+                let provider: Arc<dyn Provider> = providers::build(&cfg)?;
                 let start = args.resume.as_deref().map_or(Start::New, Start::Resume);
                 let mut agent = session::build(&cfg, &cwd, provider, start)?;
                 agent.effort = cfg.effort;
@@ -170,7 +188,7 @@ fn real_main() -> Result<i32> {
         }
         Some("serve") => {
             let socket = args.socket.clone().unwrap_or_else(net::default_socket);
-            let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
+            let provider: Arc<dyn Provider> = providers::build(&cfg)?;
             let idle = (cfg.serve_idle_secs > 0).then(|| std::time::Duration::from_secs(cfg.serve_idle_secs));
             let sessions_dir = cfg.sessions_dir();
             let factory = factory(cfg, cwd, provider);
@@ -204,7 +222,7 @@ fn real_main() -> Result<i32> {
             runtime()?.block_on(async move {
                 if net::connect_socket(&socket).await.is_err() {
                     // Starting the hub: check the key here so the error is readable.
-                    DeepSeek::new(&cfg)?;
+                    providers::build(&cfg)?;
                 }
                 let connector: Connector = Arc::new(move |spec: HostSpec| {
                     let (socket, exe) = (socket.clone(), exe.clone());
@@ -228,7 +246,7 @@ fn real_main() -> Result<i32> {
                 let url = webview::login_url(&listener, &token)?;
                 eprintln!("rdsh web: {url}");
                 if !args.no_open {
-                    open_browser(&url);
+                    rdsh::util::open_browser(&url);
                 }
                 webview::serve(listener, settings, connector, token).await?;
                 Ok(0)
@@ -256,24 +274,29 @@ fn real_main() -> Result<i32> {
             let no_daemon = args.no_daemon;
             runtime()?.block_on(async {
                 let (req_tx, notices) = if no_daemon {
-                    let provider: Arc<dyn Provider> = Arc::new(DeepSeek::new(&cfg)?);
+                    let provider: Arc<dyn Provider> = providers::build(&cfg)?;
                     let sessions_dir = cfg.sessions_dir();
                     Hub::new(factory(cfg, cwd.clone(), provider), Some(sessions_dir)).connect()
                 } else {
                     if net::connect_socket(&socket).await.is_err() {
                         // Starting the hub: check the key here so the error is readable.
-                        DeepSeek::new(&cfg)?;
+                        providers::build(&cfg)?;
                         let exe = std::env::current_exe().context("locating the rdsh binary")?;
                         net::ensure_server(&socket, &exe).await?;
                     }
                     net::connect_socket(&socket).await?
                 };
-                let mut links = vec![tui::HostLink { name: "local".into(), local: true, dir: None, req_tx, notices }];
+                let relink = match no_daemon {
+                    true => None,
+                    false => Some(net::Relink::Socket { socket, exe: std::env::current_exe().context("locating the rdsh binary")? }),
+                };
+                let mut links = vec![tui::HostLink { name: "local".into(), local: true, dir: None, req_tx, notices, relink }];
                 for h in remotes {
                     let mut ssh_args = vec!["-T".to_owned(), h.ssh.clone()];
                     ssh_args.extend(remote_command.iter().cloned());
                     let (req_tx, notices) = net::connect_command(&ssh_program, &ssh_args)?;
-                    links.push(tui::HostLink { name: h.name, local: false, dir: h.dir.map(PathBuf::from), req_tx, notices });
+                    let relink = Some(net::Relink::Command { program: ssh_program.clone(), args: ssh_args });
+                    links.push(tui::HostLink { name: h.name, local: false, dir: h.dir.map(PathBuf::from), req_tx, notices, relink });
                 }
                 tui::run(links, cwd, first, effort, models, ssh_program, remote_command).await?;
                 Ok(0)
@@ -295,17 +318,6 @@ fn remote_hosts(cfg: &Config, args: &Args) -> Result<Vec<HostConfig>> {
         }
     }
     Ok(remotes)
-}
-
-/// Opens `url` in the default browser; failures leave the printed URL to the user.
-fn open_browser(url: &str) {
-    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    let _ = std::process::Command::new(program)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
 
 /// Builds agents for a hub: new sessions in the requested directory (default `default_cwd`),
@@ -351,7 +363,7 @@ fn print_trace(path: &std::path::Path) -> Result<()> {
                     println!("\n[runtime context] {}", content.lines().skip(2).collect::<Vec<_>>().join(" · "))
                 }
                 Message::Directive { content } => println!("  [directive] {content}"),
-                Message::Assistant { content, reasoning, tool_calls } => {
+                Message::Assistant { content, reasoning, tool_calls, .. } => {
                     if let Some(r) = reasoning {
                         println!("\n∴ reasoning ({} chars)", r.len());
                     }

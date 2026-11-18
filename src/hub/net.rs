@@ -174,6 +174,36 @@ pub async fn connect_socket(socket: &Path) -> Result<(UnboundedSender<Request>, 
     Ok(client(r, w))
 }
 
+/// How a client reaches a hub again after its connection ends (a `:restart`, a crash).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Relink {
+    /// The local hub's socket; a hub is started when none answers.
+    Socket { socket: PathBuf, exe: PathBuf },
+    /// A command speaking the protocol on its stdio (`ssh -T DEST rdsh connect`).
+    Command { program: String, args: Vec<String> },
+}
+
+impl Relink {
+    /// Connects and waits for the hub's first notice (its `Hello`), so a command that starts but
+    /// never reaches a hub counts as a failure.
+    ///
+    /// @returns the request sender, the first notice, and the rest of the stream.
+    pub async fn connect(&self) -> Result<(UnboundedSender<Request>, Notice, UnboundedReceiver<Notice>)> {
+        let (tx, mut rx) = match self {
+            Relink::Socket { socket, exe } => {
+                ensure_server(socket, exe).await?;
+                connect_socket(socket).await?
+            }
+            Relink::Command { program, args } => connect_command(program, args)?,
+        };
+        match tokio::time::timeout(Duration::from_secs(15), rx.recv()).await {
+            Ok(Some(first)) => Ok((tx, first, rx)),
+            Ok(None) => bail!("the hub closed the connection"),
+            Err(_) => bail!("no answer from the hub"),
+        }
+    }
+}
+
 /// Runs `program args…` and speaks the protocol over its stdin/stdout (for `ssh host rdsh
 /// connect`). The process is killed when the connection is dropped.
 pub fn connect_command(program: &str, args: &[String]) -> Result<(UnboundedSender<Request>, UnboundedReceiver<Notice>)> {

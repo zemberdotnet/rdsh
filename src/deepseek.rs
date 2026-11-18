@@ -230,6 +230,7 @@ impl SseAccumulator {
                 content: self.content,
                 reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 tool_calls,
+                replay: Vec::new(),
             },
             usage: self.usage,
             finish_reason: self.finish_reason,
@@ -274,7 +275,7 @@ mod tests {
         acc.feed(b, &sink).unwrap();
         assert!(acc.done);
         let c = acc.finish().unwrap();
-        let Message::Assistant { content, reasoning, tool_calls } = c.message else { panic!() };
+        let Message::Assistant { content, reasoning, tool_calls, .. } = c.message else { panic!() };
         assert_eq!(content, "Hello");
         assert_eq!(reasoning.as_deref(), Some("think"));
         assert_eq!(tool_calls[0].arguments, "{\"command\":1}");

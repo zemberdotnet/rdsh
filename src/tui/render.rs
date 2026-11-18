@@ -17,12 +17,14 @@ use super::{
     theme::*,
     transcript::GUTTER,
 };
-use crate::{comments::Anchor, diff::Kind as DiffKind, llm::Effort};
+use crate::{comments::Anchor, diff::Kind as DiffKind, llm::Effort, util::sanitize};
 
 /// Width of the file view's `old new ●+ ` gutter.
 pub const FILE_GUTTER: usize = 14;
 pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const MAX_PROMPT_ROWS: usize = 8;
+/// Queued messages listed above the prompt; more collapse into a "+N more" row.
+const MAX_QUEUE_ROWS: usize = 4;
 /// Fixed width of the session rail.
 pub const SIDEBAR_WIDTH: u16 = 28;
 /// Below this width for the chat, the rail is hidden and the chat keeps the full area.
@@ -138,9 +140,15 @@ impl App {
         let prompt_w = (area.width as usize).saturating_sub(2);
         let (prompt_lines, prompt_cur) = self.cur.prompt.layout(prompt_w);
         let prompt_h = prompt_lines.len().clamp(1, MAX_PROMPT_ROWS) as u16;
-        let [body, sep, prompt, status] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(prompt_h), Constraint::Length(1)])
-                .areas(area);
+        let queue_h = self.queue_rows() as u16;
+        let [body, queue, sep, prompt, status] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(queue_h),
+            Constraint::Length(1),
+            Constraint::Length(prompt_h),
+            Constraint::Length(1),
+        ])
+        .areas(area);
         // The rail sits left of the chat; the prompt, separator and status keep the full width.
         let (rail, main) = if self.sidebar_open && area.width >= SIDEBAR_WIDTH + SIDEBAR_MIN_WIDTH {
             let [rail, main] = Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(1)]).areas(body);
@@ -170,6 +178,7 @@ impl App {
         if self.mode == Mode::Comment {
             self.draw_comment_popup(f, main);
         }
+        self.draw_waiting(f, queue);
         self.draw_separator(f, sep);
         self.draw_prompt(f, prompt, &prompt_lines, prompt_cur);
         self.draw_status(f, status);
@@ -535,17 +544,74 @@ impl App {
         }
     }
 
+    /// Rows the waiting-message list takes above the prompt (none while previewing).
+    fn queue_rows(&self) -> usize {
+        let n = self.cur.queued.len();
+        if n == 0 || self.preview_id().is_some() {
+            return 0;
+        }
+        if n > MAX_QUEUE_ROWS { MAX_QUEUE_ROWS } else { n }
+    }
+
+    /// Messages waiting for the running turn, oldest first, one line each; the one being
+    /// edited is marked. Past `MAX_QUEUE_ROWS` the oldest show and a row counts the rest.
+    fn draw_waiting(&self, f: &mut Frame, area: Rect) {
+        let rows = area.height as usize;
+        if rows == 0 {
+            return;
+        }
+        let queued = &self.cur.queued;
+        let shown = if queued.len() > rows { rows - 1 } else { rows };
+        let editing = self.cur.queue_edit.as_ref().map(|e| e.turn_id);
+        let w = area.width as usize;
+        let mut lines: Vec<Line> = queued
+            .iter()
+            .take(shown)
+            .enumerate()
+            .map(|(i, t)| {
+                let mark = if editing == Some(t.id) { "✎" } else { "○" };
+                let first = t.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                let more = if t.text.trim().lines().count() > 1 { " …" } else { "" };
+                let head = format!(" {mark} {}. ", i + 1);
+                let room = w.saturating_sub(head.chars().count() + more.len());
+                let body: String = sanitize(first).chars().take(room).collect();
+                let style = if editing == Some(t.id) { Style::default().fg(PURPLE).add_modifier(Modifier::BOLD) } else { Style::default().fg(FG) };
+                Line::from(vec![Span::styled(head, Style::default().fg(PURPLE)), Span::styled(body, style), Span::styled(more, dim())])
+            })
+            .collect();
+        if queued.len() > shown {
+            lines.push(Line::from(Span::styled(format!("   +{} more waiting", queued.len() - shown), dim())));
+        }
+        f.render_widget(Paragraph::new(lines).style(Style::default().bg(PANEL)), area);
+    }
+
     fn draw_separator(&self, f: &mut Frame, area: Rect) {
         let mut left: Vec<Span> = Vec::new();
+        let n = self.cur.queued.len();
+        let edit_hint = self.cur.queue_edit.as_ref().map(|e| {
+            if e.submitted.is_some() {
+                "Saving edit…"
+            } else if self.mode == Mode::Insert {
+                "Editing queued turn · Enter save · Esc discard"
+            } else {
+                "Editing queued turn · i to resume"
+            }
+        });
+        if n > 0 || edit_hint.is_some() {
+            let hint = edit_hint.unwrap_or(match (self.mode == Mode::Insert, self.cur.running) {
+                (true, true) => "↑ recall · Ctrl-Enter sends now",
+                (true, false) => "↑ recall",
+                (false, true) => "i then ↑ recall · Ctrl-Enter sends now",
+                (false, false) => "i then ↑ recall",
+            });
+            left.push(Span::styled(format!(" ⏳ {n} queued · {hint} "), Style::default().fg(PURPLE)));
+        }
         if !self.cur.queue.is_empty() {
             let n = self.cur.queue.len();
             left.push(Span::styled(
-                format!(" ● {n} comment{} queued — sent with your next message (Q to review) ", if n == 1 { "" } else { "s" }),
+                format!(" ● {n} comment{} queued (Q to review) ", if n == 1 { "" } else { "s" }),
                 Style::default().fg(YELLOW),
             ));
-        }
-        if self.cur.waiting > 0 {
-            left.push(Span::styled(" ⏳ message waiting for the current turn (Ctrl-Enter sends it now) ", Style::default().fg(PURPLE)));
         }
         let right = if self.cur.running {
             let secs = self.cur.turn_started.elapsed().as_secs();
@@ -674,6 +740,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l(""),
         h("Prompt (INSERT)"),
         l("  Enter send · Shift-Enter newline (also Alt-Enter, Ctrl-J) · Up/Down history · Esc normal mode"),
+        l("  Up in an empty prompt recalls queued turns before history; Up/Down browse unchanged recalls."),
+        l("  Tab in the prompt completes a path (relative to the session's directory); Tab again cycles matches"),
+        l("  Enter saves a queued edit · Esc discards it · Ctrl-Enter saves, then starts the whole queue"),
         l(""),
         h("Navigation (NORMAL, chat and file views)"),
         l("  h j k l · w b e · 0 ^ $ · gg G · 42G · Ctrl-d/u half page · Ctrl-f/b page · Ctrl-e/y scroll"),
@@ -687,6 +756,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l(""),
         h("Files"),
         l("  Enter / gf / click on a path opens it: diff view (Tab toggles full file), comment on lines with v/V c"),
+        l("  gx opens the URL under the cursor in the browser, or a local file with its default app"),
         l("  Shift-Tab diffs against the default branch (origin/main) and back · F lists changed files"),
         l("  :e path[:line] opens any file · r reloads · q or Esc goes back"),
         l(""),
@@ -705,7 +775,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         l("  Ctrl-Enter (any mode) sends queued comments + prompt text right away; in a comment it saves, then sends"),
         l("  Shift-Tab (any mode) cycles thinking: off, low, high, max; the model name turns gray, light blue, blue, purple"),
         l("  :model lists models (Enter picks one for this session's next turns) · :model <id> names any other"),
-        l("  Ctrl-Enter or :now during a turn interrupts it so your message starts at once"),
+        l("  Ctrl-Enter or :now during a turn interrupts it; every waiting message starts at once, as one"),
         l("  :send · :dropcomments · :q quit · Ctrl-C interrupts / clears / quits (twice)"),
     ];
     f.render_widget(Paragraph::new(text), area);

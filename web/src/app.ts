@@ -77,9 +77,10 @@ export class App {
     const h = this.hosts[host];
     if (!h || !h.connected || !this.connected) {
       this.setFlash(`not connected to ${h?.name ?? "that host"}`, true);
-      return;
+      return false;
     }
     this.out({ type: "request", host, request });
+    return true;
   }
 
   setFlash(s: string | null, err = false) {
@@ -114,6 +115,7 @@ export class App {
         this.cwd = m.cwd;
         this.models = m.models;
         if (!reconnect) this.effort = m.effort;
+        this.clearQueues();
         this.hosts = m.hosts.map((spec) => this.newHost(spec));
         this.views.clear();
         this.previews.clear();
@@ -148,7 +150,8 @@ export class App {
         h.connected = false;
         h.running.clear();
         for (const v of this.views.values()) if (v.host === m.host) v.running = false;
-        this.setFlash(m.reason ? `${h.name}: ${m.reason}` : `lost the connection to ${h.name}`, true);
+        this.clearQueues(m.host);
+        this.setFlash(m.reason ? `${h.name}: ${m.reason}` : `lost the connection to ${h.name} — reconnecting…`, true);
         break;
       }
       case "error":
@@ -156,6 +159,15 @@ export class App {
         break;
     }
     this.redraw();
+  }
+
+  clearQueues(host?: number) {
+    // A hub may reuse turn IDs after restarting. Keep the text, but not the edit target.
+    for (const v of [this.cur, ...this.views.values()]) {
+      if (host !== undefined && v.host !== host) continue;
+      v.queued = [];
+      v.queueEdit = null;
+    }
   }
 
   private newHost(spec: HostSpec): Host {
@@ -184,8 +196,18 @@ export class App {
     if (!h) return;
     switch (n.type) {
       case "hello": {
+        // A hello from a host seen before is a reconnect (its hub restarted): reopen its
+        // sessions so they keep updating.
+        const reconnected = h.version !== null && !h.connected;
         h.version = n.version;
         h.connected = true;
+        this.request(host, { type: "watch_queue" });
+        if (reconnected) {
+          for (const v of this.views.values()) {
+            if (v.host === host && !v.readOnly && v.id) this.request(host, { type: "open", session_id: v.id });
+          }
+          this.setFlash(`reconnected to ${h.name}`);
+        }
         const waiting = this.queued.filter((q) => q.host === host);
         this.queued = this.queued.filter((q) => q.host !== host);
         for (const q of waiting) this.request(host, q.req);
@@ -221,11 +243,24 @@ export class App {
         }
         break;
       }
+      case "queue": {
+        const v = this.views.get(key(host, n.session_id));
+        if (v) v.queued = n.queued;
+        break;
+      }
+      case "queue_edited": {
+        const v = this.views.get(key(host, n.session_id));
+        if (v) this.onQueueEdited(v, n.turn_id, n.updated);
+        break;
+      }
       case "event": {
         const v = this.views.get(key(host, n.session_id));
         if (v) v.apply(n.event, this.hooks(host));
         break;
       }
+      case "path_completions":
+        this.onPathCompletions(host, n.request_id, n.paths);
+        break;
       case "file":
       case "changed_files":
         this.setFlash("file views come in the next step");
@@ -254,11 +289,13 @@ export class App {
     const old = this.views.get(k);
     const fresh = SessionView.fromSnapshot(host, snap, this.hooks(host));
     fresh.readOnly = readOnly;
-    if (old) {
-      // Keep the draft and position of a view being refreshed.
-      fresh.draft = old.draft;
-      fresh.cur = old.cur;
-      fresh.hasInput ||= old.hasInput;
+    const previous = old ?? (this.cur.host === host && this.cur.id === snap.session_id ? this.cur : undefined);
+    if (previous) {
+      // Keep the draft and position of a view being refreshed, including after reconnect.
+      fresh.draft = previous === this.cur ? this.prompt.get() : previous.draft;
+      fresh.cur = previous.cur;
+      fresh.hasInput ||= previous.hasInput;
+      if (!readOnly) fresh.queueEdit = previous.queueEdit;
     }
     this.views.set(k, fresh);
     if (makeCurrent || old === this.cur) this.show(fresh);
@@ -384,10 +421,76 @@ export class App {
     this.setFlash(answer.type === "dismissed" ? "form dismissed" : "answer sent");
   }
 
-  submit() {
-    let text = this.prompt.get().trim();
-    if (!text) return;
+  /** Browse queued turns before history, without replacing a draft or modified recall. */
+  recallQueued(older: boolean): boolean {
     const v = this.cur;
+    if (v.readOnly) return false;
+    const edit = v.queueEdit;
+    let i: number;
+    if (edit) {
+      if (edit.submitted !== null || this.prompt.get() !== edit.original) return false;
+      const at = v.queued.findIndex((t) => t.id === edit.id);
+      if (older && at === -1) return true;
+      i = older ? Math.max(0, at - 1) : at + 1;
+      if (i === v.queued.length) {
+        this.discardQueueEdit();
+        return true;
+      }
+    } else {
+      if (!older || this.prompt.get() || !v.queued.length) return false;
+      i = v.queued.length - 1;
+    }
+    const turn = v.queued[i];
+    if (edit?.id !== turn.id) {
+      this.histPos = null;
+      v.queueEdit = { id: turn.id, original: turn.text, submitted: null };
+      this.prompt.set(turn.text);
+    }
+    return true;
+  }
+
+  discardQueueEdit(): boolean {
+    const v = this.cur;
+    if (!v.queueEdit) return false;
+    if (v.queueEdit.submitted !== null) {
+      this.setFlash("edit already sent — waiting for the hub");
+    } else {
+      v.queueEdit = null;
+      this.prompt.set("");
+    }
+    return true;
+  }
+
+  private onQueueEdited(v: SessionView, id: number, updated: boolean) {
+    const edit = v.queueEdit;
+    if (!edit || edit.id !== id || edit.submitted === null) return;
+    v.queueEdit = null;
+    if (!updated) {
+      const msg = "queued turn already started — edit kept as an unsent draft";
+      this.setFlash(v === this.cur ? msg : `${v.id}: ${msg}`, true);
+    } else {
+      if (edit.now && v.running) this.runQueuedNow(v, v.queued.length);
+      const text = v === this.cur ? this.prompt.get() : v.draft;
+      if (text === edit.submitted) {
+        v.draft = "";
+        if (v === this.cur) this.prompt.set("");
+      }
+    }
+  }
+
+  submit() {
+    const v = this.cur;
+    let text = this.prompt.get().trim();
+    if (v.queueEdit) {
+      const edit = v.queueEdit;
+      if (edit.submitted !== null) return this.setFlash("edit already sent — waiting for the hub");
+      if (!text) return this.setFlash("queued turn cannot be empty — Esc discards the edit", true);
+      // This is a replacement, even if the current turn opened a form in the meantime.
+      text = this.prompt.get();
+      if (this.request(v.host, { type: "edit_queued", session_id: v.id, turn_id: edit.id, text })) edit.submitted = text;
+      return;
+    }
+    if (!text) return;
     if (v.question && !v.readOnly) {
       // The agent is waiting on a form: a typed message answers it in words.
       this.prompt.set("");
@@ -406,16 +509,81 @@ export class App {
     if (this.history[this.history.length - 1] !== text) this.history.push(text);
     this.histPos = null;
     // The hub queues turns; the user entry appears when the turn starts.
-    if (v.running) {
-      v.waiting++;
-      this.setFlash("queued — sends when the current turn finishes");
-    }
+    if (v.running) this.setFlash("queued — sends when the current turn finishes");
     const errors = this.diagramErrors();
     if (errors.length) {
       text += `\n\n<diagram_errors>\n${errors.map((e) => `"${e.title}": ${e.message}`).join("\n")}\n</diagram_errors>`;
     }
     const model = v.model && v.model !== "trace" ? v.model : undefined;
     this.request(v.host, { type: "send", session_id: v.id, text, effort: this.effort, model, diagrams: true });
+  }
+
+  /** Tab completion in flight: its request id, where it was asked, and how to put a path in. */
+  private completion: { id: number; host: number; session: string; token: string; apply: (path: string) => boolean } | null = null;
+  private completionIds = 0;
+  /** Opens a link in a new tab (`gx`); tests stub it. */
+  openUrl: (url: string) => void = (url) => { window.open(url, "_blank", "noopener"); };
+  /** Offers several completions; the page shows a menu (tests can stub it). */
+  choosePath: (paths: string[], pick: (path: string) => void) => void = () => {};
+
+  /**
+   * Asks the session's host to complete `token`, a path relative to the session's directory.
+   * `apply` replaces the token in the prompt and returns false when the prompt changed since.
+   */
+  completePath(token: string, apply: (path: string) => boolean): boolean {
+    const v = this.cur;
+    if (v.readOnly || !v.id) return false;
+    const id = ++this.completionIds;
+    if (this.request(v.host, { type: "complete_path", session_id: v.id, request_id: id, prefix: token })) {
+      this.completion = { id, host: v.host, session: v.id, token, apply };
+    }
+    return true;
+  }
+
+  private onPathCompletions(host: number, id: number, paths: string[]) {
+    const c = this.completion;
+    if (!c || c.id !== id || c.host !== host) return;
+    this.completion = null;
+    if (this.cur.host !== c.host || this.cur.id !== c.session) return;
+    if (!paths.length) return this.setFlash(c.token ? `no paths start with ${c.token}` : "no files here");
+    if (paths.length === 1) {
+      c.apply(paths[0]);
+      return;
+    }
+    // Fill in what every match shares, then offer the matches.
+    const common = paths.reduce((p, s) => {
+      let i = 0;
+      while (i < p.length && p[i] === s[i]) i++;
+      return p.slice(0, i);
+    });
+    if (common.length > c.token.length && !c.apply(common)) return;
+    this.choosePath(paths, (p) => { c.apply(p); this.redraw(); });
+  }
+
+  /**
+   * Ctrl-Enter: send the prompt (or save the queued edit), then start every waiting message at
+   * once — the hub merges them and interrupts the running turn. A form answer is not hurried.
+   */
+  sendNow() {
+    const v = this.cur;
+    if (v.readOnly || !v.id) return this.submit();
+    if (v.queueEdit) {
+      const edit = v.queueEdit;
+      this.submit();
+      if (edit.submitted !== null) edit.now = true;
+      return;
+    }
+    const typed = !!this.prompt.get().trim();
+    if (!typed && !v.queued.length) return this.setFlash("nothing to send — type with i");
+    const answering = typed && !!v.question;
+    if (typed) this.submit();
+    if (v.running && !answering) this.runQueuedNow(v, v.queued.length + (typed ? 1 : 0));
+  }
+
+  /** `n`: messages that will start, for the flash. */
+  private runQueuedNow(v: SessionView, n: number) {
+    if (!this.request(v.host, { type: "run_queued_now", session_id: v.id })) return;
+    if (v === this.cur) this.setFlash(n > 1 ? `interrupting — the ${n} waiting messages start now, as one` : "interrupting — the waiting message starts now");
   }
 
   cancel(): boolean {

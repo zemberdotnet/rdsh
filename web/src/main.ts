@@ -1,6 +1,7 @@
 // Boot: the WebSocket to `rdsh web`, DOM events, timers.
 
 import { App } from "./app.ts";
+import { ChoiceMenu } from "./choice-menu.ts";
 import { keyName, Keys } from "./keys.ts";
 import type { ClientMsg, ServerMsg } from "./proto.ts";
 import { GUTTER, View } from "./view.ts";
@@ -23,6 +24,9 @@ const app = new App((m: ClientMsg) => ws?.readyState === WebSocket.OPEN && ws.se
 });
 const view = new View(app);
 const keys = new Keys(app, view, input);
+const pathMenu = new ChoiceMenu<string>("Path completions");
+app.choosePath = (paths, pick) =>
+  pathMenu.show(document.querySelector("#prompt") as HTMLElement, paths.map((p) => ({ label: p, value: p })), pick, { owner: input });
 
 // ------------------------------------------------------------------ connection
 
@@ -44,6 +48,7 @@ function connect() {
     if (ws !== sock) return;
     app.connected = false;
     for (const h of app.hosts) h.connected = false;
+    app.clearQueues();
     redraw();
     setTimeout(connect, backoff);
     backoff = Math.min(backoff * 2, 8000);
@@ -62,12 +67,19 @@ document.addEventListener("keydown", (e) => {
 
 input.addEventListener("keydown", (e) => {
   if (app.mode !== "insert") return;
+  // An open completion menu takes Tab, arrows, Ctrl-n/p, Enter and Escape first.
+  if (pathMenu.handle(e)) {
+    e.preventDefault();
+    redraw();
+    return;
+  }
   if (keys.insertKey(e)) {
     e.preventDefault();
     redraw();
   }
 });
-input.addEventListener("input", () => { app.histPos = null; view.drawPrompt(); });
+input.addEventListener("input", () => { app.histPos = null; pathMenu.close(); view.drawPrompt(); });
+window.addEventListener("resize", () => pathMenu.position());
 input.addEventListener("focus", () => {
   if (app.mode === "insert") return;
   if (app.previewing() || app.cur.readOnly) {
@@ -79,6 +91,7 @@ input.addEventListener("focus", () => {
   redraw();
 });
 input.addEventListener("blur", () => {
+  pathMenu.close();
   if (app.mode === "insert") {
     app.mode = "normal";
     redraw();

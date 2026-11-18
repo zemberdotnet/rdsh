@@ -40,10 +40,19 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         diagrams: bool,
     },
+    /// Opt in to `Queue` notices for this connection. Send after every `Hello`.
+    /// Already subscribed sessions get an immediate update; later opens include the queue.
+    WatchQueue,
+    /// Replace a pending turn's text without changing its position or settings.
+    /// Answered with `QueueEdited`.
+    EditQueued { session_id: String, turn_id: u64, text: String },
     /// Answer the `ask` call `question_id` (its tool call id); the first answer wins.
     Answer { session_id: String, question_id: String, answer: crate::tools::ask::Answer },
     /// Interrupt the running turn.
     Cancel { session_id: String },
+    /// Start every queued turn now: they merge into one message, in order, and the running
+    /// turn is interrupted so it begins at once (Ctrl-Enter).
+    RunQueuedNow { session_id: String },
     /// Stop receiving events for a session. Its agent keeps running.
     Close { session_id: String },
     /// Load `path` (relative to `cwd`) with its git diff against `base` on the host; answered
@@ -54,6 +63,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "crate::diff::Base::is_head")]
         base: crate::diff::Base,
     },
+    /// Complete a workspace-relative path in a subscribed session on its host.
+    CompletePath { session_id: String, request_id: u64, prefix: String },
     /// Files with uncommitted changes under `cwd` on the host; answered with `ChangedFiles`.
     ChangedFiles { cwd: String },
     /// Read a recorded session without running it (subagents, sessions owned elsewhere);
@@ -76,12 +87,18 @@ pub enum Notice {
     Sessions { recorded: Vec<SessionInfo>, open: Vec<String>, running: Vec<String> },
     /// The client is now subscribed to `snapshot.session_id`; events follow the snapshot.
     Opened { snapshot: Snapshot },
+    /// The full pending queue (excluding the active turn), sent to opted-in subscribers.
+    Queue { session_id: String, queued: Vec<QueuedTurn> },
+    /// Reply to `EditQueued`; `updated` means the edit was accepted, even if the text matched.
+    QueueEdited { session_id: String, turn_id: u64, updated: bool },
     /// An event of a subscribed session, in order.
     Event { session_id: String, event: AgentEvent },
     /// Reply to `ReadTrace`; `cwd` is where the session ran.
     Trace { session_id: String, cwd: String, history: Vec<Message> },
     /// Reply to `ReadFile`.
     File { file: Box<FileDiff> },
+    /// Reply to `CompletePath`, sent only to the requesting client.
+    PathCompletions { request_id: u64, paths: Vec<String> },
     /// Reply to `ChangedFiles`: `(git status, path relative to cwd)` pairs.
     ChangedFiles { cwd: String, files: Vec<(String, String)> },
     /// The hub is draining and about to exit (reply to `Restart`).
@@ -89,8 +106,15 @@ pub enum Notice {
     Error { session_id: Option<String>, message: String },
 }
 
+/// A pending user turn, identified for the lifetime of this hub.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedTurn {
+    pub id: u64,
+    pub text: String,
+}
+
 /// Everything needed to show a session joined mid-flight: the history as of the start of the
-/// current turn, plus that turn's events so far (beginning with `TurnStarted`).
+/// current turn, that turn's events so far (beginning with `TurnStarted`), and pending turns.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub session_id: String,
@@ -101,4 +125,6 @@ pub struct Snapshot {
     pub turn: Vec<AgentEvent>,
     pub running: bool,
     pub usage: Usage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<QueuedTurn>,
 }

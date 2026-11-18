@@ -315,7 +315,13 @@ impl Agent {
                     Delta::ToolCall { name } => AgentEvent::ToolCallStreaming { name },
                 })
             };
-            let req = Request { messages: &self.history, tools: &self.specs, effort: self.effort, model: self.model.as_deref() };
+            let req = Request {
+                messages: &self.history,
+                tools: &self.specs,
+                effort: self.effort,
+                model: self.model.as_deref(),
+                cache_key: self.session_id(),
+            };
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => None,

@@ -8,6 +8,9 @@ use std::path::Path;
 
 use crate::{tools::Registry, util::today};
 
+const WORKTREE_GUIDANCE: &str = "When making changes in a Git repository, prefer a dedicated Git worktree \
+    unless instructed otherwise. Reuse a worktree already set aside for the task.";
+
 /// Guidance for the tools in `tools`, one paragraph per tool that provides any, in registry order.
 fn tool_guidance(tools: &Registry) -> String {
     tools.guidance().collect::<Vec<_>>().join("\n\n")
@@ -22,6 +25,7 @@ pub fn main(model: &str, tools: &Registry) -> String {
         "You are rdsh, a coding agent powered by the {model} model, working in the user's terminal.\n\n\
          Verify your work by running the code or tests. Keep answers factual. A user message may be followed \
          by a <response_length> note picked for it; make your final reply that long. Without one, keep it brief.\n\n\
+         {WORKTREE_GUIDANCE}\n\n\
          {guidance}\n\n\
          Refer to code as `path:line` (relative to the working directory) so the user can open it.\n\n\
          The user reviews your work by commenting on quoted parts of the conversation and on diff lines of files. \
@@ -42,6 +46,7 @@ pub fn subagent(model: &str, tools: &Registry) -> String {
          complete, self-contained report: findings, `path:line` references, and anything you changed.\n\n\
          Verify your work by running the code or tests. Be factual and specific; include every detail the \
          main agent needs.\n\n\
+         {WORKTREE_GUIDANCE}\n\n\
          {guidance}",
         guidance = tool_guidance(tools),
     )

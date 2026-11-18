@@ -12,19 +12,27 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::{decision::KeySource, llm::Effort};
+use crate::{auth::OpenAiAuth, decision::KeySource, llm::Effort};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Model id sent to the API (`RDSH_MODEL` overrides).
+    /// Default model for new sessions (`RDSH_MODEL` overrides). Unset: the model of the last
+    /// `rdsh login`, else one the stored keys can use.
     pub model: String,
-    /// Models offered by `:model`; any other id can still be typed after it.
+    /// Models offered by `:model`; any other id can still be typed after it. Unset: the models
+    /// of every provider logged into.
     pub models: Vec<String>,
     /// Thinking effort new turns start with (`off`, `low`, `high`, `max`); Shift-Tab cycles it.
     pub effort: Effort,
     /// OpenAI-compatible base URL (`DEEPSEEK_BASE_URL` overrides).
     pub base_url: String,
+    /// OpenAI API base for API-key logins (`OPENAI_BASE_URL` overrides).
+    pub openai_base_url: String,
+    /// ChatGPT backend for subscription logins; requests go to `{this}/codex/responses`.
+    pub chatgpt_base_url: String,
+    /// Model ids beyond `gpt-…`, `o3`-style and `codex-…` that go to OpenAI.
+    pub openai_models: Vec<String>,
     /// Maximum model requests per user turn in the main agent; 0 is unlimited.
     pub max_steps: usize,
     /// Maximum model requests per subagent task; 0 (the default) is unlimited.
@@ -66,6 +74,13 @@ pub struct Config {
     /// API key from `DEEPSEEK_API_KEY`; never read from the config file.
     #[serde(skip)]
     pub api_key: Option<String>,
+    /// OpenAI login from `OPENAI_API_KEY` or `rdsh login chatgpt|openai`; never read from the
+    /// config file.
+    #[serde(skip)]
+    pub openai: Option<OpenAiAuth>,
+    /// `openai` came from the environment.
+    #[serde(skip)]
+    pub openai_from_env: bool,
     /// Kagi key from `KAGI_API_KEY`; enables `web_search` and `web_fetch`. Never read from the
     /// config file.
     #[serde(skip)]
@@ -106,10 +121,13 @@ impl HostConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: "deepseek-flash".into(),
-            models: vec!["deepseek-flash".into(), "deepseek-v4-pro".into()],
+            model: crate::providers::DEEPSEEK_DEFAULT_MODEL.into(),
+            models: Vec::new(),
             effort: Effort::High,
             base_url: "https://api.deepseek.com".into(),
+            openai_base_url: "https://api.openai.com/v1".into(),
+            chatgpt_base_url: "https://chatgpt.com/backend-api".into(),
+            openai_models: Vec::new(),
             max_steps: 200,
             subagent_max_steps: 0,
             max_tool_output_chars: 30_000,
@@ -129,6 +147,8 @@ impl Default for Config {
             decision_api_key: None,
             decision_key_source: None,
             api_key: None,
+            openai: None,
+            openai_from_env: false,
             kagi_api_key: None,
             kagi_base_url: None,
         }
@@ -141,14 +161,18 @@ impl Config {
     /// @param cwd working directory whose `.env` is consulted.
     /// @returns the validated configuration.
     pub fn load(cwd: &Path) -> Result<Self> {
-        let mut cfg = match config_path() {
+        let (mut cfg, mut explicit_model) = match config_path() {
             Some(path) if path.exists() => {
                 let text = std::fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
-                serde_json::from_str(&text)
-                    .with_context(|| format!("invalid config file {}", path.display()))?
+                let raw: serde_json::Value = serde_json::from_str(&text)
+                    .with_context(|| format!("invalid config file {}", path.display()))?;
+                let explicit = raw.get("model").is_some();
+                let cfg = serde_json::from_value(raw)
+                    .with_context(|| format!("invalid config file {}", path.display()))?;
+                (cfg, explicit)
             }
-            _ => Config::default(),
+            _ => (Config::default(), false),
         };
         let dotenv = read_dotenv(&cwd.join(".env"));
         let var = |key: &str| {
@@ -160,8 +184,12 @@ impl Config {
         if let Some(v) = var("DEEPSEEK_BASE_URL") {
             cfg.base_url = v;
         }
+        if let Some(v) = var("OPENAI_BASE_URL") {
+            cfg.openai_base_url = v;
+        }
         if let Some(v) = var("RDSH_MODEL") {
             cfg.model = v;
+            explicit_model = true;
         }
         (cfg.decision_api_key, cfg.decision_key_source) = match (var("TYPESAFE_API_KEY"), var("OPENROUTER_API_KEY")) {
             (Some(k), _) => (Some(k), Some(KeySource::TypeSafe)),
@@ -170,12 +198,45 @@ impl Config {
         };
         cfg.kagi_api_key = var("KAGI_API_KEY");
         cfg.kagi_base_url = var("KAGI_BASE_URL");
-        cfg.api_key = match var("DEEPSEEK_API_KEY") {
-            Some(k) => Some(k),
-            None => crate::auth::load()?,
+        let creds = crate::auth::load()?;
+        cfg.api_key = var("DEEPSEEK_API_KEY").or(creds.deepseek_api_key.clone());
+        cfg.openai_from_env = var("OPENAI_API_KEY").is_some();
+        cfg.openai = match var("OPENAI_API_KEY") {
+            Some(key) => Some(OpenAiAuth::ApiKey { key }),
+            None => creds.openai.clone(),
         };
+        cfg.resolve_models(creds.default_model.as_deref(), explicit_model);
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Picks the default model when the config and environment name none (the last login's, if
+    /// its provider still has credentials, else whichever provider does) and fills an unset
+    /// `models` list from the providers logged into.
+    fn resolve_models(&mut self, last_login: Option<&str>, explicit: bool) {
+        let openai = |m: &str| crate::providers::is_openai(m) || self.openai_models.iter().any(|o| o == m);
+        let usable = |m: &str| if openai(m) { self.openai.is_some() } else { self.api_key.is_some() };
+        if !explicit {
+            self.model = match last_login.filter(|m| usable(m)) {
+                Some(m) => m.to_owned(),
+                None if self.api_key.is_none() && self.openai.is_some() => crate::providers::OPENAI_DEFAULT_MODEL.to_owned(),
+                None => crate::providers::DEEPSEEK_DEFAULT_MODEL.to_owned(),
+            };
+        }
+        if self.models.is_empty() {
+            let mut models: Vec<String> = Vec::new();
+            if self.api_key.is_some() || self.openai.is_none() {
+                models.extend(crate::providers::DEEPSEEK_MODELS.map(String::from));
+            }
+            if self.openai.is_some() {
+                models.extend(crate::providers::OPENAI_MODELS.map(String::from));
+                models.extend(self.openai_models.iter().cloned());
+            }
+            if !models.contains(&self.model) {
+                models.insert(0, self.model.clone());
+            }
+            self.models = models;
+        }
     }
 
     /// Rejects values that would make the agent unusable.
@@ -266,6 +327,34 @@ mod tests {
         assert_eq!(m["B"], "two");
         assert_eq!(m["C"], "3");
         assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn default_model_follows_the_last_login() {
+        let chatgpt = || Some(OpenAiAuth::ApiKey { key: "k".into() });
+        let resolved = |api_key: Option<&str>, openai, last: Option<&str>, explicit: Option<&str>| {
+            let mut c = Config { api_key: api_key.map(String::from), openai, ..Config::default() };
+            if let Some(m) = explicit {
+                c.model = m.into();
+            }
+            c.resolve_models(last, explicit.is_some());
+            (c.model, c.models)
+        };
+        // Only DeepSeek: unchanged from before.
+        let (m, ms) = resolved(Some("k"), None, None, None);
+        assert_eq!((m.as_str(), ms.len()), ("deepseek-flash", 2));
+        // Only ChatGPT: its default, and only its models.
+        let (m, ms) = resolved(None, chatgpt(), None, None);
+        assert_eq!(m, "gpt-6.2-sol");
+        assert!(ms.iter().all(|m| m.starts_with("gpt-")), "{ms:?}");
+        // Both: the last login wins, and the picker offers both.
+        let (m, ms) = resolved(Some("k"), chatgpt(), Some("gpt-6-sol"), None);
+        assert_eq!((m.as_str(), ms.len()), ("gpt-6-sol", 12));
+        // A last login whose credentials are gone is skipped.
+        assert_eq!(resolved(Some("k"), None, Some("gpt-6-sol"), None).0, "deepseek-flash");
+        // The config or RDSH_MODEL always wins, and an unlisted model joins the picker.
+        let (m, ms) = resolved(Some("k"), chatgpt(), Some("gpt-6-sol"), Some("qwen3"));
+        assert_eq!((m.as_str(), ms[0].as_str()), ("qwen3", "qwen3"));
     }
 
     #[test]
