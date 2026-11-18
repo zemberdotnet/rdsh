@@ -5,7 +5,7 @@ import { composeMessage } from "../src/comments.ts";
 import { Keys } from "../src/keys.ts";
 import type { FileDiff, Notice, Request } from "../src/proto.ts";
 
-test("composed messages match the TUI's format", () => {
+test("composed messages quote each comment in a review block", () => {
   const msg = composeMessage([
     { anchor: { kind: "chat", source: "your response", quote: "line one\nline two" }, body: "why?" },
     { anchor: { kind: "file", path: "src/a.rs", lines: [3, 4], snippet: "+let x = 1;\n+```" }, body: "rename x" },
