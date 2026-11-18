@@ -2,6 +2,7 @@
 // entries to rows. Pure functions, so tests run them without a browser.
 
 import { COLLAPSED_REASONING_LINES, type Entry } from "./session.ts";
+import { diffLines, mark as markRanges, pairRanges } from "./worddiff.ts";
 
 /** A run of text with CSS classes and an optional HTTP(S) link target. */
 export type Seg = [text: string, cls: string, href?: string];
@@ -230,7 +231,7 @@ export function chunks(s: string, n: number): string[] {
 }
 
 /** Fixed-width wrapping that preserves spaces and link targets in tool output. */
-function* chunkSegs(segs: Seg[], width: number): Generator<Seg[]> {
+export function* chunkSegs(segs: Seg[], width: number): Generator<Seg[]> {
   let row: Seg[] = [];
   let col = 0;
   for (const [text, ...style] of segs) {
@@ -405,6 +406,7 @@ function build(e: Entry, W: number, spin: number): Line[] {
       const dur = t.dur == null ? "" : t.dur >= 1000 ? `  (${(t.dur / 1000).toFixed(1)}s)` : `  (${t.dur}ms)`;
       out.push({ g: icon, segs: [[t.name + " ", "b"], [fit(t.summary, W - t.name.length - dur.length - 1), "b"], [dur, "dim"]] });
       for (const c of t.children) out.push({ segs: [["  " + fit(c, W - 2), "dim"]] });
+      if (t.edit && t.status !== "bad") out.push(...editLines(t.edit, t.output, W, e.collapsed));
       const ls = t.output ? t.output.split("\n") : [];
       const shown = e.collapsed ? Math.min(COLLAPSED_OUTPUT, ls.length) : ls.length;
       const cls = t.status === "bad" ? "err" : "fgdim";
@@ -425,6 +427,47 @@ function build(e: Entry, W: number, spin: number): Line[] {
 }
 
 const COLLAPSED_OUTPUT = 4;
+/** Line-number column of diffs: four digits and a space. */
+export const NUM_W = 5;
+
+/**
+ * Rows of one diff line: `- `/`+ ` gutter, a line number, the code highlighted for its language,
+ * the changed words marked, and the row tinted; long lines wrap under the number column.
+ */
+export function diffRows(kind: "ctx" | "del" | "add", text: string, num: number | null, lang: string, W: number, ranges?: [number, number][]): Line[] {
+  const cls = kind === "del" ? "delw" : "addw";
+  const code = ranges?.length ? markRanges(highlight(text, lang), ranges, cls) : highlight(text, lang);
+  const bg = kind === "del" ? "del" : kind === "add" ? "add" : undefined;
+  const sign: Seg = kind === "del" ? ["- ", "bad"] : kind === "add" ? ["+ ", "ok"] : ["  ", "dim"];
+  const out: Line[] = [];
+  let first = true;
+  for (const part of chunkSegs(code, Math.max(10, W - NUM_W))) {
+    const lead: Seg = [first ? String(num ?? "").padStart(NUM_W - 1) + " " : " ".repeat(NUM_W), "dim"];
+    out.push({ g: first ? sign : ["  ", ""], segs: [lead, ...part], bg });
+    first = false;
+  }
+  return out;
+}
+
+/** The diff of an `edit_file` call, numbered from the line its output reports. */
+function editLines(edit: { path: string; old: string; new: string }, output: string, W: number, collapsed: boolean): Line[] {
+  const lang = edit.path.split(".").pop() ?? "";
+  const ops = diffLines(edit.old, edit.new);
+  const ranges = pairRanges(ops, (o) => (o.kind === "ctx" ? "other" : o.kind), (o) => o.text);
+  const start = Number(output.match(/:(\d+) \(\d+ replacement/)?.[1]) || null;
+  let oldN = start, newN = start;
+  const lines: Line[] = [];
+  const shown = collapsed ? ops.slice(0, COLLAPSED_EDIT) : ops;
+  for (const o of shown) {
+    const n = o.kind === "del" ? oldN : newN;
+    lines.push(...diffRows(o.kind, o.text, n, lang, W, ranges.get(o)));
+    if (o.kind !== "add" && oldN != null) oldN++;
+    if (o.kind !== "del" && newN != null) newN++;
+  }
+  if (shown.length < ops.length) lines.push({ g: ["  ", ""], segs: [[`… +${ops.length - shown.length} diff lines (Tab to expand)`, "dim"]] });
+  return lines;
+}
+const COLLAPSED_EDIT = 12;
 
 /** All rows of a transcript, without the spacer after the last entry. */
 export function layout(entries: Entry[], W: number, spin: number, links?: PathLinks): Row[] {

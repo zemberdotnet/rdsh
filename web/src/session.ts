@@ -20,7 +20,12 @@ export interface Tool {
   dur: number | null;
   /** `task` calls: the subagent's session, which Enter opens. */
   session?: string;
+  /** `edit_file` calls: what was replaced, drawn as a diff. */
+  edit?: { path: string; old: string; new: string };
 }
+
+/** Edits longer than this many diff lines start folded. */
+export const COLLAPSED_EDIT_LINES = 40;
 
 export type Kind = "user" | "assistant" | "reasoning" | "tool" | "info" | "error";
 
@@ -143,7 +148,8 @@ export class SessionView {
     t.dur = dur;
     // A finished task names its subagent's session on its first line (src/tools/task.rs).
     t.session ??= t.name === "task" ? output.match(/\[subagent session ([^\]\s]+)\]/)?.[1] : undefined;
-    e.collapsed = lineCount(output) > COLLAPSED_OUTPUT_LINES;
+    e.collapsed = lineCount(output) > COLLAPSED_OUTPUT_LINES
+      || (!!t.edit && lineCount(t.edit.old) + lineCount(t.edit.new) > COLLAPSED_EDIT_LINES);
     this.touch(e);
   }
 
@@ -315,7 +321,16 @@ function noteBody(text: string): string {
 }
 
 function toolEntry(callId: string, name: string, args: string): Tool {
-  return { callId, name, summary: summarize(name, args), status: "run", output: "", children: [], dur: null };
+  const t: Tool = { callId, name, summary: summarize(name, args), status: "run", output: "", children: [], dur: null };
+  if (name === "edit_file") {
+    try {
+      const a = JSON.parse(args);
+      if (typeof a?.old_string === "string" && typeof a?.new_string === "string") {
+        t.edit = { path: String(a.path ?? ""), old: a.old_string, new: a.new_string };
+      }
+    } catch { /* drawn without a diff */ }
+  }
+  return t;
 }
 
 /** One-line summary of a tool call's arguments (src/tools/mod.rs `summarize`). */
